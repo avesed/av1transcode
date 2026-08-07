@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>说明 - AV1 Transcode Archive</title>
+  <style>
+    :root {
+      --bg: #14161a; --panel: #1d2128; --border: #2c323c;
+      --text: #dfe3e9; --muted: #8b95a5; --accent: #4f9cf9;
+      --ok: #3ecf6e; --warn: #e3b341; --err: #ef6b6b;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+           background: var(--bg); color: var(--text); line-height: 1.65; }
+    header { display: flex; align-items: center; gap: 16px; padding: 14px 22px;
+             background: var(--panel); border-bottom: 1px solid var(--border); }
+    header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    header nav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-left: 14px; }
+    header nav a:hover { color: var(--text); }
+    main { padding: 20px 22px; max-width: 960px; margin: 0 auto; }
+    h2 { font-size: 17px; margin: 32px 0 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    h3 { font-size: 14px; margin: 20px 0 6px; color: var(--accent); }
+    p { font-size: 13.5px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0 16px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 500; background: var(--panel); }
+    td code, p code, li code { background: var(--panel); border: 1px solid var(--border);
+      border-radius: 4px; padding: 1px 6px; font-size: 12px; }
+    pre { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+          padding: 12px 16px; overflow-x: auto; font-size: 12.5px; }
+    .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 99px; margin-left: 6px; }
+    .tag.core { background: rgba(62,207,110,.15); color: var(--ok); }
+    .tag.adv { background: rgba(227,179,65,.15); color: var(--warn); }
+    ul { font-size: 13.5px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>AV1 Transcode Archive</h1>
+  <nav>
+    <a href="/">首页</a>
+    <a href="/static/settings.html">设置</a>
+    <a href="/static/docs.html">说明</a>
+  </nav>
+</header>
+<main>
+
+<h2>并行处理</h2>
+<p>并行分两层，可在<b>设置</b>页调整（即时生效，持久化到 <code>dirs.settings_file</code>，默认 <code>/data/settings.json</code>）：</p>
+<ul>
+  <li><code>concurrency</code>（并行任务数，默认 1）：同时转码几个文件。增大后多个任务同时进行，会显著提高 CPU/内存占用。</li>
+  <li><code>av1an_workers</code>（任务内切片并行，默认 0）：每个任务内部 av1an 用多少线程并行编码切片；0 = 自动（av1an 按 CPU 核数分配）。</li>
+</ul>
+<p>各取值对资源占用的影响：<code>concurrency × av1an_workers</code> 约等于峰值同时运行的编码进程数。减小编号即时生效：已排队的任务不受影响，当前任务完成后对应的 worker 会自动退出。</p>
+
+<h2>工作流程</h2>
+<p>系统监控输入目录（<code>dirs.input</code>），发现稳定的视频文件后自动入队分析：
+Dolby Vision P5/P7/P8 会转成 HDR10（保留/附带 RPU），HDR10/HLG/SDR 直接编码为 AV1（SVT-AV1），随后按预设的码率/质量参数编码输出。</p>
+<ul>
+  <li>已跳过非视频文件与小于 <code>watcher.min_size_mb</code> 的文件。</li>
+  <li>已是 AV1 的源默认跳过（<code>skip_existing_av1</code>）。</li>
+  <li>成功后可归档（移到 <code>dirs.archive</code>）或删除源文件。</li>
+</ul>
+
+<h2>输出行为</h2>
+<p>默认（<code>dirs.output</code>/<code>dirs.rpu</code> 为 null）转码输出到<b>源文件所在目录下的 <code>av1/</code> 子目录</b>：</p>
+<pre>movies/
+├── Big Buck Bunny.mkv        # 源文件
+└── av1/
+    ├── Big Buck Bunny.av1.mkv    # 转码输出
+    └── rpu/
+        └── Big Buck Bunny.rpu.bin   # 抽取的 Dolby Vision RPU（仅 DV 源且 save_rpu=true）
+</pre>
+<p>若在 <code>config.yaml</code> 中配置了固定的 <code>dirs.output</code>/<code>dirs.rpu</code>，则所有输出集中到这些目录。监视器（watcher）会排除 <code>av1</code>/<code>work</code>/<code>rpu</code> 目录，避免把转码输出再次入队。</p>
+
+<h2>预设与编码参数</h2>
+<p>预设可在<b>设置</b>页添加/编辑/删除并持久化（存于 <code>dirs.presets_file</code>，默认 <code>/data/presets.json</code>）。自定义预设可覆盖内置同名预设，内置预设删除后自动恢复 config.yaml 中的定义。</p>
+<table>
+  <tr><th>参数</th><th>默认</th><th>说明</th></tr>
+  <tr><td><code>crf</code></td><td>28</td><td>恒定码率因子：越低质量越高、文件越大。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>preset</code></td><td>4</td><td>SVT-AV1 速度档 0-13：0 最慢最好，6 快；4-6 是常见区间。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>passes</code></td><td>1</td><td>编码遍数；2 = 两遍（先探测再编码）。</td></tr>
+  <tr><td><code>film_grain</code></td><td>0</td><td>胶片颗粒合成 0-50；0 关闭，8-10 适合有颗粒的电影源（能显著省码率）。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>film_grain_denoise</code></td><td>false</td><td>合成颗粒前先对源去噪，配合 film_grain 使用。</td></tr>
+  <tr><td><code>keyint</code></td><td>240</td><td>关键帧间隔（帧数）。</td></tr>
+  <tr><td><code>extra_split_sec</code></td><td>60</td><td>长场景按秒数再切分，便于多 worker 并行；0 = 不切。</td></tr>
+  <tr><td><code>min_scene_len</code></td><td>24</td><td>场景检测最小长度（帧），防止过碎分段。</td></tr>
+  <tr><td><code>tune</code></td><td>0</td><td>0=VQ（视觉质量）、1=PSNR、2=SSIM。</td></tr>
+  <tr><td><code>pixel_format</code></td><td>yuv420p10le</td><td>10-bit 保色阶；HDR 源请保持 10bit。</td></tr>
+  <tr><td><code>target_quality</code></td><td>空</td><td>av1an 分场景质量模式，如 <code>75-85</code>（VMAF 0-100）；每个场景自动调 CRF 命中区间。比固定 CRF 慢很多。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>probes</code></td><td>0</td><td>分场景探测次数上限（0 = av1an 默认 4）。越多越准越慢。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>probing_rate</code></td><td>0</td><td>探测时每隔 n 帧取一帧算 VMAF（1 = 全部帧）；n&gt;4 通常不可用。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>probe_res</code></td><td>空</td><td>探测用分辨率（如 <code>960x540</code>），缩小后探测更快。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>probing_vmaf_features</code></td><td>空</td><td>探测用 VMAF 特征组合，如 <code>default motionless</code>、<code>weighted neg</code>。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>vmaf_threads</code></td><td>0</td><td>探测阶段 VMAF 计算线程数（0 = 自动）。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>probe_video_params</code></td><td>空</td><td>探测阶段编码参数，建议更快 preset 如 <code>preset=10</code>；<code>copy</code> = 与正式编码相同。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>additional_video_params</code></td><td>空</td><td>原样透传给 SVT-AV1 的额外参数，空格分隔，如 <code>--sharpness 1</code>。<span class="tag adv">进阶</span></td></tr>
+</table>
+
+<h3>自定义参数（临时覆盖，不落盘）</h3>
+<p>首页表单的“自定义参数”框，或 CLI <code>--custom key=value</code>（可重复），按 <code>key=value</code> 逗号/分号分隔。值会覆盖所选预设的同名字段：</p>
+<pre>crf=24,preset=3,target_quality=75-85,film_grain_denoise=true</pre>
+<p>数字字段自动转 int（crf/preset/film_grain/passes/keyint/extra_split_sec/min_scene_len/tune），布尔字段接受 <code>true/false/1/0</code>（film_grain_denoise），其余按字符串（target_quality、additional_video_params、pixel_format）。预设选 <code>custom</code> 时以默认视频参数为基准，全部由自定义参数决定。</p>
+
+<h2>Dolby Vision / HDR</h2>
+<table>
+  <tr><th>来源</th><th>处理</th></tr>
+  <tr><td>P5（ICtCp）</td><td>libplacebo（Vulkan）转 HDR10 BT.2020+PQ；zscale 为近似备用方案。</td></tr>
+  <tr><td>P7 / P8</td><td>剥离 RPU/EL 后编码基底层；RPU 单独保存为 <code>.rpu.bin</code>。</td></tr>
+  <tr><td>HDR10 / HLG</td><td>保留 mastering display / CLL 元数据（hdr.preserve）原样编码。</td></tr>
+  <tr><td>SDR</td><td>BT.709 直接编码。</td></tr>
+</table>
+
+<h2>config.yaml 全部配置</h2>
+<table>
+  <tr><th>配置段</th><th>键</th><th>说明</th></tr>
+  <tr><td><code>dirs</code></td><td><code>input</code></td><td>监视目录（挂载卷）。</td></tr>
+  <tr><td><code>dirs</code></td><td><code>output / rpu</code></td><td>固定输出目录；<code>null</code> = 源目录下 <code>av1/</code>（RPU 在 <code>av1/rpu/</code>）。</td></tr>
+  <tr><td><code>dirs</code></td><td><code>work</code></td><td>av1an 临时分段目录。</td></tr>
+  <tr><td><code>dirs</code></td><td><code>archive</code></td><td>成功后源文件移入；<code>null</code> = 不移。</td></tr>
+  <tr><td><code>dirs</code></td><td><code>db / logs</code></td><td>SQLite 任务库 / 任务日志目录。</td></tr>
+  <tr><td><code>dirs</code></td><td><code>presets_file / settings_file</code></td><td>网页端预设 / 并行设置持久化文件。</td></tr>
+  <tr><td><code>workers</code></td><td><code>concurrency</code></td><td>并行转码任务数（每个任务内部 av1an 还可多 worker）。</td></tr>
+  <tr><td><code>workers</code></td><td><code>av1an_workers</code></td><td>av1an 内部 chunk 并行数，0 = 自动。</td></tr>
+  <tr><td><code>workers</code></td><td><code>max_retries</code></td><td>失败重试次数。</td></tr>
+  <tr><td><code>watcher</code></td><td><code>enabled / recursive</code></td><td>监视开关 / 递归扫描子目录。</td></tr>
+  <tr><td><code>watcher</code></td><td><code>stable_seconds</code></td><td>文件大小稳定秒数后才入队（防复制中文件）。</td></tr>
+  <tr><td><code>watcher</code></td><td><code>min_size_mb</code></td><td>最小文件大小（MB），过滤小文件/侧车文件。</td></tr>
+  <tr><td><code>watcher</code></td><td><code>extensions</code></td><td>识别的扩展名列表。</td></tr>
+  <tr><td><code>transcode</code></td><td><code>default_preset</code></td><td>未指定预设时的默认值。</td></tr>
+  <tr><td><code>transcode</code></td><td><code>skip_existing_av1 / min_height_to_transcode</code></td><td>已是 AV1 且分辨率 ≥ 阈值时跳过；阈值 0 = 永不跳过。</td></tr>
+  <tr><td><code>transcode</code></td><td><code>keep_temp / delete_source</code></td><td>保留 av1an 临时文件 / 成功后删除源文件。</td></tr>
+  <tr><td><code>transcode.dovi</code></td><td><code>enabled / save_rpu / strip_rpu</code></td><td>DV 转换开关 / 是否保存 RPU / P7·P8 剥离 RPU。</td></tr>
+  <tr><td><code>transcode.dovi</code></td><td><code>p5_method</code></td><td><code>libplacebo</code>（准确，需 Vulkan）或 <code>zscale</code>（近似，纯软件）。</td></tr>
+  <tr><td><code>transcode.hdr</code></td><td><code>preserve</code></td><td>输出保留 mastering display / CLL 元数据。</td></tr>
+  <tr><td><code>web</code></td><td><code>enabled / host / port</code></td><td>Web UI 与 API 服务。</td></tr>
+  <tr><td><code>web</code></td><td><code>api_key</code></td><td>写操作（提交任务/改预设）的 API 密钥；空 = 开放。</td></tr>
+  <tr><td><code>tools</code></td><td><code>ffmpeg / ffprobe / av1an / …</code></td><td>各外部工具的可执行路径。</td></tr>
+</table>
+
+<h2>环境变量覆盖</h2>
+<p>任何配置均可通过环境变量覆盖（容器内优先于 config.yaml）：<code>AV1TC_&lt;段&gt;_&lt;键&gt;</code>，例如：</p>
+<pre>AV1TC_TRANSCODE_VIDEO_CRF=26
+AV1TC_WEB_PORT=9090
+AV1TC_WATCHER_MIN_SIZE_MB=5</pre>
+<p>布尔值接受 <code>1/true/yes/on</code>，数字自动转换。</p>
+
+<h2>CLI 用法</h2>
+<pre>python3 -m app.cli run                    # 完整运行（监视+队列+Web）
+python3 -m app.cli process &lt;file&gt; --single --custom crf=24 --custom preset=3
+python3 -m app.cli process &lt;file&gt; -p compact
+python3 -m app.cli scan                    # 把输入目录现有文件全部入队
+python3 -m app.cli presets                 # 查看当前预设
+python3 -m app.cli status / cancel / check</pre>
+
+<h2>API</h2>
+<table>
+  <tr><th>方法</th><th>路径</th><th>说明</th></tr>
+  <tr><td>GET</td><td><code>/api/health /status /jobs /presets /browse /workers</code></td><td>状态、任务、预设、目录浏览、并行设置。</td></tr>
+  <tr><td>POST</td><td><code>/api/jobs</code></td><td>入队：<code>{"path": "...", "preset": "balanced", "overrides": {"crf": 24}}</code>。</td></tr>
+  <tr><td>POST</td><td><code>/api/jobs/{id}/cancel</code></td><td>取消任务。</td></tr>
+  <tr><td>PUT/DELETE</td><td><code>/api/presets/{name}</code></td><td>新增/修改 / 删除预设（写操作需 api_key）。</td></tr>
+  <tr><td>PUT</td><td><code>/api/settings/workers</code></td><td>并行设置：<code>{"concurrency": 2, "av1an_workers": 4}</code>，即时生效并持久化。</td></tr>
+  <tr><td>GET</td><td><code>/api/jobs/{id}/log</code></td><td>任务日志。</td></tr>
+</table>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,102 @@
+# AV1 Transcode Archive - configuration
+# All values can be overridden via environment variables AV1TC_<SECTION>_<KEY>
+# e.g. AV1TC_TRANSCODE_VIDEO_CRF=26
+
+dirs:
+  input: /media/input        # watch folder (mounted volume)
+  # null (default) => transcode into an `av1/` subdir next to each source
+  # file; RPU extracts go into `<source_dir>/av1/rpu/`. Set to a fixed path
+  # (e.g. /media/output) to collect everything in one place instead.
+  output: null
+  rpu: null                  # null => <source_dir>/av1/rpu (or dirs.output/rpu)
+  work: /media/work          # temp/working files (av1an chunks)
+  archive: /media/archive    # moved here after success (null to keep in place)
+  db: /data/av1transcode.db  # SQLite job database
+  logs: /data/logs
+  presets_file: /data/presets.json   # user presets saved from the web UI
+  settings_file: /data/settings.json # user settings (parallelism) from web UI
+
+workers:
+  concurrency: 1             # parallel transcode jobs (each uses av1an multi-worker)
+  av1an_workers: 0           # av1an internal chunk workers (0 = auto)
+  max_retries: 2
+
+watcher:
+  enabled: true
+  recursive: true
+  stable_seconds: 30         # file must be unchanged this long before processing
+  min_size_mb: 20
+  extensions: [mkv, mp4, mov, m2ts, ts, avi]
+
+transcode:
+  # default preset (see presets below)
+  default_preset: balanced
+  skip_existing_av1: true
+  min_height_to_transcode: 0   # 0 = never re-encode AV1
+  keep_temp: false
+  delete_source: false         # set true to delete source after success
+
+  presets:
+    quality:                   # highest fidelity, slowest
+      crf: 22
+      preset: 2
+      film_grain: 0
+      passes: 1
+      pixel_format: yuv420p10le
+    balanced:                  # default: good quality/speed balance
+      crf: 28
+      preset: 4
+      film_grain: 0
+      passes: 1
+      pixel_format: yuv420p10le
+    compact:                   # smaller files, faster
+      crf: 34
+      preset: 6
+      film_grain: 0
+      passes: 1
+      pixel_format: yuv420p10le
+
+  video:                       # defaults used when preset selected
+    codec: svt-av1
+    crf: 28
+    preset: 4
+    film_grain: 0              # 0=off, 8-10 good for grainy film
+    film_grain_denoise: false
+    passes: 1
+    keyint: 240
+    tune: 0                    # 0=VQ, 1=PSNR, 2=SSIM
+    extra_split_sec: 60
+    min_scene_len: 24
+    pixel_format: yuv420p10le
+    additional_video_params: ""
+
+  dovi:
+    enabled: true
+    save_rpu: true             # extract & archive RPU .bin
+    p5_method: libplacebo      # libplacebo (accurate, needs Vulkan) | zscale (approx)
+    strip_rpu: true            # strip RPU/EL from P7/P8 streams before encode
+
+  hdr:
+    preserve: true             # keep mastering display / CLL on output
+    default_master_display: "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+    default_max_cll: "1000,400"
+
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
+  api_key: ""                  # optional; clients must send X-API-Key
+
+logging:
+  level: INFO
+  file: true
+
+tools:
+  ffmpeg: ffmpeg
+  ffprobe: ffprobe
+  mediainfo: mediainfo
+  av1an: av1an
+  dovi_tool: dovi_tool
+  mkvmerge: mkvmerge
+  mkvextract: mkvextract
+  mkvpropedit: mkvpropedit

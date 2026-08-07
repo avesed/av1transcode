@@ -1,0 +1,41 @@
+services:
+  av1transcode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: av1transcode:latest
+    container_name: av1transcode
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # Mount your media library here. Adjust to your real paths.
+    volumes:
+      - ./media/input:/media/input
+      - ./media/output:/media/output
+      - ./media/rpu:/media/rpu
+      - ./media/work:/media/work
+      - ./media/archive:/media/archive
+      - ./config.yaml:/app/config.yaml:ro
+      - av1data:/data
+    environment:
+      # Everything below can also be set in config.yaml
+      - AV1TC_WORKERS_CONCURRENCY=1
+      - AV1TC_WORKERS_AV1AN_WORKERS=${AV1AN_WORKERS:-0}
+      # P5 -> HDR10 via libplacebo needs a Vulkan device.
+      # Without a GPU, use Mesa's llvmpipe software renderer (slow but works):
+      - MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+      - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      - TZ=Asia/Shanghai
+    # Optional: pass through a real GPU for hardware-accelerated libplacebo.
+    # device_filters: ["/dev/dri/renderD128"]
+    # group_add: ["render"]
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  av1data:

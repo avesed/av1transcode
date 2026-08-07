@@ -1,0 +1,29 @@
+# Runtime data
+data/
+media/
+*.db
+*.db-wal
+*.db-shm
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.playwright-mcp/

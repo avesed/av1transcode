@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>设置 - AV1 Transcode Archive</title>
+  <style>
+    :root {
+      --bg: #14161a; --panel: #1d2128; --border: #2c323c;
+      --text: #dfe3e9; --muted: #8b95a5; --accent: #4f9cf9;
+      --ok: #3ecf6e; --warn: #e3b341; --err: #ef6b6b;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+           background: var(--bg); color: var(--text); }
+    header { display: flex; align-items: center; gap: 16px; padding: 14px 22px;
+             background: var(--panel); border-bottom: 1px solid var(--border); }
+    header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    header nav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-left: 14px; }
+    header nav a:hover { color: var(--text); }
+    main { padding: 20px 22px; max-width: 900px; margin: 0 auto; }
+    h2 { font-size: 15px; margin: 24px 0 12px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+            padding: 14px 16px; margin-bottom: 10px; display: flex; align-items: center; gap: 14px; }
+    .card .name { font-weight: 600; font-size: 14px; min-width: 110px; }
+    .card .params { flex: 1; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; }
+    .badge.builtin { background: rgba(139,149,165,.15); color: var(--muted); }
+    .badge.user { background: rgba(79,156,249,.15); color: var(--accent); }
+    .card button { margin-left: 4px; }
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+             padding: 6px 12px; cursor: pointer; font-size: 12px; }
+    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    button.danger { background: transparent; border: 1px solid var(--err); color: var(--err); }
+    form.editor { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+                  padding: 16px; margin-bottom: 14px; display: none; }
+    form.editor.open { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 14px; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { color: var(--muted); font-size: 11px; }
+    .field input, .field select { background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 7px 10px; color: var(--text); font-size: 13px; width: 100%; }
+    .field.full { grid-column: 1 / -1; }
+    .editor-actions { margin-top: 14px; display: flex; gap: 8px; align-items: center; }
+    #msg { margin: 10px 0; font-size: 13px; min-height: 18px; }
+    #msg.ok { color: var(--ok); } #msg.err { color: var(--err); }
+    .empty { text-align: center; color: var(--muted); padding: 20px; font-size: 13px; }
+    .hint { color: var(--muted); font-size: 12px; margin: 4px 0 14px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>AV1 Transcode Archive</h1>
+  <nav>
+    <a href="/">首页</a>
+    <a href="/static/settings.html">设置</a>
+    <a href="/static/docs.html">说明</a>
+  </nav>
+</header>
+<main>
+  <h2>并行处理</h2>
+  <p class="hint">同时转码的任务数（concurrency）与每个任务内部的 av1an 切片并行数（av1an_workers，0=自动吃满所有核心）。修改即时生效并持久化到 settings_file。</p>
+  <form class="editor open" id="workersForm" style="margin-bottom:24px">
+    <div class="grid">
+      <div class="field">
+        <label>concurrency（并行任务数）</label>
+        <input type="number" id="w-concurrency" min="1" max="64">
+      </div>
+      <div class="field">
+        <label>av1an_workers（任务内切片并行，0=自动）</label>
+        <input type="number" id="w-av1an_workers" min="0" max="128">
+      </div>
+    </div>
+    <div class="editor-actions">
+      <button type="submit" id="workersSaveBtn">保存并行设置</button>
+      <span class="hint" id="workersActive" style="margin:0"></span>
+    </div>
+  </form>
+
+  <h2>编码预设</h2>
+  <p class="hint">预设即一组编码参数（CRF、速度 preset、胶片颗粒等）。修改会持久化到 presets_file（不会改动 config.yaml）。同名自定义预设会覆盖内置预设。</p>
+  <button id="newBtn">＋ 新建预设</button>
+  <div id="msg"></div>
+
+  <form class="editor" id="editor">
+    <h2 id="editorTitle" style="margin-top:0">新建预设</h2>
+    <div class="grid">
+      <div class="field">
+        <label>名称（用于 CLI/API 的 --preset）</label>
+        <input type="text" id="f-name" placeholder="e.g. anime, film, speed">
+      </div>
+      <div class="field">
+        <label>CRF（码率质量，越低越清晰/越慢）</label>
+        <input type="number" id="f-crf" value="28" min="0" max="63">
+      </div>
+      <div class="field">
+        <label>SVT-AV1 preset（0=最慢最好, 13=最快）</label>
+        <input type="number" id="f-preset" value="4" min="0" max="13">
+      </div>
+      <div class="field">
+        <label>胶片颗粒合成（0=关, 8-10 适合颗粒电影）</label>
+        <input type="number" id="f-film_grain" value="0" min="0" max="50">
+      </div>
+      <div class="field">
+        <label>film_grain_denoise（去噪再合成颗粒）</label>
+        <select id="f-film_grain_denoise">
+          <option value="false">false</option>
+          <option value="true">true</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>passes（编码遍数）</label>
+        <input type="number" id="f-passes" value="1" min="1" max="2">
+      </div>
+      <div class="field">
+        <label>keyint（关键帧间隔）</label>
+        <input type="number" id="f-keyint" value="240" min="0">
+      </div>
+      <div class="field">
+        <label>extra_split_sec（秒，长场景再切分）</label>
+        <input type="number" id="f-extra_split_sec" value="60" min="0">
+      </div>
+      <div class="field">
+        <label>min_scene_len（最小场景长度）</label>
+        <input type="number" id="f-min_scene_len" value="24" min="0">
+      </div>
+      <div class="field">
+        <label>tune（0=VQ 1=PSNR 2=SSIM）</label>
+        <input type="number" id="f-tune" value="0" min="0" max="2">
+      </div>
+      <div class="field">
+        <label>pixel_format</label>
+        <select id="f-pixel_format">
+          <option value="yuv420p10le">yuv420p10le（默认）</option>
+          <option value="yuv420p8le">yuv420p8le</option>
+          <option value="yuv420p12le">yuv420p12le</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>target_quality（分场景质量，如 75-85，留空=固定 CRF）</label>
+        <input type="text" id="f-target_quality" placeholder="75-85">
+      </div>
+      <div class="field">
+        <label>probes（探测次数上限，0=默认4）</label>
+        <input type="number" id="f-probes" value="0" min="0" max="10">
+      </div>
+      <div class="field">
+        <label>probing_rate（每隔 n 帧探测，1=全部）</label>
+        <input type="number" id="f-probing_rate" value="0" min="0" max="4">
+      </div>
+      <div class="field">
+        <label>probe_res（探测分辨率，如 960x540）</label>
+        <input type="text" id="f-probe_res" placeholder="960x540">
+      </div>
+      <div class="field">
+        <label>probing_vmaf_features（如 weighted neg motionless）</label>
+        <input type="text" id="f-probing_vmaf_features" placeholder="default motionless">
+      </div>
+      <div class="field">
+        <label>vmaf_threads（VMAF 计算线程数，0=自动）</label>
+        <input type="number" id="f-vmaf_threads" value="0" min="0">
+      </div>
+      <div class="field full">
+        <label>probe_video_params（探测时编码参数，建议更快 preset；copy=同正式编码）</label>
+        <input type="text" id="f-probe_video_params" placeholder="preset=10">
+      </div>
+      <div class="field full">
+        <label>additional_video_params（透传给 SVT-AV1 的额外参数，空格分隔）</label>
+        <input type="text" id="f-additional_video_params" placeholder="--sharpness 1 --enable-qm 1">
+      </div>
+    </div>
+    <div class="editor-actions">
+      <button type="submit" id="saveBtn">保存</button>
+      <button type="button" class="ghost" id="cancelBtn">取消</button>
+      <span class="hint" id="editingHint" style="margin:0"></span>
+    </div>
+  </form>
+
+  <div id="list"></div>
+</main>
+<script>
+const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const $ = id => document.getElementById(id);
+let msgTimer = null;
+function showMsg(text, ok) {
+  const m = $("msg");
+  m.textContent = text; m.className = ok ? "ok" : "err";
+  clearTimeout(msgTimer); msgTimer = setTimeout(() => { m.textContent = ""; m.className = ""; }, 4000);
+}
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    let msg = `HTTP ${r.status}`;
+    try { const b = await r.json(); if (b && b.detail) msg = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch(_) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+async function loadList() {
+  const presets = await api("/api/presets");
+  const list = $("list");
+  const names = Object.keys(presets);
+  if (!names.length) { list.innerHTML = `<div class="empty">暂无预设</div>`; return; }
+  list.innerHTML = "";
+  for (const name of names.sort()) {
+    const p = presets[name];
+    const lines = [
+      `crf=${p.crf} · preset=${p.preset} · passes=${p.passes}`,
+      `pix_fmt=${p.pixel_format}`,
+    ];
+    if (p.film_grain) lines.push(`film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
+    if (p.target_quality) lines.push(`target_quality=${p.target_quality}`);
+    if (p.additional_video_params) lines.push(p.additional_video_params);
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
+      <div class="name">${esc(name)}</div>
+      <span class="badge ${p._builtin ? "builtin" : "user"}">${p._builtin ? "内置" : "自定义"}</span>
+      <div class="params">${lines.join("<br>")}</div>
+      <button class="ghost" data-edit="${esc(name)}">编辑</button>
+      <button class="danger" data-del="${esc(name)}">删除</button>`;
+    list.appendChild(card);
+  }
+}
+function fillForm(name, p) {
+  $("f-name").value = name;
+  $("f-name").disabled = !!name;
+  $("f-crf").value = p?.crf ?? 28;
+  $("f-preset").value = p?.preset ?? 4;
+  $("f-film_grain").value = p?.film_grain ?? 0;
+  $("f-film_grain_denoise").value = String(!!p?.film_grain_denoise);
+  $("f-passes").value = p?.passes ?? 1;
+  $("f-keyint").value = p?.keyint ?? 240;
+  $("f-extra_split_sec").value = p?.extra_split_sec ?? 60;
+  $("f-min_scene_len").value = p?.min_scene_len ?? 24;
+  $("f-tune").value = p?.tune ?? 0;
+  $("f-pixel_format").value = p?.pixel_format ?? "yuv420p10le";
+  $("f-target_quality").value = p?.target_quality ?? "";
+  $("f-probes").value = p?.probes ?? 0;
+  $("f-probing_rate").value = p?.probing_rate ?? 0;
+  $("f-probe_res").value = p?.probe_res ?? "";
+  $("f-probing_vmaf_features").value = p?.probing_vmaf_features ?? "";
+  $("f-vmaf_threads").value = p?.vmaf_threads ?? 0;
+  $("f-probe_video_params").value = p?.probe_video_params ?? "";
+  $("f-additional_video_params").value = p?.additional_video_params ?? "";
+  $("editorTitle").textContent = name ? `编辑预设 ${name}` : "新建预设";
+  $("editingHint").textContent = name ? "保存将覆盖该预设并持久化。" : "";
+  $("editor").classList.add("open");
+}
+function collectForm() {
+  return {
+    crf: parseInt($("f-crf").value, 10),
+    preset: parseInt($("f-preset").value, 10),
+    film_grain: parseInt($("f-film_grain").value, 10),
+    film_grain_denoise: $("f-film_grain_denoise").value === "true",
+    passes: parseInt($("f-passes").value, 10),
+    keyint: parseInt($("f-keyint").value, 10),
+    extra_split_sec: parseInt($("f-extra_split_sec").value, 10),
+    min_scene_len: parseInt($("f-min_scene_len").value, 10),
+    tune: parseInt($("f-tune").value, 10),
+    pixel_format: $("f-pixel_format").value,
+    target_quality: $("f-target_quality").value.trim(),
+    probes: parseInt($("f-probes").value, 10) || 0,
+    probing_rate: parseInt($("f-probing_rate").value, 10) || 0,
+    probe_res: $("f-probe_res").value.trim(),
+    probing_vmaf_features: $("f-probing_vmaf_features").value.trim(),
+    vmaf_threads: parseInt($("f-vmaf_threads").value, 10) || 0,
+    probe_video_params: $("f-probe_video_params").value.trim(),
+    additional_video_params: $("f-additional_video_params").value.trim(),
+  };
+}
+$("newBtn").addEventListener("click", () => { fillForm("", null); });
+$("cancelBtn").addEventListener("click", () => { $("editor").classList.remove("open"); $("f-name").disabled = false; });
+$("editor").addEventListener("submit", async e => {
+  e.preventDefault();
+  const name = $("f-name").value.trim();
+  if (!name) { showMsg("请填写预设名称", false); return; }
+  try {
+    const body = collectForm();
+    await api(`/api/presets/${encodeURIComponent(name)}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    showMsg(`已保存预设 "${name}"`, true);
+    $("editor").classList.remove("open");
+    $("f-name").disabled = false;
+    loadList();
+  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
+});
+$("list").addEventListener("click", async e => {
+  const editBtn = e.target.closest("button[data-edit]");
+  const delBtn = e.target.closest("button[data-del]");
+  if (editBtn) {
+    const presets = await api("/api/presets");
+    fillForm(editBtn.dataset.edit, presets[editBtn.dataset.edit]);
+  }
+  if (delBtn) {
+    const name = delBtn.dataset.del;
+    if (!confirm(`删除预设 "${name}"？${presetsBuiltin(name) ? "（内置预设将恢复为 config.yaml 默认值）" : ""}`)) return;
+    try {
+      await api(`/api/presets/${encodeURIComponent(name)}`, { method: "DELETE" });
+      showMsg(`已删除 "${name}"`, true);
+async function loadWorkers() {
+  try {
+    const w = await api("/api/workers");
+    $("w-concurrency").value = w.concurrency;
+    $("w-av1an_workers").value = w.av1an_workers;
+    $("workersActive").textContent = `当前运行中 worker: ${w.active_worker_count}`;
+  } catch (err) {
+    $("workersActive").textContent = `读取并行设置失败: ${err.message}`;
+  }
+}
+$("workersForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    const concurrency = parseInt($("w-concurrency").value, 10);
+    const av1an_workers = parseInt($("w-av1an_workers").value, 10);
+    if (!concurrency || concurrency < 1) { showMsg("concurrency 必须 >= 1", false); return; }
+    const r = await api("/api/settings/workers", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ concurrency, av1an_workers }),
+    });
+    showMsg(`已保存并行设置（concurrency=${r.workers.concurrency}, av1an_workers=${r.workers.av1an_workers}）`, true);
+    loadWorkers();
+  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
+});
+loadWorkers();
+loadList();
+    } catch (err) { showMsg(`删除失败: ${err.message}`, false); }
+  }
+});
+async function presetsBuiltin(name) {
+  const presets = await api("/api/presets");
+  return !!(presets[name] && presets[name]._builtin);
+}
+loadList();
+</script>
+</body>
+</html>

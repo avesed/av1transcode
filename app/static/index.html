@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AV1 Transcode Archive</title>
+  <style>
+    :root {
+      --bg: #14161a; --panel: #1d2128; --border: #2c323c;
+      --text: #dfe3e9; --muted: #8b95a5; --accent: #4f9cf9;
+      --ok: #3ecf6e; --warn: #e3b341; --err: #ef6b6b;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+           background: var(--bg); color: var(--text); }
+    header { display: flex; align-items: center; gap: 16px; padding: 14px 22px;
+             background: var(--panel); border-bottom: 1px solid var(--border); }
+    header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .badge { font-size: 12px; padding: 3px 10px; border-radius: 99px; }
+    .badge.ok { background: rgba(62,207,110,.15); color: var(--ok); }
+    main { padding: 20px 22px; max-width: 1200px; margin: 0 auto; }
+    .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+    .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+            padding: 10px 18px; }
+    .stat b { display: block; font-size: 20px; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel);
+            border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    th, td { text-align: left; padding: 10px 14px; font-size: 13px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; }
+    .bar { width: 120px; height: 6px; background: #2a2f3a; border-radius: 4px; overflow: hidden; }
+    .bar > div { height: 100%; background: var(--accent); }
+    .st-done { color: var(--ok); } .st-failed { color: var(--err); }
+    .st-pending { color: var(--warn); } .st-running { color: var(--accent); }
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+             padding: 6px 12px; cursor: pointer; font-size: 12px; }
+    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    form { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+    input[type=text] { flex: 1; min-width: 200px; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 12px; color: var(--text); }
+    select { max-width:180px; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 13px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .empty { text-align: center; color: var(--muted); padding: 30px; }
+    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none;
+                align-items: center; justify-content: center; z-index: 50; }
+    .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+             width: min(720px, 94vw); max-height: 82vh; display: flex; flex-direction: column; }
+    .modal h3 { margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 14px; }
+    .bpath { color: var(--muted); font-size: 12px; padding: 8px 16px 0; word-break: break-all; }
+    .btree { overflow-y: auto; padding: 8px; flex: 1; }
+    .brow { display: flex; gap: 8px; align-items: center; padding: 7px 10px; border-radius: 6px;
+            cursor: pointer; font-size: 13px; }
+    .brow:hover { background: #262c36; }
+    .brow .ico { width: 18px; text-align: center; color: var(--muted); }
+    .brow.d { color: var(--accent); }
+    .brow .sz { margin-left: auto; color: var(--muted); font-size: 11px; }
+    .modal-foot { padding: 10px 16px; border-top: 1px solid var(--border); display: flex;
+                  justify-content: flex-end; gap: 8px; }
+    #path { background: var(--panel); }
+    .custom-hint { width: 100%; color: var(--muted); font-size: 12px; margin-top: -10px; }
+    #custom:disabled { opacity: .4; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>AV1 Transcode Archive</h1>
+  <span class="badge ok" id="sysinfo">loading…</span>
+  <nav style="margin-left:auto">
+    <a href="/static/settings.html" style="color:var(--muted);text-decoration:none;font-size:13px;margin-left:14px">设置</a>
+    <a href="/static/docs.html" style="color:var(--muted);text-decoration:none;font-size:13px;margin-left:14px">说明</a>
+  </nav>
+</header>
+<main>
+  <div class="stats" id="stats"></div>
+  <form id="submit">
+    <input type="text" id="path" placeholder="绝对路径：/media/input/xxx.mkv 或目录">
+    <button type="button" class="ghost" id="browseBtn">浏览…</button>
+    <select id="preset"></select>
+    <input type="text" id="custom" placeholder="自定义参数: crf=24,preset=3,target_quality=75-85" style="max-width:280px">
+    <button type="submit">提交转码</button>
+    <div class="custom-hint" id="customHint">提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。</div>
+  </form>
+  <div id="error" style="display:none;color:var(--err);margin-bottom:12px;font-size:13px"></div>
+  <div class="modal-bg" id="modalBg">
+    <div class="modal">
+      <h3>目录浏览</h3>
+      <div class="bpath" id="bpath">/</div>
+      <div class="btree" id="btree"></div>
+      <div class="modal-foot">
+        <button class="ghost" id="bUsePath" style="display:none">填入当前路径</button>
+        <button class="ghost" id="bClose">关闭</button>
+      </div>
+    </div>
+  </div>
+  <table>
+    <thead><tr>
+      <th>状态</th><th>文件</th><th>进度</th><th>阶段</th><th>预设</th><th>大小</th><th>操作</th>
+    </tr></thead>
+    <tbody id="jobs"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">暂无任务</div>
+</main>
+<script>
+const fmt = n => { if (n==null) return "–"; const u=["B","KB","MB","GB","TB"]; let i=0;
+  while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
+const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const stCls = s => "st-"+esc(s);
+async function loadPresets() {
+  try {
+    const r = await fetch("/api/presets").then(r=>r.json());
+    const sel = document.getElementById("preset");
+    const names = Object.keys(r);
+    sel.innerHTML = "";
+    const opt = names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    sel.innerHTML = opt + `<option value="custom">custom（自定义）</option>`;
+    sel.value = "balanced";
+    if (!names.includes("balanced") && names.length) sel.value = names[0];
+    syncCustom();
+  } catch(e) { /* presets endpoint is best-effort */ }
+}
+function syncCustom() {
+  const isCustom = document.getElementById("preset").value === "custom";
+  document.getElementById("customHint").textContent = isCustom
+    ? "custom 模式：以默认参数为基准，自定义参数框中的值全部生效（留空等于默认 preset）。"
+    : "提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。";
+}
+document.getElementById("preset").addEventListener("change", syncCustom);
+async function refresh() {
+  const [s, jobs] = await Promise.all([
+    fetch("/api/status").then(r=>r.json()),
+    fetch("/api/jobs?limit=50").then(r=>r.json()),
+  ]);
+  document.getElementById("sysinfo").textContent =
+    `队列 ${s.queue_len} · worker ${s.workers_running?"运行中":"停止"}`;
+  document.getElementById("stats").innerHTML = Object.entries(s.jobs).map(([k,v]) =>
+    `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join("");
+  const t = document.getElementById("jobs");
+  t.innerHTML = "";
+  document.getElementById("empty").style.display = jobs.length ? "none" : "block";
+  for (const j of jobs) {
+    const meta = j.meta || {};
+    const size = j.size_after ? fmt(j.size_after) : (j.meta ? fmt(j.meta.size) : "–");
+    const ov = (j.params && j.params.overrides) || {};
+    const ovKeys = Object.keys(ov);
+    const paramCell = ovKeys.length
+      ? `${esc(j.params?.preset||"")}<div class="muted">${esc(ovKeys.map(k=>k+"="+ov[k]).join(", "))}</div>`
+      : esc(j.params?.preset||"");
+    const err = j.error ? `<div class="muted" style="color:var(--err)">${esc(j.error)}</div>` : "";
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="${stCls(j.status)}">${esc(j.status)}</td>
+      <td>${esc((j.meta&&j.meta.display)||(j.source||"").split("/").pop())}
+          <div class="muted">${esc(j.source||"")}</div>${err}</td>
+      <td><div class="bar"><div style="width:${j.progress||0}%"></div></div>
+          <span class="muted">${(j.progress||0).toFixed(0)}%</span></td>
+      <td class="muted">${esc(j.stage||"")}</td>
+      <td class="muted">${paramCell}</td>
+      <td class="muted">${size}</td>
+      <td>${["running","pending","analyzing"].includes(j.status)
+        ? `<button class="ghost" data-id="${j.id}">取消</button>` : ""}
+          ${(j.status==="failed"||j.status==="done") ? `<button class="ghost" data-log="${j.id}">日志</button>` : ""}</td>`;
+    t.appendChild(tr);
+  }
+}
+document.getElementById("submit").addEventListener("submit", async e => {
+  e.preventDefault();
+  const path = document.getElementById("path").value.trim();
+  const preset = document.getElementById("preset").value || "";
+  const err = document.getElementById("error");
+  err.style.display = "none";
+  if (!path) { err.textContent = "请输入要转码的文件或目录路径"; err.style.display = "block"; return; }
+  // parse custom params: "crf=24,preset=3,target_quality=75-85"
+  const overrides = {};
+  const raw = document.getElementById("custom").value.trim();
+  if (raw) {
+    for (const pair of raw.split(/[,;]/)) {
+      const kv = pair.trim().split("=");
+      if (kv.length !== 2 || !kv[0].trim()) {
+        err.textContent = `自定义参数格式错误: "${pair.trim()}"（应为 key=value）`;
+        err.style.display = "block"; return;
+      }
+      overrides[kv[0].trim()] = kv[1].trim();
+    }
+  }
+  const r = await fetch("/api/jobs", { method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({path, preset, overrides}) });
+  if (!r.ok) {
+    let msg = `提交失败 (HTTP ${r.status})`;
+    try { const b = await r.json(); if (b && b.detail) msg = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch(_) {}
+    err.textContent = msg; err.style.display = "block"; return;
+  }
+  document.getElementById("path").value = "";
+  refresh();
+});
+document.getElementById("jobs").addEventListener("click", async e => {
+  const btn = e.target.closest("button[data-id]");
+  const logBtn = e.target.closest("button[data-log]");
+  if (btn) { await fetch(`/api/jobs/${btn.dataset.id}/cancel`, {method:"POST"}); refresh(); }
+  if (logBtn) { window.open(`/api/jobs/${logBtn.dataset.log}/log`, "_blank"); }
+});
+// ---- directory browser ----
+const modalBg = document.getElementById("modalBg");
+const btree = document.getElementById("btree");
+const bpath = document.getElementById("bpath");
+const fmt2 = n => { if (n==null) return ""; const u=["B","KB","MB","GB"]; let i=0;
+  while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
+let curPath = "/";
+async function openBrowser(path) {
+  curPath = path || "/";
+  modalBg.style.display = "flex";
+  await renderBrowse();
+}
+async function renderBrowse() {
+  let d;
+  try { d = await fetch("/api/browse?path="+encodeURIComponent(curPath)).then(r=>{ if(!r.ok) throw 0; return r.json(); }); }
+  catch(_) { bpath.textContent = "无法读取 " + curPath; btree.innerHTML = `<div class="empty">读取失败</div>`; return; }
+  bpath.textContent = d.path;
+  let html = "";
+  if (d.parent) html += `<div class="brow d" data-dir="${esc(d.parent)}"><span class="ico">↑</span>..</div>`;
+  for (const e of d.entries || []) {
+    if (e.dir) html += `<div class="brow d" data-dir="${esc(d.path)}/${esc(e.name)}"><span class="ico">▸</span>${esc(e.name)}</div>`;
+    else html += `<div class="brow" data-file="${esc(d.path)}/${esc(e.name)}"><span class="ico">·</span>${esc(e.name)}<span class="sz">${fmt2(e.size)}</span></div>`;
+  }
+  btree.innerHTML = html || `<div class="empty">（空目录）</div>`;
+}
+btree.addEventListener("click", e => {
+  const dir = e.target.closest(".brow.d");
+  const file = e.target.closest(".brow[data-file]");
+  if (dir) { curPath = dir.dataset.dir; renderBrowse(); }
+  if (file) {
+    document.getElementById("path").value = file.dataset.file;
+    modalBg.style.display = "none";
+  }
+});
+document.getElementById("browseBtn").addEventListener("click", () => openBrowser(document.getElementById("path").value.trim() || "/media"));
+document.getElementById("bClose").addEventListener("click", () => modalBg.style.display = "none");
+modalBg.addEventListener("click", e => { if (e.target === modalBg) modalBg.style.display = "none"; });
+loadPresets();
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>
