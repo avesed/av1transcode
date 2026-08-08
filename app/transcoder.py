@@ -23,6 +23,7 @@ class TranscodeError(Exception):
 
 def _to_svt_flags(params: str) -> str:
     """Normalize "key=value key=value" input to "--key value --key value".
+    Also accepts "--key=value" and converts to "--key value".
 
     av1an forwards --probe-video-params verbatim to the encoder binary, and
     SvtAv1EncApp (SVT-AV1 v4) only accepts the "--key value" form.
@@ -31,7 +32,11 @@ def _to_svt_flags(params: str) -> str:
     for tok in params.split():
         if "=" in tok:
             k, v = tok.split("=", 1)
-            parts.append(f"--{k} {v}")
+            # If key already starts with '-', don't add another '--'
+            if k.startswith("-"):
+                parts.append(f"{k} {v}")
+            else:
+                parts.append(f"--{k} {v}")
         else:
             parts.append(tok)
     return " ".join(parts)
@@ -50,7 +55,7 @@ def av1_video_params(video: VideoParams) -> List[str]:
         if not video.film_grain_denoise:
             parts.append("--film-grain-denoise 0")
     if video.additional_video_params:
-        parts.append(video.additional_video_params)
+        parts.append(_to_svt_flags(video.additional_video_params))
     return parts
 
 
