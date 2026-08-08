@@ -55,10 +55,9 @@
 <p>各取值对资源占用的影响：<code>concurrency × av1an_workers</code> 约等于峰值同时运行的编码进程数。减小编号即时生效：已排队的任务不受影响，当前任务完成后对应的 worker 会自动退出。</p>
 
 <h2>工作流程</h2>
-<p>系统监控输入目录（<code>dirs.input</code>），发现稳定的视频文件后自动入队分析：
-Dolby Vision P5/P7/P8 会转成 HDR10（保留/附带 RPU），HDR10/HLG/SDR 直接编码为 AV1（SVT-AV1），随后按预设的码率/质量参数编码输出。</p>
+<p><b>默认不会自动入队任何文件</b>（<code>watcher.enabled: false</code>）：只有通过首页表单 / API <code>POST /api/jobs</code> 手动指定的文件或目录才会被转码。如需恢复自动监视，在 config.yaml 中设置 <code>watcher.enabled: true</code>。</p>
+<p>提交的文件会分析（Dolby Vision P5/P7/P8 → HDR10（保留/附带 RPU），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
 <ul>
-  <li>已跳过非视频文件与小于 <code>watcher.min_size_mb</code> 的文件。</li>
   <li>已是 AV1 的源默认跳过（<code>skip_existing_av1</code>）。</li>
   <li>成功后可归档（移到 <code>dirs.archive</code>）或删除源文件。</li>
 </ul>
@@ -124,7 +123,7 @@ Dolby Vision P5/P7/P8 会转成 HDR10（保留/附带 RPU），HDR10/HLG/SDR 直
   <tr><td><code>workers</code></td><td><code>concurrency</code></td><td>并行转码任务数（每个任务内部 av1an 还可多 worker）。</td></tr>
   <tr><td><code>workers</code></td><td><code>av1an_workers</code></td><td>av1an 内部 chunk 并行数，0 = 自动。</td></tr>
   <tr><td><code>workers</code></td><td><code>max_retries</code></td><td>失败重试次数。</td></tr>
-  <tr><td><code>watcher</code></td><td><code>enabled / recursive</code></td><td>监视开关 / 递归扫描子目录。</td></tr>
+  <tr><td><code>watcher</code></td><td><code>enabled / recursive</code></td><td>自动监视开关（默认 <code>false</code>，仅手动提交）/ 递归扫描子目录。</td></tr>
   <tr><td><code>watcher</code></td><td><code>stable_seconds</code></td><td>文件大小稳定秒数后才入队（防复制中文件）。</td></tr>
   <tr><td><code>watcher</code></td><td><code>min_size_mb</code></td><td>最小文件大小（MB），过滤小文件/侧车文件。</td></tr>
   <tr><td><code>watcher</code></td><td><code>extensions</code></td><td>识别的扩展名列表。</td></tr>

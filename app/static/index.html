@@ -88,7 +88,7 @@
       <div class="bpath" id="bpath">/</div>
       <div class="btree" id="btree"></div>
       <div class="modal-foot">
-        <button class="ghost" id="bUsePath" style="display:none">填入当前路径</button>
+        <button class="ghost" id="bUsePath">选择当前目录</button>
         <button class="ghost" id="bClose">关闭</button>
       </div>
     </div>
@@ -235,6 +235,10 @@ btree.addEventListener("click", e => {
   }
 });
 document.getElementById("browseBtn").addEventListener("click", () => openBrowser(document.getElementById("path").value.trim() || "/media"));
+document.getElementById("bUsePath").addEventListener("click", () => {
+  document.getElementById("path").value = curPath;
+  modalBg.style.display = "none";
+});
 document.getElementById("bClose").addEventListener("click", () => modalBg.style.display = "none");
 modalBg.addEventListener("click", e => { if (e.target === modalBg) modalBg.style.display = "none"; });
 loadPresets();

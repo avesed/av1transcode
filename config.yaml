@@ -22,7 +22,7 @@ workers:
   max_retries: 2
 
 watcher:
-  enabled: true
+  enabled: false           # 默认关闭自动入队；仅转码用户手动提交的文件/目录
   recursive: true
   stable_seconds: 30         # file must be unchanged this long before processing
   min_size_mb: 20
