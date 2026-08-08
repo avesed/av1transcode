@@ -120,6 +120,8 @@ def run_av1an(
 
     env = dict(os.environ)
     env.setdefault("AV1AN_LOG_LEVEL", "info")
+    # enable full backtrace for panics
+    env["RUST_BACKTRACE"] = "full"
     logger.debug("av1an env: {}", env)
     log_handle = open(log_path, "w", buffering=1) if log_path else None
     proc: Optional[subprocess.Popen] = None
@@ -174,7 +176,27 @@ def run_av1an(
             rc = proc.poll()
             if rc is not None:
                 if rc != 0:
-                    raise TranscodeError(f"av1an exited with code {rc}; log: {log_path}")
+                    # try to extract more detail from the log file
+                    tail = []
+                    lines = []
+                    if log_path and log_path.exists():
+                        try:
+                            with open(log_path) as f:
+                                lines = f.read().strip().splitlines()
+                                tail = lines[-20:]  # last 20 lines
+                        except Exception:
+                            pass
+                        # if log ends with "Scene detection" with no further output,
+                        # likely scene detection failed
+                        if len(lines) >= 1 and "Scene detection" in lines[-1]:
+                            raise TranscodeError(
+                                f"av1an scene detection failed (no scenes found?); exit code {rc}; "
+                                f"log: {log_path}"
+                            )
+                    error_msg = f"av1an exited with code {rc}; log: {log_path}"
+                    if tail:
+                        error_msg += f"\nLast log lines:\n" + "\n".join(tail[-10:])
+                    raise TranscodeError(error_msg)
                 break
             # watchdog: no output for 90s => log a warning (scene detection
             # on long files is single-threaded and can look stalled)
