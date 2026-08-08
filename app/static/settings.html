@@ -79,7 +79,7 @@
 
   <h2 style="color:#d33;margin-top:32px">危险操作</h2>
   <p class="hint" style="color:#d33">以下开关会造成<b>不可逆的数据损失</b>，请谨慎操作。</p>
-  <form class="editor" id="safetyForm" style="margin-bottom:24px">
+  <form class="editor open" id="safetyForm" style="margin-bottom:24px">
     <div class="grid">
       <div class="field">
         <label>转码成功后删除源文件</label>
@@ -318,6 +318,11 @@ $("list").addEventListener("click", async e => {
     try {
       await api(`/api/presets/${encodeURIComponent(name)}`, { method: "DELETE" });
       showMsg(`已删除 "${name}"`, true);
+      loadList();
+    } catch (err) { showMsg(`删除失败: ${err.message}`, false); }
+  }
+});
+
 async function loadWorkers() {
   try {
     const w = await api("/api/workers");
@@ -342,6 +347,7 @@ $("workersForm").addEventListener("submit", async e => {
     loadWorkers();
   } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
 });
+
 async function loadSafety() {
   try {
     const s = await api("/api/settings/safety");
@@ -370,16 +376,13 @@ $("safetyForm").addEventListener("submit", async e => {
     loadSafety();
   } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
 });
-loadWorkers();
-loadSafety();
-loadList();
-    } catch (err) { showMsg(`删除失败: ${err.message}`, false); }
-  }
-});
+
 async function presetsBuiltin(name) {
   const presets = await api("/api/presets");
   return !!(presets[name] && presets[name]._builtin);
 }
+loadWorkers();
+loadSafety();
 loadList();
 </script>
 </body>
