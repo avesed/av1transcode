@@ -115,13 +115,16 @@ def run_av1an(
     cancel_flag: Optional[Callable[[], bool]] = None,
     stage_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Run av1an, streaming stdout to log, reporting progress %, honoring cancel.
+    """Run av1an under a pty, streaming stdout to log, reporting progress %.
 
-    av1an's stdout is drained by a background thread so a stalled process
-    (no output) can still be cancelled. The main loop polls both the process
-    and the cancel flag, and kills the whole process group on cancel.
+    av1an only renders its progress bar when stdout is a terminal, so it is
+    started on a pty (master/slave pair): the slave is the child's stdout, the
+    parent drains the master. Progress lines like "NN% frames/total" are parsed
+    and forwarded to progress_cb. Cancel is honored by polling both the pty
+    and the cancel flag, killing the whole process group on cancel.
     """
     import fcntl  # noqa: PLC0415
+    import pty  # noqa: PLC0415
 
     env = dict(os.environ)
     env.setdefault("AV1AN_LOG_LEVEL", "info")
@@ -130,54 +133,87 @@ def run_av1an(
     logger.debug("av1an env: {}", env)
     log_handle = open(log_path, "w", buffering=1) if log_path else None
     proc: Optional[subprocess.Popen] = None
+    master_fd: Optional[int] = None
+
+    def _read_available() -> str:
+        """Non-blocking read of everything currently buffered on the pty."""
+        out = []
+        while True:
+            try:
+                chunk = os.read(master_fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            if not chunk:
+                break
+            out.append(chunk)
+        return b"".join(out).decode("utf-8", errors="replace")
+
     try:
+        master_fd, slave_fd = pty.openpty()
+        os.set_blocking(master_fd, False)
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
             env=env,
             start_new_session=True,  # own process group so we can kill children
         )
-        assert proc.stdout is not None
-        # make stdout reads non-blocking so a stuck av1an can't wedge us
-        fd = proc.stdout.fileno()
-        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        os.close(slave_fd)
 
+        buf = ""
+        last_report: float = -1.0
         last_output = time.monotonic()
-        last_stage = ""
         while True:
             if cancel_flag and cancel_flag():
                 logger.info("Cancel requested - terminating av1an pid {}", proc.pid)
                 _terminate_proc(proc)
                 raise TranscodeError("Job cancelled by user")
-            # drain available stdout
-            while True:
-                try:
-                    raw = proc.stdout.readline()
-                except Exception:  # noqa: BLE001
-                    raw = ""
-                if raw == "":
-                    break
-                line = raw.rstrip("\n")
+            # drain whatever the pty has buffered
+            raw = _read_available()
+            if raw:
                 last_output = time.monotonic()
-                if log_handle:
-                    log_handle.write(line + "\n")
+                buf += raw
+            # split on newlines; keep a trailing partial line as buf
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.rstrip("\r")
+                # progress bar redraws combine many \r-separated states into one
+                # line: keep only the latest redraw for the log
+                if "\r" in line:
+                    line = line.rsplit("\r", 1)[-1]
+                clean = _strip_ansi(line)
+                if log_handle and clean:
+                    log_handle.write(clean + "\n")
+                last_output = time.monotonic()
                 if progress_cb:
-                    pct = parse_progress(line)
-                    if pct is not None:
+                    pct = parse_progress(clean)
+                    if pct is not None and pct > last_report:
                         progress_cb(pct)
-                logger.debug("av1an: {}", line)
+                        last_report = pct
+                logger.debug("av1an: {}", clean)
                 # surface av1an milestones at INFO so stage transitions are visible
-                if any(k in line for k in ("Scene detection", "scenecut", "Encoding", "Queue", "Params", "Worker")):
-                    logger.info("av1an: {}", line)
+                if any(k in clean for k in ("Scene detection", "scenecut", "Encoding", "Queue", "Params", "Worker")):
+                    logger.info("av1an: {}", clean)
                 # report coarse stage to the UI: scenedetect -> encoding
                 if stage_cb:
-                    if "Scene detection" in line:
+                    if "Scene detection" in clean:
                         stage_cb("scenedetect")
-                    elif "scenecut" in line or "Chunking" in line:
+                    elif "scenecut" in clean or "Chunking" in clean:
                         stage_cb("encoding")
+            # av1an's progress bar redraws in-place with \r, never \n, and can
+            # accumulate in buf for the whole encode: keep only the latest
+            # redraw, then scan it so the UI percentage stays current.
+            if buf:
+                if "\r" in buf:
+                    buf = buf.rsplit("\r", 1)[-1]
+                if progress_cb:
+                    pct = parse_progress(_strip_ansi(buf))
+                    if pct is not None and pct > last_report:
+                        progress_cb(pct)
+                        last_report = pct
             rc = proc.poll()
             if rc is not None:
                 if rc != 0:
@@ -216,6 +252,11 @@ def run_av1an(
     finally:
         if log_handle:
             log_handle.close()
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
         if proc is not None and proc.poll() is None:
             logger.info("Cleaning up leftover av1an process (pid {})", proc.pid)
             _terminate_proc(proc)
@@ -241,10 +282,21 @@ def _terminate_proc(proc: "subprocess.Popen") -> None:
             logger.warning("av1an (pid {}) did not die after SIGKILL", proc.pid)
 
 
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences (colours, cursor movement) from a line."""
+    return re.sub(r"\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|\(B|\)[0-9A-B])", "", text)
+
+
 def parse_progress(line: str) -> Optional[float]:
-    m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
-    if m:
-        val = float(m.group(1))
+    """Extract the most recent percentage from av1an output.
+
+    Matches both plain log lines ("40% ...") and av1an's terminal progress bar
+    ("▐██▌ 64% 700/1000 (80 fps, eta)") once ANSI codes are stripped. Returns
+    the LAST percentage found in the text (in-place bar redraws accumulate).
+    """
+    hits = re.findall(r"([\d.]+)\s*%", line)
+    for raw in reversed(hits):
+        val = float(raw)
         if 0 <= val <= 100:
             return val
     return None
