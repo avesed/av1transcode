@@ -6,10 +6,9 @@ services:
     ports:
       - "8080:8080"
     # Mount your media library here. Adjust to your real paths.
+    # output/rpu 默认 null => 输出到源目录的 av1/ 子目录，无需单独挂载
     volumes:
       - ./media/input:/media/input
-      - ./media/output:/media/output
-      - ./media/rpu:/media/rpu
       - ./media/work:/media/work
       - ./media/archive:/media/archive
       - ./config.yaml:/app/config.yaml:ro
