@@ -9,12 +9,12 @@ services:
     ports:
       - "8080:8080"
     # Mount your media library here. Adjust to your real paths.
-    # output/rpu 默认 null => 输出到源目录的 av1/ 子目录，无需单独挂载
+    # 配置已内置在镜像内（/app/config.yaml）；如需自定义，取消下一行注释并放置自己的 config.yaml
+    # - ./config.yaml:/app/config.yaml:ro
     volumes:
       - ./media/input:/media/input
       - ./media/work:/media/work
       - ./media/archive:/media/archive
-      - ./config.yaml:/app/config.yaml:ro
       - av1data:/data
     environment:
       # Everything below can also be set in config.yaml
