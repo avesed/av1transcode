@@ -121,6 +121,7 @@ const fmt = n => { if (n==null) return "–"; const u=["B","KB","MB","GB","TB"];
   while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
 const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stCls = s => "st-"+esc(s);
+const stageLabel = s => ({encoding:"转码中",cancelling:"取消中…",analyzing:"分析中",scenedetect:"场景检测"}[s]||s||"");
 async function loadPresets() {
   try {
     const r = await fetch("/api/presets").then(r=>r.json());
@@ -170,7 +171,7 @@ async function refresh() {
           <div class="muted">${esc(j.source||"")}</div>${err}</td>
       <td><div class="bar"><div style="width:${j.progress||0}%"></div></div>
           <span class="muted">${(j.progress||0).toFixed(0)}%</span></td>
-      <td class="muted">${esc(j.stage||"")}</td>
+      <td class="muted">${esc(stageLabel(j.stage))}</td>
       <td class="muted">${paramCell}</td>
       <td class="muted">${size}</td>
       <td>${["running","pending","analyzing"].includes(j.status)

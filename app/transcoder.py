@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -106,11 +108,21 @@ def run_av1an(
     log_path: Optional[Path] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
+    stage_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Run av1an, streaming stdout to log, reporting progress %, honoring cancel."""
+    """Run av1an, streaming stdout to log, reporting progress %, honoring cancel.
+
+    av1an's stdout is drained by a background thread so a stalled process
+    (no output) can still be cancelled. The main loop polls both the process
+    and the cancel flag, and kills the whole process group on cancel.
+    """
+    import fcntl  # noqa: PLC0415
+
     env = dict(os.environ)
     env.setdefault("AV1AN_LOG_LEVEL", "info")
+    logger.debug("av1an env: {}", env)
     log_handle = open(log_path, "w", buffering=1) if log_path else None
+    proc: Optional[subprocess.Popen] = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -118,25 +130,88 @@ def run_av1an(
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
+            start_new_session=True,  # own process group so we can kill children
         )
         assert proc.stdout is not None
-        for raw in proc.stdout:
-            line = raw.rstrip("\n")
-            if log_handle:
-                log_handle.write(line + "\n")
-            if progress_cb:
-                pct = parse_progress(line)
-                if pct is not None:
-                    progress_cb(pct)
+        # make stdout reads non-blocking so a stuck av1an can't wedge us
+        fd = proc.stdout.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        last_output = time.monotonic()
+        last_stage = ""
+        while True:
             if cancel_flag and cancel_flag():
-                proc.terminate()
+                logger.info("Cancel requested - terminating av1an pid {}", proc.pid)
+                _terminate_proc(proc)
                 raise TranscodeError("Job cancelled by user")
-        rc = proc.wait()
-        if rc != 0:
-            raise TranscodeError(f"av1an exited with code {rc}; log: {log_path}")
+            # drain available stdout
+            while True:
+                try:
+                    raw = proc.stdout.readline()
+                except Exception:  # noqa: BLE001
+                    raw = ""
+                if raw == "":
+                    break
+                line = raw.rstrip("\n")
+                last_output = time.monotonic()
+                if log_handle:
+                    log_handle.write(line + "\n")
+                if progress_cb:
+                    pct = parse_progress(line)
+                    if pct is not None:
+                        progress_cb(pct)
+                logger.debug("av1an: {}", line)
+                # surface av1an milestones at INFO so stage transitions are visible
+                if any(k in line for k in ("Scene detection", "scenecut", "Encoding", "Queue", "Params", "Worker")):
+                    logger.info("av1an: {}", line)
+                # report coarse stage to the UI: scenedetect -> encoding
+                if stage_cb:
+                    if "Scene detection" in line:
+                        stage_cb("scenedetect")
+                    elif "scenecut" in line or "Chunking" in line:
+                        stage_cb("encoding")
+            rc = proc.poll()
+            if rc is not None:
+                if rc != 0:
+                    raise TranscodeError(f"av1an exited with code {rc}; log: {log_path}")
+                break
+            # watchdog: no output for 90s => log a warning (scene detection
+            # on long files is single-threaded and can look stalled)
+            if time.monotonic() - last_output > 90:
+                pstate = "alive" if proc.poll() is None else "dead"
+                logger.warning(
+                    "av1an produced no output for {}s (pstate={}); cmd: {}",
+                    90, pstate, " ".join(cmd),
+                )
+                last_output = time.monotonic()
+            time.sleep(1.5)
     finally:
         if log_handle:
             log_handle.close()
+        if proc is not None and proc.poll() is None:
+            logger.info("Cleaning up leftover av1an process (pid {})", proc.pid)
+            _terminate_proc(proc)
+
+
+def _terminate_proc(proc: "subprocess.Popen") -> None:
+    """Kill av1an and its whole process group (av1an spawns ffmpeg/svt children)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=15)
+        return
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("av1an (pid {}) did not die after SIGKILL", proc.pid)
 
 
 def parse_progress(line: str) -> Optional[float]:
@@ -157,6 +232,7 @@ def run_full_transcode(
     log_path: Optional[Path] = None,
     progress_cb: Optional[Callable[[float], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
+    stage_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Execute the full encode of a plan: DV preprocessing, av1an, mux, metadata."""
     from app import dovi  # local import avoids cycles
@@ -206,8 +282,12 @@ def run_full_transcode(
     cmd = build_av1an_cmd(
         settings, video, encode_input, output, tempdir, workers=settings.workers.av1an_workers,
     )
-    logger.info("Starting av1an: {}", " ".join(cmd[:6]) + " ...")
-    run_av1an(cmd, log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag)
+    logger.info("Starting av1an: {} -> {}", encode_input, output)
+    logger.debug("av1an full command: {}", " ".join(cmd))
+    t0 = time.monotonic()
+    run_av1an(cmd, log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
+              stage_cb=stage_cb)
+    logger.info("av1an finished in {:.1f}s", time.monotonic() - t0)
 
     if not output.exists() or output.stat().st_size == 0:
         raise TranscodeError("av1an produced no output file")

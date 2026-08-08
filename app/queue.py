@@ -120,6 +120,7 @@ class TranscodeManager:
                 return 1
             # running: request async abort at the next check
             self._cancel.add(jid)
+            self.store.update(jid, stage="cancelling")
             logger.info("Cancel requested for running job {}", jid)
             return 1
         n = self.store.cancel_pending()
@@ -138,6 +139,7 @@ class TranscodeManager:
                 if not jid:
                     self._condition.wait(timeout=2)
                     continue
+            logger.debug("worker-{} picked job {}", idx, jid)
             self._process(jid)
             if self._retire_self(idx):
                 return
@@ -189,8 +191,17 @@ class TranscodeManager:
         self._emit(jid, "analyzing")
 
         try:
+            logger.debug("analyzing {} (job {})", source, jid)
             info = analyzer_mod.analyze(self.settings, str(source))
+            if jid in self._cancel:
+                self._cancel.discard(jid)
+                self.store.update(jid, status=db.CANCELLED, stage="cancelled",
+                                  finished_at=time.time())
+                self._emit(jid, "cancelled")
+                logger.info("Job {} cancelled during analysis", jid)
+                return
             if info is None:
+                logger.warning("analysis returned None for {} (job {})", source, jid)
                 self._fail(jid, "analysis failed", job)
                 return
             plan = decisions.decide_action(self.settings, info, preset, overrides)
@@ -224,12 +235,15 @@ class TranscodeManager:
             def progress_cb(pct: float) -> None:
                 self.store.update(jid, progress=round(pct, 1), stage="encoding")
 
+            def stage_cb(stage: str) -> None:
+                self.store.update(jid, stage=stage)
+
             def cancel_flag() -> bool:
                 return jid in self._cancel
 
             run_full_transcode(
                 self.settings, info, plan, source, out, log_path,
-                progress_cb=progress_cb, cancel_flag=cancel_flag,
+                progress_cb=progress_cb, cancel_flag=cancel_flag, stage_cb=stage_cb,
             )
 
             if jid in self._cancel:
@@ -263,6 +277,13 @@ class TranscodeManager:
                 self._fail(jid, str(e), job)
 
     def _fail(self, jid: str, error: str, job: dict) -> None:
+        if jid in self._cancel:
+            self._cancel.discard(jid)
+            self.store.update(jid, status=db.CANCELLED, error=error,
+                              stage="cancelled", finished_at=time.time())
+            self._emit(jid, "cancelled")
+            logger.info("Job {} cancelled (was failing: {})", jid, error)
+            return
         retries = int(job.get("retries") or 0)
         if retries < self.settings.workers.max_retries:
             self.store.update(jid, retries=retries + 1, error=error,
