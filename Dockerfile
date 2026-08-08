@@ -235,7 +235,7 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
 COPY app /app/app
 COPY config.yaml /app/config.yaml
 WORKDIR /app
-RUN mkdir -p /media/input /media/output /media/rpu /media/work /media/archive /data/logs
+RUN mkdir -p /media/input /media/output /media/rpu /media/work /data/logs
 
 EXPOSE 8080
 ENTRYPOINT ["python3", "-m", "app.cli"]

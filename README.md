@@ -44,7 +44,6 @@ media/input/      # 放入待转码文件
 media/output/     # AV1 输出（<片名>.av1.mkv）
 media/rpu/        # Dolby Vision 提取的 RPU (.bin)
 media/work/       # av1an 临时文件
-media/archive/    # 成功后原片移入
 ```
 
 ### 本机开发

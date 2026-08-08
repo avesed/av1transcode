@@ -178,15 +178,42 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
             raise HTTPException(422, "concurrency must be >= 1")
         if av1an_workers < 0:
             raise HTTPException(422, "av1an_workers must be >= 0")
-        # persist
-        workers = {"concurrency": concurrency, "av1an_workers": av1an_workers}
-        config.save_user_settings(settings, workers)
+        # persist (merge keeps delete_source intact)
+        config.save_user_settings(settings, {"workers": {
+            "concurrency": concurrency, "av1an_workers": av1an_workers,
+        }})
         # apply live
         settings.workers.concurrency = concurrency
         settings.workers.av1an_workers = av1an_workers
         manager.set_concurrency(concurrency)
-        logger.info("Updated workers: {}", workers)
-        return {"ok": True, "workers": workers}
+        logger.info("Updated workers: {}", {"concurrency": concurrency,
+                                            "av1an_workers": av1an_workers})
+        return {"ok": True, "workers": {
+            "concurrency": concurrency, "av1an_workers": av1an_workers}}
+
+    # ---------- safety settings (delete_source) ----------
+    @router.get("/settings/safety")
+    def get_safety():
+        return {"delete_source": settings.transcode.delete_source}
+
+    @router.put("/settings/delete_source")
+    def put_delete_source(request: Request, body: dict):
+        """Enable/disable source deletion after success.
+
+        Enabling is destructive (source files get deleted), so the caller
+        must explicitly confirm with confirm=true.
+        """
+        _auth(request)
+        enabled = bool(body.get("enabled"))
+        if enabled and not body.get("confirm"):
+            raise HTTPException(422, "confirm=true required to enable delete_source")
+        settings.transcode.delete_source = enabled
+        config.save_user_settings(settings, {"delete_source": enabled})
+        if enabled:
+            logger.warning("delete_source ENABLED (destructive: source files will be deleted after success)")
+        else:
+            logger.info("delete_source disabled")
+        return {"ok": True, "delete_source": enabled}
 
     # ---------- directory browser ----------
     def _browse(p: Path) -> list[dict]:

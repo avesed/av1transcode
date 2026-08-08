@@ -21,7 +21,6 @@ class Dirs(BaseModel):
     output: Optional[Path] = None
     rpu: Optional[Path] = None
     work: Path = Path("media/work")
-    archive: Optional[Path] = None  # None => do not move source after success
     db: Path = Path("data/av1transcode.db")
     logs: Path = Path("data/logs")
     # User-defined presets (added/edited via web UI). Builtin presets come
@@ -123,7 +122,7 @@ class Transcode(BaseModel):
     min_height_to_transcode: int = 0
     # Keep av1an temp files after success
     keep_temp: bool = False
-    # Delete source file after successful transcode (false by default - archive manually)
+    # Delete source file after successful transcode (false by default)
     delete_source: bool = False
 
 
@@ -168,7 +167,7 @@ class Settings(BaseModel):
     def resolve_paths(self) -> "Settings":
         """Make relative paths absolute against the config file location (or CWD)."""
         base = ROOT_DIR
-        for field_name in ("input", "output", "rpu", "work", "archive", "db", "logs", "presets_file", "settings_file"):
+        for field_name in ("input", "output", "rpu", "work", "db", "logs", "presets_file", "settings_file"):
             p = getattr(self.dirs, field_name)
             if p is not None and not p.is_absolute():
                 setattr(self.dirs, field_name, (base / p).resolve())
@@ -189,11 +188,6 @@ class Settings(BaseModel):
                 continue  # source-relative mode: created per-job by the worker
             try:
                 p.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
-        if self.dirs.archive:
-            try:
-                self.dirs.archive.mkdir(parents=True, exist_ok=True)
             except OSError:
                 pass
         try:
@@ -259,38 +253,53 @@ def load_settings(config_path: Optional[Path] = None) -> Settings:
         presets[name] = params
     # Apply user workers settings (persisted by the web UI)
     usettings = load_user_settings(settings)
-    if "concurrency" in usettings and usettings["concurrency"]:
+    user_workers = usettings.get("workers") or {}
+    if "concurrency" in user_workers and user_workers["concurrency"]:
         try:
-            settings.workers.concurrency = max(1, int(usettings["concurrency"]))
+            settings.workers.concurrency = max(1, int(user_workers["concurrency"]))
         except (TypeError, ValueError):
             pass
-    if "av1an_workers" in usettings and usettings["av1an_workers"] is not None:
+    if "av1an_workers" in user_workers and user_workers["av1an_workers"] is not None:
         try:
-            settings.workers.av1an_workers = max(0, int(usettings["av1an_workers"]))
+            settings.workers.av1an_workers = max(0, int(user_workers["av1an_workers"]))
         except (TypeError, ValueError):
             pass
+    if "delete_source" in usettings and isinstance(usettings["delete_source"], bool):
+        settings.transcode.delete_source = usettings["delete_source"]
     return settings
 
 
 def load_user_settings(settings: Settings) -> Dict[str, Any]:
-    """Read user-persisted settings (workers etc.) from the settings file."""
+    """Read user-persisted settings (workers, delete_source) from the settings file."""
     p = settings.dirs.settings_file
     try:
         if not p.exists():
             return {}
         data = json.loads(p.read_text()) or {}
-        return data.get("workers") or {}
+        out: Dict[str, Any] = {}
+        if data.get("workers"):
+            out["workers"] = data["workers"]
+        if "delete_source" in data:
+            out["delete_source"] = data["delete_source"]
+        return out
     except (OSError, ValueError):
         return {}
 
 
-def save_user_settings(settings: Settings, workers: Dict[str, Any]) -> None:
-    """Persist user settings (workers) to disk from the web UI."""
+def save_user_settings(settings: Settings, data: Dict[str, Any]) -> None:
+    """Persist user settings (workers, delete_source) to disk from the web UI."""
     p = settings.dirs.settings_file
-    data = {"workers": workers}
+    # merge with existing data so workers / delete_source don't clobber each other
+    existing: Dict[str, Any] = {}
+    try:
+        if p.exists():
+            existing = json.loads(p.read_text()) or {}
+    except (OSError, ValueError):
+        existing = {}
+    existing.update(data)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
     tmp.replace(p)
 
 

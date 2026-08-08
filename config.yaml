@@ -10,7 +10,7 @@ dirs:
   output: null
   rpu: null                  # null => <source_dir>/av1/rpu (or dirs.output/rpu)
   work: /media/work          # temp/working files (av1an chunks)
-  archive: /media/archive    # moved here after success (null to keep in place)
+  archive: null               # archive functionality removed - keep source files in place
   db: /data/av1transcode.db  # SQLite job database
   logs: /data/logs
   presets_file: /data/presets.json   # user presets saved from the web UI

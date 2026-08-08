@@ -14,7 +14,6 @@ services:
     volumes:
       - ./media/input:/media/input
       - ./media/work:/media/work
-      - ./media/archive:/media/archive
       - av1data:/data
     environment:
       # Everything below can also be set in config.yaml

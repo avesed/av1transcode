@@ -77,6 +77,24 @@
     </div>
   </form>
 
+  <h2 style="color:#d33;margin-top:32px">危险操作</h2>
+  <p class="hint" style="color:#d33">以下开关会造成<b>不可逆的数据损失</b>，请谨慎操作。</p>
+  <form class="editor" id="safetyForm" style="margin-bottom:24px">
+    <div class="grid">
+      <div class="field">
+        <label>转码成功后删除源文件</label>
+        <select id="s-delete_source">
+          <option value="false">false（保留源文件，推荐）</option>
+          <option value="true">true（删除源文件）</option>
+        </select>
+      </div>
+    </div>
+    <div class="editor-actions">
+      <button type="submit" id="safetySaveBtn">保存</button>
+      <span class="hint" id="safetyActive" style="margin:0"></span>
+    </div>
+  </form>
+
   <h2>编码预设</h2>
   <p class="hint">预设即一组编码参数（CRF、速度 preset、胶片颗粒等）。修改会持久化到 presets_file（不会改动 config.yaml）。同名自定义预设会覆盖内置预设。</p>
   <button id="newBtn">＋ 新建预设</button>
@@ -324,7 +342,36 @@ $("workersForm").addEventListener("submit", async e => {
     loadWorkers();
   } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
 });
+async function loadSafety() {
+  try {
+    const s = await api("/api/settings/safety");
+    $("s-delete_source").value = String(s.delete_source);
+    $("safetyActive").textContent = s.delete_source ? "⚠ 已开启：源文件将被删除" : "当前：保留源文件";
+  } catch (err) {
+    $("safetyActive").textContent = `读取失败: ${err.message}`;
+  }
+}
+$("safetyForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const enabled = $("s-delete_source").value === "true";
+  if (enabled) {
+    // destructive action - require explicit confirmation
+    const msg = "⚠ 开启后，每个转码成功的任务都会删除原始源文件。\n\n"
+      + "此操作不可逆！即使转码失败或输出文件有问题，源文件也可能已经丢失。\n\n"
+      + "确定要开启吗？";
+    if (!confirm(msg)) { $("s-delete_source").value = "false"; return; }
+  }
+  try {
+    await api("/api/settings/delete_source", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, confirm: enabled }),
+    });
+    showMsg(enabled ? "已开启删除源文件（危险）" : "已关闭删除源文件", true);
+    loadSafety();
+  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
+});
 loadWorkers();
+loadSafety();
 loadList();
     } catch (err) { showMsg(`删除失败: ${err.message}`, false); }
   }

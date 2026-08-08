@@ -59,7 +59,7 @@
 <p>提交的文件会分析（Dolby Vision P5/P7/P8 → HDR10（保留/附带 RPU），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
 <ul>
   <li>已是 AV1 的源默认跳过（<code>skip_existing_av1</code>）。</li>
-  <li>成功后可归档（移到 <code>dirs.archive</code>）或删除源文件。</li>
+  <li>成功后源文件<b>默认保留</b>在原位置。可选：在设置页开启「删除源文件」（需要二次确认，危险操作）。</li>
 </ul>
 
 <h2>输出行为</h2>
@@ -117,7 +117,6 @@
   <tr><td><code>dirs</code></td><td><code>input</code></td><td>监视目录（挂载卷）。</td></tr>
   <tr><td><code>dirs</code></td><td><code>output / rpu</code></td><td>固定输出目录；<code>null</code> = 源目录下 <code>av1/</code>（RPU 在 <code>av1/rpu/</code>）。</td></tr>
   <tr><td><code>dirs</code></td><td><code>work</code></td><td>av1an 临时分段目录。</td></tr>
-  <tr><td><code>dirs</code></td><td><code>archive</code></td><td>成功后源文件移入；<code>null</code> = 不移。</td></tr>
   <tr><td><code>dirs</code></td><td><code>db / logs</code></td><td>SQLite 任务库 / 任务日志目录。</td></tr>
   <tr><td><code>dirs</code></td><td><code>presets_file / settings_file</code></td><td>网页端预设 / 并行设置持久化文件。</td></tr>
   <tr><td><code>workers</code></td><td><code>concurrency</code></td><td>并行转码任务数（每个任务内部 av1an 还可多 worker）。</td></tr>

@@ -298,24 +298,15 @@ class TranscodeManager:
         self._emit(jid, "failed")
 
     def _postprocess(self, jid: str, source: Path) -> None:
-        """Optional: delete or archive the source after a successful encode."""
+        """Optional: delete the source after a successful encode."""
         if self.settings.transcode.delete_source:
             try:
                 source.unlink()
                 logger.info("Deleted source after success: {}", source)
             except OSError as e:
                 logger.warning("Could not delete source {}: {}", source, e)
-        elif self.settings.dirs.archive:
-            archive = self.settings.dirs.archive
-            try:
-                archive.mkdir(parents=True, exist_ok=True)
-                dest = archive / source.name
-                if not dest.exists():
-                    source.rename(dest)
-                    self.store.update(jid, source=str(dest))
-                    logger.info("Archived source to {}", dest)
-            except OSError as e:
-                logger.warning("Could not archive {}: {}", source, e)
+        # archive functionality removed - source files are kept in place
+        # output already written to av1/ subdirectory
 
     def _emit(self, jid: str, event: str) -> None:
         if self.on_event:
