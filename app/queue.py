@@ -36,6 +36,9 @@ class TranscodeManager:
                 return
             self._running = True
         n = max(1, self.settings.workers.concurrency)
+        recovered = self.store.reset_interrupted()
+        if recovered:
+            logger.info("Recovered {} job(s) stuck in running/analyzing -> pending", recovered)
         self._spawn_workers(n)
         logger.info("Started {} transcode worker(s)", n)
 

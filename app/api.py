@@ -113,6 +113,13 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
     def cancel_all():
         return {"cancelled": manager.cancel()}
 
+    @router.post("/jobs/prune")
+    def prune_jobs(request: Request, body: Optional[dict] = None):
+        _auth(request)
+        statuses = (body or {}).get("statuses")
+        n = store.prune(statuses)
+        return {"pruned": n}
+
     # ---------- presets ----------
     @router.get("/presets")
     def presets():

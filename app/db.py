@@ -184,6 +184,30 @@ class JobStore:
             self._conn.commit()
             return n
 
+    def reset_interrupted(self) -> int:
+        """On startup: jobs stuck in running/analyzing belonged to a previous
+        process (crash/restart). Reset them to pending so they get picked up."""
+        with self._cursor() as cur:
+            cur.execute("UPDATE jobs SET status=?, stage='', started_at=NULL "
+                        "WHERE status IN (?,?)",
+                        (PENDING, ANALYZING, RUNNING))
+            n = cur.rowcount
+            self._conn.commit()
+            return n
+
+    def prune(self, statuses: Optional[List[str]] = None) -> int:
+        """Hard-delete finished jobs (done/failed/skipped/cancelled)."""
+        allowed = {DONE, FAILED, SKIPPED, CANCELLED}
+        statuses = [s for s in (statuses or list(allowed)) if s in allowed]
+        if not statuses:
+            return 0
+        ph = ",".join("?" * len(statuses))
+        with self._cursor() as cur:
+            cur.execute(f"DELETE FROM jobs WHERE status IN ({ph})", statuses)
+            n = cur.rowcount
+            self._conn.commit()
+            return n
+
     def close(self) -> None:
         if self._conn:
             try:

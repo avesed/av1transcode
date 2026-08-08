@@ -60,6 +60,9 @@
     #path { background: var(--panel); }
     .custom-hint { width: 100%; color: var(--muted); font-size: 12px; margin-top: -10px; }
     #custom:disabled { opacity: .4; }
+    .toolbar { display: flex; align-items: center; gap: 8px; margin: 14px 0 8px; }
+    .toolbar .ghost-sel { background: var(--panel); border: 1px solid var(--border); color: var(--text);
+      border-radius: 6px; padding: 5px 8px; font-size: 12px; margin-left: auto; }
   </style>
 </head>
 <body>
@@ -92,6 +95,18 @@
         <button class="ghost" id="bClose">关闭</button>
       </div>
     </div>
+  </div>
+  <div class="toolbar">
+    <select id="statusFilter" class="ghost-sel">
+      <option value="all">全部状态</option>
+      <option value="pending">排队中</option>
+      <option value="running">转码中</option>
+      <option value="done">已完成</option>
+      <option value="failed">失败</option>
+      <option value="cancelled">已取消</option>
+      <option value="skipped">已跳过</option>
+    </select>
+    <button type="button" class="ghost" id="pruneBtn" title="删除所有已结束（完成/失败/取消/跳过）的记录">清除历史记录</button>
   </div>
   <table>
     <thead><tr>
@@ -126,10 +141,11 @@ function syncCustom() {
     : "提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。";
 }
 document.getElementById("preset").addEventListener("change", syncCustom);
+let statusFilter = "all";
 async function refresh() {
   const [s, jobs] = await Promise.all([
     fetch("/api/status").then(r=>r.json()),
-    fetch("/api/jobs?limit=50").then(r=>r.json()),
+    fetch("/api/jobs?status="+(statusFilter==="all"?"":statusFilter)+"&limit=100").then(r=>r.json()),
   ]);
   document.getElementById("sysinfo").textContent =
     `队列 ${s.queue_len} · worker ${s.workers_running?"运行中":"停止"}`;
@@ -241,6 +257,15 @@ document.getElementById("bUsePath").addEventListener("click", () => {
 });
 document.getElementById("bClose").addEventListener("click", () => modalBg.style.display = "none");
 modalBg.addEventListener("click", e => { if (e.target === modalBg) modalBg.style.display = "none"; });
+document.getElementById("statusFilter").addEventListener("change", e => { statusFilter = e.target.value; refresh(); });
+document.getElementById("pruneBtn").addEventListener("click", async () => {
+  if (!confirm("删除所有已结束（完成/失败/取消/跳过）的任务记录？此操作不可恢复。")) return;
+  try {
+    const r = await fetch("/api/jobs/prune", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    refresh();
+  } catch(err) { alert("清除失败: " + err.message); }
+});
 loadPresets();
 refresh();
 setInterval(refresh, 4000);
