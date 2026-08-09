@@ -121,10 +121,11 @@ const fmt = n => { if (n==null) return "–"; const u=["B","KB","MB","GB","TB"];
   while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
 const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stCls = s => "st-"+esc(s);
-const stageLabel = s => ({encoding:"转码中",cancelling:"取消中…",analyzing:"分析中",scenedetect:"场景检测"}[s]||s||"");
+const stageLabel = s => ({encoding:"转码中",cancelling:"取消中…",analyzing:"分析中",scenedetect:"场景检测",probing:"质量探测中"}[s]||s||"");
 function liveStats(j) {
   const total = j.progress_total || 0, done = j.progress_done || 0, fps = j.progress_fps || 0;
-  if (!total || !j.progress_fps) return "";
+  if (j.stage === "probing") return total ? ` · 探测 ${done}/${total} 段` : ` · 探测 ${done} 段`;
+  if (!total || !fps) return "";
   const rem = Math.max(0, total - done) / fps;
   const mm = String(Math.floor(rem / 60)).padStart(2, "0"), ss = String(Math.round(rem % 60)).padStart(2, "0");
   return ` · ${done}/${total} 帧 · ${fps.toFixed(0)} fps · 剩余 ${mm}:${ss}`;

@@ -119,9 +119,18 @@ def run_av1an(
 
     av1an only renders its progress bar when stdout is a terminal, so it is
     started on a pty (master/slave pair): the slave is the child's stdout, the
-    parent drains the master. Progress lines like "NN% frames/total" are parsed
+    parent drains the stream. Progress lines like "NN% frames/total" are parsed
     and forwarded to progress_cb. Cancel is honored by polling both the pty
     and the cancel flag, killing the whole process group on cancel.
+
+    For "--target-quality" jobs the VMAF probe phase runs silently on the pty:
+    progress is then derived from the per-chunk probe files that av1an writes
+    into its temp dir (split/v_AAAAA_<q>.ivf): each new chunk index means one
+    more chunk has been probed. The chunk count is known from av1an's scenecut
+    line ("found N scene(s) [with extra_splits (..): M scene(s)]" where M is
+    the final chunk count, or N when no extra splits), so the probe progress is
+    reported as (chunks probed / total chunks). Once the real encode progress
+    bar appears the probe phase ends and normal frame-based progress resumes.
     """
     import fcntl  # noqa: PLC0415
     import pty  # noqa: PLC0415
@@ -168,6 +177,18 @@ def run_av1an(
         last_done: Optional[int] = None
         last_stage: Optional[str] = None
         last_output = time.monotonic()
+        # target-quality probe tracking: av1an silently runs VMAF probes per
+        # chunk, writing split/v_AAAAA_<q>.ivf files. The last probed chunk
+        # index is our probe progress denominator-free numerator.
+        probing: bool = "--target-quality" in cmd
+        probe_total_chunks: Optional[int] = None
+        probe_done_chunks: int = 0
+        probe_last_pct: float = -1.0
+        temp_dir: Optional[Path] = None
+        for i, arg in enumerate(cmd):
+            if arg == "--temp" and i + 1 < len(cmd):
+                temp_dir = Path(cmd[i + 1])
+                break
         while True:
             if cancel_flag and cancel_flag():
                 logger.info("Cancel requested - terminating av1an pid {}", proc.pid)
@@ -199,20 +220,41 @@ def run_av1an(
                 # surface av1an milestones at INFO so stage transitions are visible
                 if any(k in clean for k in ("Scene detection", "scenecut", "Encoding", "Queue", "Params", "Worker")):
                     logger.info("av1an: {}", clean)
-                # report coarse stage to the UI: scenedetect -> encoding
+                # report coarse stage to the UI: scenedetect -> probing -> encoding
                 if stage_cb:
                     new_stage = None
                     if "Scene detection" in clean:
                         new_stage = "scenedetect"
-                    elif "scenecut" in clean or "Chunking" in clean:
+                    elif "scenecut" in clean:
+                        # scene detection finished: VMAF probing begins now
+                        new_stage = "probing"
+                    elif "Chunking" in clean or "Queue" in clean:
+                        # chunk queue built: probing done, real encoding starts
                         new_stage = "encoding"
+                        probing = False
                     if new_stage and new_stage != last_stage:
                         stage_cb(new_stage)
                         last_stage = new_stage
-                        # the encode progress bar restarts from 0 after scene
-                        # detection: allow the fresh lower % to be reported
+                        # the progress bar restarts from 0 at each stage:
+                        # allow the fresh lower % to be reported
                         last_report = -1.0
                         last_done = None
+                # av1an's chunk count is the denominator for probe progress.
+                # Two sources, whichever appears first:
+                #   scenecut: found 4 scene(s) [with extra_splits (300 frames): 5 scene(s)]
+                #   Queue 5 Workers ...   (workers line has total chunk count)
+                if probing and probe_total_chunks is None:
+                    m = re.search(
+                        r"scenecut: found \d+ scene\(s\)"
+                        r"(?: \[with extra_splits \(\d+ frames\): (\d+) scene\(s\)\])?",
+                        clean,
+                    )
+                    if m:
+                        probe_total_chunks = int(m.group(1) or re.search(r"found (\d+)", clean).group(1))
+                    else:
+                        m = re.search(r"Queue (\d+) Worker", clean)
+                        if m:
+                            probe_total_chunks = int(m.group(1))
             # av1an's progress bar redraws in-place with \r, never \n, and can
             # accumulate in buf for the whole encode: keep only the latest
             # redraw, then scan it so the UI percentage stays current.
@@ -222,6 +264,17 @@ def run_av1an(
                 if progress_cb:
                     stats = parse_progress_stats(_strip_ansi(buf))
                     if stats:
+                        # probing normally ends at the Queue line; the scene
+                        # detection bar also carries fps>0, so only treat an
+                        # fps>0 bar as encode progress once probing has started
+                        # (stage=probing) and the pty suddenly emits frames
+                        if probing and last_stage == "probing" and stats.get("fps", 0) > 0:
+                            probing = False
+                            last_report = -1.0
+                            last_done = None
+                            if stage_cb and last_stage != "encoding":
+                                stage_cb("encoding")
+                                last_stage = "encoding"
                         # bar restarted (new chunk): old values are stale
                         if last_done is not None and stats["done"] < last_done:
                             last_report = -1.0
@@ -229,6 +282,47 @@ def run_av1an(
                             progress_cb(stats["pct"], stats)
                             last_report = stats["pct"]
                         last_done = stats["done"]
+            # VMAF probe phase: av1an emits nothing on the pty while probing, but it
+            # writes a probe-encode file split/v_AAAAA_<q>.ivf as each chunk's
+            # probing starts (one file per CRF sample). The set of chunk
+            # indices seen so far is a reliable, monotonic probe progress.
+            if probing and progress_cb and temp_dir is not None:
+                probed = 0
+                split_dir = temp_dir / "split"
+                if split_dir.is_dir():
+                    try:
+                        chunks = set()
+                        for p in split_dir.iterdir():
+                            m = re.match(r"v_(\d{5})_", p.name)
+                            if m:
+                                chunks.add(int(m.group(1)))
+                        probed = len(chunks)
+                    except OSError:
+                        pass
+                if probed > probe_done_chunks:
+                    probe_done_chunks = probed
+                    last_output = time.monotonic()
+                    # total chunk count may still be unknown while probing is
+                    # in flight: report probed chunks as done/total whenever
+                    # possible; progress_cb sees done>0 either way
+                    if probe_total_chunks:
+                        pct = min(probe_done_chunks / probe_total_chunks * 100, 99.0)
+                    else:
+                        pct = 0.0
+                    if pct > probe_last_pct or (not probe_total_chunks and probe_done_chunks):
+                        probe_last_pct = pct
+                        progress_cb(
+                            pct,
+                            {
+                                "pct": pct,
+                                "done": probe_done_chunks,
+                                "total": probe_total_chunks or 0,
+                                "fps": 0.0,
+                            },
+                        )
+                    if stage_cb and last_stage != "probing":
+                        stage_cb("probing")
+                        last_stage = "probing"
             rc = proc.poll()
             if rc is not None:
                 if rc != 0:
