@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     status      TEXT NOT NULL,           -- pending|analyzing|running|done|failed|skipped|cancelled
     progress    REAL DEFAULT 0,
     stage       TEXT DEFAULT '',
+    progress_fps    REAL DEFAULT 0,      -- av1an live stats (for the UI)
+    progress_done   INTEGER DEFAULT 0,
+    progress_total  INTEGER DEFAULT 0,
     error       TEXT,
     meta        TEXT,                    -- JSON probe info
     params      TEXT,                    -- JSON transcode params snapshot
@@ -90,11 +93,30 @@ class JobStore:
             self._conn.executescript(SCHEMA)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._migrate_schema()
         except Exception as e:  # pragma: no cover
             logger.warning("SQLite unavailable ({}); falling back to in-memory store", e)
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.executescript(SCHEMA)
+
+    def _migrate_schema(self) -> None:
+        """Add columns introduced after the first release (CREATE TABLE IF NOT
+        EXISTS does not alter existing tables)."""
+        if self._conn is None:
+            return
+        try:
+            cur = self._conn.execute("PRAGMA table_info(jobs)")
+            have = {r[1] for r in cur.fetchall()}
+            if "progress_fps" not in have:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN progress_fps REAL DEFAULT 0")
+            if "progress_done" not in have:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN progress_done INTEGER DEFAULT 0")
+            if "progress_total" not in have:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN progress_total INTEGER DEFAULT 0")
+            self._conn.commit()
+        except sqlite3.Error as e:  # pragma: no cover
+            logger.warning("Schema migration skipped: {}", e)
 
     @contextmanager
     def _cursor(self) -> Generator[Any, None, None]:
@@ -127,7 +149,8 @@ class JobStore:
             return
         allowed = {"status", "progress", "stage", "error", "meta", "params", "rpu_path",
                    "output_path", "size_bytes", "size_after", "retries", "started_at",
-                   "finished_at", "finalized_at"}
+                   "finished_at", "finalized_at",
+                   "progress_fps", "progress_done", "progress_total"}
         f = {k: v for k, v in fields.items() if k in allowed}
         if not f:
             return
@@ -160,13 +183,23 @@ class JobStore:
             return [dict(r) for r in cur.fetchall()]
 
     def next_pending(self) -> Optional[str]:
+        """Atomically claim the oldest pending job (sets it analyzing) so
+        concurrent workers never pick the same job."""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT id FROM jobs WHERE status=? ORDER BY created_at ASC LIMIT 1",
                 (PENDING,),
             )
             row = cur.fetchone()
-            return row["id"] if row else None
+            if not row:
+                return None
+            jid = row["id"]
+            cur.execute(
+                "UPDATE jobs SET status=?, stage='' WHERE id=? AND status=?",
+                (ANALYZING, jid, PENDING),
+            )
+            self._conn.commit()
+            return jid if cur.rowcount == 1 else None
 
     def count_by_status(self) -> Dict[str, int]:
         out = {s: 0 for s in ("pending", "analyzing", "running", "done", "failed", "skipped", "cancelled")}

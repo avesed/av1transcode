@@ -165,6 +165,8 @@ def run_av1an(
 
         buf = ""
         last_report: float = -1.0
+        last_done: Optional[int] = None
+        last_stage: Optional[str] = None
         last_output = time.monotonic()
         while True:
             if cancel_flag and cancel_flag():
@@ -189,20 +191,28 @@ def run_av1an(
                     log_handle.write(clean + "\n")
                 last_output = time.monotonic()
                 if progress_cb:
-                    pct = parse_progress(clean)
-                    if pct is not None and pct > last_report:
-                        progress_cb(pct)
-                        last_report = pct
+                    stats = parse_progress_stats(clean)
+                    if stats and stats["pct"] > last_report:
+                        progress_cb(stats["pct"], stats)
+                        last_report = stats["pct"]
                 logger.debug("av1an: {}", clean)
                 # surface av1an milestones at INFO so stage transitions are visible
                 if any(k in clean for k in ("Scene detection", "scenecut", "Encoding", "Queue", "Params", "Worker")):
                     logger.info("av1an: {}", clean)
                 # report coarse stage to the UI: scenedetect -> encoding
                 if stage_cb:
+                    new_stage = None
                     if "Scene detection" in clean:
-                        stage_cb("scenedetect")
+                        new_stage = "scenedetect"
                     elif "scenecut" in clean or "Chunking" in clean:
-                        stage_cb("encoding")
+                        new_stage = "encoding"
+                    if new_stage and new_stage != last_stage:
+                        stage_cb(new_stage)
+                        last_stage = new_stage
+                        # the encode progress bar restarts from 0 after scene
+                        # detection: allow the fresh lower % to be reported
+                        last_report = -1.0
+                        last_done = None
             # av1an's progress bar redraws in-place with \r, never \n, and can
             # accumulate in buf for the whole encode: keep only the latest
             # redraw, then scan it so the UI percentage stays current.
@@ -210,10 +220,15 @@ def run_av1an(
                 if "\r" in buf:
                     buf = buf.rsplit("\r", 1)[-1]
                 if progress_cb:
-                    pct = parse_progress(_strip_ansi(buf))
-                    if pct is not None and pct > last_report:
-                        progress_cb(pct)
-                        last_report = pct
+                    stats = parse_progress_stats(_strip_ansi(buf))
+                    if stats:
+                        # bar restarted (new chunk): old values are stale
+                        if last_done is not None and stats["done"] < last_done:
+                            last_report = -1.0
+                        if stats["pct"] > last_report:
+                            progress_cb(stats["pct"], stats)
+                            last_report = stats["pct"]
+                        last_done = stats["done"]
             rc = proc.poll()
             if rc is not None:
                 if rc != 0:
@@ -302,6 +317,29 @@ def parse_progress(line: str) -> Optional[float]:
     return None
 
 
+def parse_progress_stats(line: str) -> Optional[dict]:
+    """Parse av1an's progress bar line into structured stats.
+
+    Bar format (ANSI stripped): "00:00:07 [1/5 Chunks] ▐▌  60% 724/1200
+    (97.15 fps, eta 5s, ...)". Returns {pct, done, total, fps} from the LAST
+    redraw found (in-place redraws accumulate in one text buffer), or None.
+    """
+    hits = re.findall(
+        r"([\d.]+)\s*%\s+(\d+)/(\d+)\s+\(([\d.]+)\s*fps",
+        line,
+    )
+    for raw_pct, raw_done, raw_total, raw_fps in reversed(hits):
+        pct = float(raw_pct)
+        if 0 <= pct <= 100:
+            return {
+                "pct": pct,
+                "done": int(raw_done),
+                "total": int(raw_total),
+                "fps": float(raw_fps),
+            }
+    return None
+
+
 def run_full_transcode(
     settings: Settings,
     info: MediaInfo,
@@ -353,9 +391,9 @@ def run_full_transcode(
     tempdir.mkdir(parents=True, exist_ok=True)
     tmp_files.append(tempdir)
 
-    def on_progress(pct: float) -> None:
+    def on_progress(pct: float, stats: Optional[dict] = None) -> None:
         if progress_cb:
-            progress_cb(pct)
+            progress_cb(pct, stats)
 
     video = plan.params or settings.transcode.video
     cmd = build_av1an_cmd(

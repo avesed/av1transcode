@@ -232,8 +232,15 @@ class TranscodeManager:
                 plan.rpu_path.parent.mkdir(parents=True, exist_ok=True)
             log_path = self.settings.dirs.logs / f"job_{jid}.log"
 
-            def progress_cb(pct: float) -> None:
-                self.store.update(jid, progress=round(pct, 1), stage="encoding")
+            def progress_cb(pct: float, stats: Optional[dict] = None) -> None:
+                # stage is owned by stage_cb: progress updates must not
+                # overwrite "scenedetect" back to "encoding"
+                fields = {"progress": round(pct, 1)}
+                if stats:
+                    fields["progress_fps"] = stats.get("fps") or 0
+                    fields["progress_done"] = stats.get("done") or 0
+                    fields["progress_total"] = stats.get("total") or 0
+                self.store.update(jid, **fields)
 
             def stage_cb(stage: str) -> None:
                 self.store.update(jid, stage=stage)

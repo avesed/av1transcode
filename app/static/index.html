@@ -122,6 +122,13 @@ const fmt = n => { if (n==null) return "–"; const u=["B","KB","MB","GB","TB"];
 const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stCls = s => "st-"+esc(s);
 const stageLabel = s => ({encoding:"转码中",cancelling:"取消中…",analyzing:"分析中",scenedetect:"场景检测"}[s]||s||"");
+function liveStats(j) {
+  const total = j.progress_total || 0, done = j.progress_done || 0, fps = j.progress_fps || 0;
+  if (!total || !j.progress_fps) return "";
+  const rem = Math.max(0, total - done) / fps;
+  const mm = String(Math.floor(rem / 60)).padStart(2, "0"), ss = String(Math.round(rem % 60)).padStart(2, "0");
+  return ` · ${done}/${total} 帧 · ${fps.toFixed(0)} fps · 剩余 ${mm}:${ss}`;
+}
 async function loadPresets() {
   try {
     const r = await fetch("/api/presets").then(r=>r.json());
@@ -170,7 +177,7 @@ async function refresh() {
       <td>${esc((j.meta&&j.meta.display)||(j.source||"").split("/").pop())}
           <div class="muted">${esc(j.source||"")}</div>${err}</td>
       <td><div class="bar"><div style="width:${j.progress||0}%"></div></div>
-          <span class="muted">${(j.progress||0).toFixed(0)}%</span></td>
+          <span class="muted">${(j.progress||0).toFixed(0)}%${esc(liveStats(j))}</span></td>
       <td class="muted">${esc(stageLabel(j.stage))}</td>
       <td class="muted">${paramCell}</td>
       <td class="muted">${size}</td>
