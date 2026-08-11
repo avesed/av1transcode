@@ -93,7 +93,7 @@
   <tr><td><code>probes</code></td><td>0</td><td>分场景探测次数上限（0 = av1an 默认 4）。越多越准越慢。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probing_rate</code></td><td>0</td><td>探测时每隔 n 帧取一帧算 VMAF（1 = 全部帧）；n&gt;4 通常不可用。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probe_res</code></td><td>空</td><td>探测用分辨率（如 <code>960x540</code>），缩小后探测更快。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>probing_vmaf_features</code></td><td>空</td><td>探测用 VMAF 特征组合，如 <code>default motionless</code>、<code>weighted neg</code>。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>probing_vmaf_features</code></td><td>空</td><td>探测用 VMAF 特征组合，如 <code>default motionless</code>、<code>weighted neg</code>。<b>仅 av1an 引擎</b>生效；optimizer 引擎忽略该值（ffmpeg libvmaf 无法解析 av1an 语法，默认 VMAF 特征已够用）。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>vmaf_threads</code></td><td>0</td><td>探测阶段 VMAF 计算线程数（0 = 自动）。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probe_video_params</code></td><td>空</td><td>探测阶段编码参数，建议更快 preset 如 <code>preset=10</code>；<code>copy</code> = 与正式编码相同。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>additional_video_params</code></td><td>空</td><td>原样透传给 SVT-AV1 的额外参数，空格分隔，如 <code>--sharpness 1</code>。<span class="tag adv">进阶</span></td></tr>

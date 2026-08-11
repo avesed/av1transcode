@@ -252,7 +252,7 @@ def _install_fake_scenedetect(scene_frames):
     mod.SceneManager = type("SceneManager", (), {
         "__init__": lambda self: setattr(self, "_scenes", None),
         "add_detector": lambda self, d: setattr(self, "_detector", d),
-        "detect_scenes": lambda self, video, show_progress=False: None,
+        "detect_scenes": lambda self, video, show_progress=False, callback=None: None,
         "get_scene_list": lambda self: [(_FrameNum(a), _FrameNum(b)) for a, b in scene_frames],
     })
     mod.open_video = lambda path: object()
@@ -277,6 +277,83 @@ def test_detect_shots_falls_back_to_single_shot(settings, info, plan, tmp_path):
     _install_fake_scenedetect([])
     enc = make_encoder(settings, info, plan, tmp_path)
     assert enc.detect_shots() == [(0, enc.total_frames)]
+
+
+def test_detect_shots_reports_cuts_via_callback(settings, info, plan, tmp_path):
+    mod = types.ModuleType("scenedetect")
+    mod.ContentDetector = type("ContentDetector", (), {"__init__": lambda self, **k: None})
+
+    class _SM:
+        def add_detector(self, d):
+            pass
+
+        def detect_scenes(self, video, show_progress=False, callback=None):
+            for pos in (100, 200, 400):
+                callback(None, _FrameNum(pos))
+
+        def get_scene_list(self):
+            return [(_FrameNum(0), _FrameNum(100)), (_FrameNum(100), _FrameNum(200)),
+                    (_FrameNum(200), _FrameNum(400)), (_FrameNum(400), _FrameNum(800))]
+
+    mod.SceneManager = _SM
+    mod.open_video = lambda path: object()
+    sys.modules["scenedetect"] = mod
+    enc = make_encoder(settings, info, plan, tmp_path)
+    reports = []
+    enc.progress_cb = lambda pct, stats: reports.append((pct, stats))
+    shots = enc.detect_shots()
+    assert shots == [(0, 100), (100, 200), (200, 400), (400, 800)]
+    # scenedetect progress reports the running cut count (total=0 = indeterminate)
+    sc = [s for _, s in reports if s.get("total") == 0 and s.get("done")]
+    assert [s["done"] for s in sc] == [1, 2, 3]
+
+
+# ---- vmaf feature config guard ----
+def test_probe_ignores_av1an_style_vmaf_features(settings, info, plan, tmp_path):
+    plan.params.probing_vmaf_features = "default motionless"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    seen = {}
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if any("libvmaf=" in a for a in args):
+            seen["lavfi"] = args[args.index("-lavfi") + 1]
+            log_path = seen["lavfi"].split("log_path=")[1].split(":")[0]
+            Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
+            return ""
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    ref = tmp_path / "r.y4m"
+    ref.write_bytes(b"x")
+    dist = tmp_path / "d.ivf"
+    dist.write_bytes(b"x")
+    enc._score_probe(ref, dist, 0, 28)
+    assert "feature=default motionless" not in seen["lavfi"]
+    assert "feature=" not in seen["lavfi"]
+
+
+def test_probe_forwards_ffmpeg_style_vmaf_features(settings, info, plan, tmp_path):
+    plan.params.probing_vmaf_features = "name=motion"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    seen = {}
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if any("libvmaf=" in a for a in args):
+            seen["lavfi"] = args[args.index("-lavfi") + 1]
+            log_path = seen["lavfi"].split("log_path=")[1].split(":")[0]
+            Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
+            return ""
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    ref = tmp_path / "r.y4m"
+    ref.write_bytes(b"x")
+    dist = tmp_path / "d.ivf"
+    dist.write_bytes(b"x")
+    enc._score_probe(ref, dist, 0, 28)
+    assert "feature=name=motion" in seen["lavfi"]
 
 
 # ---- full pipeline with a fake ffmpeg ----
@@ -314,7 +391,8 @@ def test_run_full_pipeline(settings, info, plan, tmp_path):
 
     enc._run = fake_run.__get__(enc)
     enc.stage_cb = lambda s: stages.append(s)
-    enc.progress_cb = lambda pct, stats: progress.append(pct)
+    progress = []
+    enc.progress_cb = lambda pct, stats: progress.append((pct, stats))
 
     enc.run()
 
@@ -322,6 +400,11 @@ def test_run_full_pipeline(settings, info, plan, tmp_path):
     assert stages[0] == "scenedetect"
     assert "probing" in stages
     assert "encoding" in stages
-    assert progress[-1] == 100.0
+    assert progress[-1][0] == 100.0
+    # probing progress reports the SHOT count (3 shots), not probe count
+    probing = [s for pct, s in progress if s.get("total") and 0 < pct <= 50]
+    assert probing, "no probing progress reported"
+    assert all(s["total"] == 3 for s in probing)
+    assert probing[-1]["done"] == 3
     # chosen crf for target 75 should interpolate between 32@77 and 36@71
     assert opt.pick_crf([(c, score_at[c]) for c in score_at], 75.0) == pytest.approx(33.33, abs=0.1)

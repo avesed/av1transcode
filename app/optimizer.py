@@ -335,7 +335,15 @@ class ShotEncoder:
             threshold=self.opt.scenedetect_threshold,
             min_scene_len=self.opt.min_scene_len,
         ))
-        sm.detect_scenes(video, show_progress=False)
+        cuts_found = 0
+
+        def on_cut(_frame, _position) -> None:
+            # report scene analysis progress as cuts discovered so far
+            nonlocal cuts_found
+            cuts_found += 1
+            self._report(0.0, cuts_found, 0)
+
+        sm.detect_scenes(video, show_progress=False, callback=on_cut)
         scenes = sm.get_scene_list()
         shots = [(int(a.frame_num), int(b.frame_num)) for a, b in scenes]
         if not shots:
@@ -437,9 +445,9 @@ class ShotEncoder:
         workers = self.opt.probe_workers or os.cpu_count() or 1
         workers = max(1, min(workers, len(shots) * len(grid) or 1))
         tasks = [(i, s0, s1, crf) for i, (s0, s1) in enumerate(shots) for crf in grid]
-        total = len(tasks)
         results: ProbeSamples = {}
-        done = 0
+        done_shots = 0
+        per_shot_done = [0] * len(shots)
         self._log(f"probing {len(shots)} shots x {len(grid)} crfs with {workers} workers")
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [ex.submit(self._probe_one, i, s0, s1, crf)
@@ -448,10 +456,12 @@ class ShotEncoder:
                 self._check_cancel()
                 i, crf, score = fut.result()
                 results.setdefault(i, {})[crf] = score
-                done += 1
-                # probing spans 2%..47% of overall progress
-                pct = 2 + done / max(total, 1) * 45
-                self._report(pct, done, total)
+                per_shot_done[i] += 1
+                if per_shot_done[i] == len(grid):
+                    done_shots += 1
+                # probing spans 2%..47% of overall progress; report per SHOT
+                pct = 2 + done_shots / max(len(shots), 1) * 45
+                self._report(pct, done_shots, len(shots))
         return results
 
     def _probe_one(self, idx: int, s0: int, s1: int, crf: int) -> Tuple[int, int, float]:
@@ -484,7 +494,19 @@ class ShotEncoder:
                 f"log_path={out_json}"]
         feats = self._vmaf_features()
         if feats:
-            opts.append(f"feature={feats}")
+            # av1an's --probing-vmaf-features uses its own CLI syntax
+            # (e.g. "default motionless", "weighted neg") which ffmpeg's
+            # libvmaf filter cannot parse. Only forward valid ffmpeg feature
+            # configs (contain '=' / '|'); ignore the rest with a warning.
+            if "=" in feats or "|" in feats:
+                opts.append(f"feature={feats}")
+            else:
+                logger.warning(
+                    "optimizer: ignoring probing_vmaf_features {!r} (av1an-style, "
+                    "not understood by ffmpeg libvmaf; use feature=name=... "
+                    "if needed, or leave empty for default VMAF features)",
+                    feats,
+                )
         n_threads = self._vmaf_threads()
         if n_threads:
             opts.append(f"n_threads={n_threads}")
@@ -608,6 +630,7 @@ class ShotEncoder:
             self._log(f"{len(shots)} shot(s) from scene detection")
 
             self._stage("probing", 2.0)
+            self._report(2.0, 0, len(shots))  # surface the shot count to the UI
             grid = self._probe_grid()
             samples = self.probe_all(shots, grid)
             chosen = self.pick_all_crfs(samples, grid)
