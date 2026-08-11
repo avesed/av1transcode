@@ -738,9 +738,13 @@ class ShotEncoder:
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int) -> Path:
         dst = self.probe_dir / f"enc_{idx:05d}.ivf"
         start = s0 / self.fps
-        dur = (s1 - s0) / self.fps
+        # encode exactly (s1 - s0) frames: `-t` on input-seeked shots is not
+        # frame-exact (off by a frame per shot), and 762 shots x 1 frame drift
+        # = seconds of A/V desync once the audio is muxed whole. `-frames:v`
+        # guarantees the exact frame count so the concat sums to the source.
         args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{start:.6f}", "-i", str(self.source), "-t", f"{dur:.6f}",
+                "-ss", f"{start:.6f}", "-i", str(self.source),
+                "-frames:v", str(s1 - s0),
                 "-map", "0:v:0", "-c:v", "libsvtav1",
                 "-preset", str(self.video.preset), "-crf", self._fmt_crf(crf)]
         if self.video.keyint:
