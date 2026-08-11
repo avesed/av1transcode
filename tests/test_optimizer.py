@@ -116,6 +116,43 @@ def test_merge_to_max_noop_when_under():
     assert opt.merge_to_max(shots, 5) == shots
 
 
+# ---- smooth_crfs ----
+def test_smooth_crfs_bounds_adjacent_deltas():
+    out = opt.smooth_crfs([22.0, 31.0, 22.0], max_delta=4.0)
+    assert all(abs(out[i] - out[i + 1]) <= 4.0 + 1e-9 for i in range(len(out) - 1))
+    assert out == [22.0, 26.0, 22.0]
+
+
+def test_smooth_crfs_ramp():
+    out = opt.smooth_crfs([20.0, 30.0, 40.0, 50.0, 60.0], max_delta=4.0)
+    assert out == [20.0, 24.0, 28.0, 32.0, 36.0]
+
+
+def test_smooth_crfs_noop_when_within_bound():
+    crfs = [22.0, 24.0, 26.0]
+    assert opt.smooth_crfs(crfs, max_delta=4.0) == crfs
+
+
+def test_smooth_crfs_disabled_and_single():
+    assert opt.smooth_crfs([22.0, 31.0], max_delta=0.0) == [22.0, 31.0]
+    assert opt.smooth_crfs([30.0], max_delta=4.0) == [30.0]
+
+
+def test_smooth_chosen(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.max_crf_delta = 4.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    out = enc.smooth_chosen({0: 22.0, 1: 31.0, 2: 22.0})
+    vals = [out[i] for i in sorted(out)]
+    assert all(abs(vals[i] - vals[i + 1]) <= 4.0 + 1e-9 for i in range(len(vals) - 1))
+    assert out[1] == pytest.approx(26.0, abs=0.01)
+
+
+def test_smooth_chosen_disabled(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.max_crf_delta = 0.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc.smooth_chosen({0: 22.0, 1: 31.0}) == {0: 22.0, 1: 31.0}
+
+
 # ---- svt params ----
 def test_svt_params_dict():
     v = VideoParams(tune=1, film_grain=8, film_grain_denoise=False,

@@ -94,6 +94,7 @@ transcode:
     scenedetect_threshold: 27.0  # PySceneDetect ContentDetector sensitivity
     min_scene_len: 24            # minimum shot length in frames
     max_shots: 3000              # cap; shortest shots merged past this
+    max_crf_delta: 4.0           # 相邻镜头 CRF 差上限(0=关闭)，避免质量跳变
     fractional_crf: false        # pass decimal CRF to SVT-AV1 (needs support)
     keep_probes: false           # keep per-shot probe files for debugging
 

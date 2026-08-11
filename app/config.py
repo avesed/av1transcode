@@ -130,6 +130,12 @@ class OptimizerSettings(BaseModel):
     min_scene_len: int = 24
     # Cap on the number of shots; shortest adjacent shots are merged past this.
     max_shots: int = 3000
+    # Bound the per-shot CRF jump between neighbouring shots (0 = disable).
+    # Each shot independently hits target_quality, which can leave adjacent
+    # shots with very different CRFs and a visible quality step; smoothing
+    # keeps |CRF[i] - CRF[i+1]| <= max_crf_delta. May lower some shots a
+    # little below target to keep the picture continuous.
+    max_crf_delta: float = 4.0
     # Pass decimal CRF values to SVT-AV1 (finer than integer CRF granularity).
     # SVT-AV1 must accept fractional --crf for this to work.
     fractional_crf: bool = False

@@ -82,6 +82,41 @@ def pick_crf(samples: List[Tuple[int, float]], target: float) -> float:
     return float(min(pts, key=lambda p: abs(p[1] - target))[0])
 
 
+def smooth_crfs(crfs: List[float], max_delta: float, iterations: int = 32) -> List[float]:
+    """Bound the CRF jump between adjacent shots to <= max_delta.
+
+    Each shot is independently picked to hit the target metric, so two
+    neighbouring shots can land far apart (e.g. CRF 22 then CRF 31) and look
+    discontinuous even though both meet the target. This runs alternating
+    forward/backward projections: every shot is clipped to within +/- max_delta
+    of its neighbours, repeated until stable. Shots already within the bound
+    are left untouched. Returns a copy; max_delta <= 0 disables smoothing.
+    """
+    n = len(crfs)
+    if n <= 1 or max_delta <= 0:
+        return [float(c) for c in crfs]
+    s = [float(c) for c in crfs]
+    for _ in range(max(1, iterations)):
+        moved = False
+        for i in range(1, n):
+            lo = s[i - 1] - max_delta
+            hi = s[i - 1] + max_delta
+            new = min(max(s[i], lo), hi)
+            if new != s[i]:
+                s[i] = new
+                moved = True
+        for i in range(n - 2, -1, -1):
+            lo = s[i + 1] - max_delta
+            hi = s[i + 1] + max_delta
+            new = min(max(s[i], lo), hi)
+            if new != s[i]:
+                s[i] = new
+                moved = True
+        if not moved:
+            break
+    return s
+
+
 def merge_to_max(shots: List[Shot], max_shots: int) -> List[Shot]:
     """Merge the shortest adjacent shots until the count is <= max_shots."""
     shots = list(shots)
@@ -484,6 +519,21 @@ class ShotEncoder:
             chosen[idx] = crf
         return chosen
 
+    def smooth_chosen(self, chosen: Dict[int, float]) -> Dict[int, float]:
+        """Bound adjacent-shot CRF jumps (see smooth_crfs) to keep the picture
+        visually continuous. max_crf_delta <= 0 disables smoothing."""
+        max_delta = float(self.opt.max_crf_delta or 0)
+        if max_delta <= 0 or len(chosen) <= 1:
+            return chosen
+        ordered_idx = sorted(chosen)
+        smoothed = smooth_crfs([chosen[i] for i in ordered_idx], max_delta)
+        grid = self._probe_grid()
+        lo, hi = min(grid), max(grid)
+        out = {}
+        for i, crf in zip(ordered_idx, smoothed):
+            out[i] = max(lo, min(crf, hi))
+        return out
+
     # ---------- phase 4: parallel final encode ----------
     def encode_all(self, shots: List[Shot], chosen: Dict[int, float]) -> List[Path]:
         workers = self.opt.probe_workers or os.cpu_count() or 1
@@ -561,6 +611,12 @@ class ShotEncoder:
             grid = self._probe_grid()
             samples = self.probe_all(shots, grid)
             chosen = self.pick_all_crfs(samples, grid)
+            if float(self.opt.max_crf_delta or 0) > 0:
+                ideal = ", ".join(f"{i}:{chosen[i]:g}" for i in sorted(chosen))
+                chosen = self.smooth_chosen(chosen)
+                self._log(f"ideal per-shot CRFs -> {ideal}")
+            else:
+                chosen = self.smooth_chosen(chosen)
             crf_line = ", ".join(f"{i}:{chosen[i]:g}" for i in sorted(chosen))
             self._log(f"chosen per-shot CRFs -> {crf_line}")
 
