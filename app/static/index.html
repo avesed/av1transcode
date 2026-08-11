@@ -229,7 +229,8 @@ async function refresh() {
       <td class="muted">${size}</td>
       <td>${["running","pending","analyzing"].includes(j.status)
         ? `<button class="ghost" data-id="${j.id}">取消</button>` : ""}
-          ${(j.status==="failed"||j.status==="done") ? `<button class="ghost" data-log="${j.id}">日志</button>` : ""}</td>`;
+          ${["running","analyzing","done","failed","cancelled"].includes(j.status)
+            ? `<button class="ghost" data-log="${j.id}">日志</button>` : ""}</td>`;
     t.appendChild(tr);
   }
 }
