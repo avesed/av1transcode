@@ -141,6 +141,7 @@ function liveStats(j) {
 async function loadPresets() {
   try {
     const r = await fetch("/api/presets").then(r=>r.json());
+    presetsMap = r;
     const sel = document.getElementById("preset");
     const names = Object.keys(r);
     sel.innerHTML = "";
@@ -151,19 +152,37 @@ async function loadPresets() {
     syncCustom();
   } catch(e) { /* presets endpoint is best-effort */ }
 }
+let presetsMap = {};
 function syncCustom() {
   const isCustom = document.getElementById("preset").value === "custom";
-  document.getElementById("customHint").textContent = isCustom
-    ? "custom 模式：以默认参数为基准，自定义参数框中的值全部生效（留空等于默认 preset）。"
-    : "提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。";
+  const engineSel = document.getElementById("engine");
+  const metricSel = document.getElementById("target_metric");
+  const p = presetsMap[document.getElementById("preset").value] || {};
+  if (isCustom) {
+    if (engineSel.disabled) engineSel.value = "av1an";  // clean slate from a named preset
+    engineSel.disabled = false;
+    metricSel.disabled = engineSel.value !== "optimizer";
+    document.getElementById("customHint").textContent =
+      "custom 模式：以默认参数为基准，自定义参数框 + 引擎/指标下拉全部生效（留空等于默认 preset）。";
+  } else {
+    engineSel.disabled = true;
+    metricSel.disabled = true;
+    if (p.engine) engineSel.value = p.engine;
+    const eng = p.engine || "av1an";
+    document.getElementById("customHint").textContent =
+      `所选预设的引擎/探测指标以设置页为准（当前引擎：${eng}）；自定义参数框可覆盖其余字段。`;
+  }
 }
 document.getElementById("preset").addEventListener("change", syncCustom);
 function syncEngine() {
-  const isOpt = document.getElementById("engine").value === "optimizer";
-  document.getElementById("target_metric").disabled = !isOpt;
-  document.getElementById("customHint").textContent = isOpt
-    ? "optimizer：Shot-based 并行探测，需填 target_quality（如 target_quality=80 或 75-85）。探测指标取右侧下拉（VMAF/SSIMULACRA2）。"
-    : "提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。";
+  const isCustom = document.getElementById("preset").value === "custom";
+  document.getElementById("target_metric").disabled = !isCustom || document.getElementById("engine").value !== "optimizer";
+  if (isCustom) {
+    document.getElementById("customHint").textContent =
+      "optimizer：Shot-based 并行探测，需填 target_quality（如 target_quality=80 或 75-85）。探测指标取右侧下拉（VMAF/SSIMULACRA2）。";
+  } else {
+    syncCustom();
+  }
 }
 document.getElementById("engine").addEventListener("change", syncEngine);
 syncEngine();
@@ -225,14 +244,17 @@ document.getElementById("submit").addEventListener("submit", async e => {
       overrides[kv[0].trim()] = kv[1].trim();
     }
   }
-  // engine / target_metric selectors feed into overrides
-  const engine = document.getElementById("engine").value;
-  const metric = document.getElementById("target_metric").value;
-  if (engine && engine !== "av1an" && !("engine" in overrides)) overrides.engine = engine;
-  if (engine === "optimizer" && metric && !("target_metric" in overrides)) overrides.target_metric = metric;
-  if (engine === "optimizer" && !overrides.target_quality) {
-    err.textContent = "optimizer 引擎需要 target_quality（如 crf=24,preset=3,target_quality=80 或 75-85）";
-    err.style.display = "block"; return;
+  // engine / target_metric selectors only apply in custom mode; otherwise the
+  // selected preset (set in 设置页) is authoritative.
+  if (preset === "custom") {
+    const engine = document.getElementById("engine").value;
+    const metric = document.getElementById("target_metric").value;
+    if (engine && engine !== "av1an" && !("engine" in overrides)) overrides.engine = engine;
+    if (engine === "optimizer" && metric && !("target_metric" in overrides)) overrides.target_metric = metric;
+    if (engine === "optimizer" && !overrides.target_quality) {
+      err.textContent = "optimizer 引擎需要 target_quality（如 crf=24,preset=3,target_quality=80 或 75-85）";
+      err.style.display = "block"; return;
+    }
   }
   const r = await fetch("/api/jobs", { method:"POST",
     headers:{"Content-Type":"application/json"},
