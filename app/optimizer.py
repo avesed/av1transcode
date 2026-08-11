@@ -395,8 +395,9 @@ class ShotEncoder:
             self._heaviest_cmd = (peak_mb, desc)
         self._mem_log(f"[mem] {desc} peak={peak_mb:.0f}MB rc={proc.returncode}",
                       level="debug")
-        if out.strip():
-            self._log(out[-4000:])
+        # keep the job log small: ffmpeg's full stdout (SVT config dumps,
+        # progress bars) is dropped on success; the failure path below still
+        # surfaces the tail of the output.
         if proc.returncode != 0:
             raise TranscodeError(
                 f"{args[0]} failed (rc={proc.returncode}):\n{out[-2000:]}"
