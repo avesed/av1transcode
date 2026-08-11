@@ -215,6 +215,8 @@ class Logging(BaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     # Console + file. File is relative to dirs.logs
     file: bool = True
+    # Delete job_*.log files older than this many days (0 = never clean up).
+    retention_days: int = 7
 
 
 class Settings(BaseModel):

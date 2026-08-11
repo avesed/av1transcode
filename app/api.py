@@ -121,7 +121,11 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         _auth(request)
         statuses = (body or {}).get("statuses")
         n = store.prune(statuses)
-        return {"pruned": n}
+        from app.logger import prune_job_logs
+
+        keep = {j["id"] for j in store.list(status=None, limit=100000)}
+        removed_logs = prune_job_logs(settings, keep_ids=keep)
+        return {"pruned": n, "logs_removed": removed_logs}
 
     # ---------- presets ----------
     @router.get("/presets")

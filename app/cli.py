@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -29,7 +31,7 @@ def run(
 ) -> None:
     """Run the full scheduler: watcher + workers (+ web server by default)."""
     settings = load_settings(config)
-    from app.logger import setup_logging
+    from app.logger import setup_logging, cleanup_old_job_logs
 
     setup_logging(settings)
     settings.ensure_dirs()
@@ -38,6 +40,26 @@ def run(
 
     store = db.JobStore(settings)
     manager = TranscodeManager(settings, store)
+
+    # prune old job logs at startup and periodically
+    try:
+        n = cleanup_old_job_logs(settings)
+        if n:
+            logger.info("Cleaned up {} old job log(s)", n)
+    except Exception:  # noqa: BLE001
+        logger.debug("job log cleanup failed", exc_info=True)
+
+    def _log_cleanup_loop() -> None:
+        while True:
+            time.sleep(6 * 3600)
+            try:
+                n = cleanup_old_job_logs(settings)
+                if n:
+                    logger.info("Cleaned up {} old job log(s)", n)
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=_log_cleanup_loop, daemon=True).start()
 
     if settings.watcher.enabled and not no_watch:
         from app.watcher import FileWatcher

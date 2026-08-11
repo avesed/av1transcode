@@ -113,6 +113,7 @@ web:
 logging:
   level: INFO
   file: true
+  retention_days: 7          # job_*.log 保留天数，超出自动清理(0=不清理)
 
 tools:
   ffmpeg: ffmpeg

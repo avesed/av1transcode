@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +45,49 @@ def setup_logging(settings: Settings, log_file: Optional[Path] = None) -> None:
                    enqueue=True, serialize=False)
     logging.basicConfig(handlers=[InterceptHandler()], level=logging.WARNING)
     logger.opt(colors=True)
+
+
+def cleanup_old_job_logs(settings: Settings, retention_days: Optional[int] = None) -> int:
+    """Delete job_*.log files older than retention_days (0/None->config).
+
+    The job logs are written unbounded (one per job, can be tens of MB for a
+    long optimizer run), so prune them on startup and periodically. Returns
+    the number of files removed.
+    """
+    days = settings.logging.retention_days if retention_days is None else retention_days
+    if not days or days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400
+    removed = 0
+    logs_dir = settings.dirs.logs
+    if not logs_dir.is_dir():
+        return 0
+    for p in logs_dir.glob("job_*.log"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def prune_job_logs(settings: Settings, keep_ids: Optional[set] = None) -> int:
+    """Delete job_*.log files whose job id is not in keep_ids (or all of them)."""
+    removed = 0
+    logs_dir = settings.dirs.logs
+    if not logs_dir.is_dir():
+        return 0
+    for p in logs_dir.glob("job_*.log"):
+        jid = p.stem[len("job_"):]
+        if keep_ids is not None and jid in keep_ids:
+            continue
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def get_logger(name: str = "app"):
