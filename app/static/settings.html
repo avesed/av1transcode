@@ -77,6 +77,75 @@
     </div>
   </form>
 
+  <h2>Shot-based 优化器引擎（engine=optimizer）</h2>
+  <p class="hint">Netflix 风格：PySceneDetect 分镜 → 所有片段<b>并行</b>探测一组 CRF → 插值出精细的每段 CRF → 并行编码 → 拼接。质量指标为 VMAF 或 SSIMULACRA2。探测/编码并行数来自 probe_workers（0=全部核心）。</p>
+  <form class="editor open" id="optimizerForm" style="margin-bottom:24px">
+    <div class="grid">
+      <div class="field">
+        <label>probe_crfs（探测 CRF 网格，逗号分隔）</label>
+        <input type="text" id="o-probe_crfs" placeholder="20,24,28,32,36,40,44,48">
+      </div>
+      <div class="field">
+        <label>probe_preset（探测编码速度，越快越失真）</label>
+        <input type="number" id="o-probe_preset" min="0" max="13">
+      </div>
+      <div class="field">
+        <label>probe_scale（探测分辨率，如 960x540）</label>
+        <input type="text" id="o-probe_scale">
+      </div>
+      <div class="field">
+        <label>probing_rate（每隔 n 帧探测）</label>
+        <input type="number" id="o-probing_rate" min="1" max="10">
+      </div>
+      <div class="field">
+        <label>probe_workers（并行探测数，0=全部核心）</label>
+        <input type="number" id="o-probe_workers" min="0" max="256">
+      </div>
+      <div class="field">
+        <label>scenedetect_threshold（分镜灵敏度，越高分镜越少）</label>
+        <input type="number" id="o-scenedetect_threshold" min="0" step="0.5">
+      </div>
+      <div class="field">
+        <label>min_scene_len（最小镜头长度，帧）</label>
+        <input type="number" id="o-min_scene_len" min="0">
+      </div>
+      <div class="field">
+        <label>max_shots（镜头数量上限，超出合并最短镜头）</label>
+        <input type="number" id="o-max_shots" min="1">
+      </div>
+      <div class="field">
+        <label>vmaf_threads（VMAF 计算线程，0=自动）</label>
+        <input type="number" id="o-vmaf_threads" min="0">
+      </div>
+      <div class="field">
+        <label>vmaf_model（VMAF 模型路径）</label>
+        <input type="text" id="o-vmaf_model">
+      </div>
+      <div class="field">
+        <label>ssimulacra2_model（SSIMULACRA2 模型路径）</label>
+        <input type="text" id="o-ssimulacra2_model">
+      </div>
+      <div class="field">
+        <label>fractional_crf（传小数 CRF 给 SVT-AV1）</label>
+        <select id="o-fractional_crf">
+          <option value="false">false（整数 CRF，默认）</option>
+          <option value="true">true（小数 CRF，更精细）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>keep_probes（保留探测临时文件便于调试）</label>
+        <select id="o-keep_probes">
+          <option value="false">false</option>
+          <option value="true">true</option>
+        </select>
+      </div>
+    </div>
+    <div class="editor-actions">
+      <button type="submit" id="optimizerSaveBtn">保存优化器设置</button>
+      <span class="hint" id="optimizerActive" style="margin:0"></span>
+    </div>
+  </form>
+
   <h2 style="color:#d33;margin-top:32px">危险操作</h2>
   <p class="hint" style="color:#d33">以下开关会造成<b>不可逆的数据损失</b>，请谨慎操作。</p>
   <form class="editor open" id="safetyForm" style="margin-bottom:24px">
@@ -106,6 +175,20 @@
       <div class="field">
         <label>名称（用于 CLI/API 的 --preset）</label>
         <input type="text" id="f-name" placeholder="e.g. anime, film, speed">
+      </div>
+      <div class="field">
+        <label>引擎（av1an | optimizer）</label>
+        <select id="f-engine">
+          <option value="av1an">av1an（默认，串行探测）</option>
+          <option value="optimizer">optimizer（Shot-based 并行探测）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>质量指标（optimizer 引擎）</label>
+        <select id="f-target_metric">
+          <option value="vmaf">VMAF</option>
+          <option value="ssimulacra2">SSIMULACRA2</option>
+        </select>
       </div>
       <div class="field">
         <label>CRF（码率质量，越低越清晰/越慢）</label>
@@ -226,6 +309,7 @@ async function loadList() {
       `crf=${p.crf} · preset=${p.preset} · passes=${p.passes}`,
       `pix_fmt=${p.pixel_format}`,
     ];
+    if (p.engine === "optimizer") lines.push(`engine=optimizer · metric=${p.target_metric}`);
     if (p.film_grain) lines.push(`film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
     if (p.target_quality) lines.push(`target_quality=${p.target_quality}`);
     if (p.additional_video_params) lines.push(p.additional_video_params);
@@ -243,6 +327,8 @@ async function loadList() {
 function fillForm(name, p) {
   $("f-name").value = name;
   $("f-name").disabled = !!name;
+  $("f-engine").value = p?.engine ?? "av1an";
+  $("f-target_metric").value = p?.target_metric ?? "vmaf";
   $("f-crf").value = p?.crf ?? 28;
   $("f-preset").value = p?.preset ?? 4;
   $("f-film_grain").value = p?.film_grain ?? 0;
@@ -267,6 +353,8 @@ function fillForm(name, p) {
 }
 function collectForm() {
   return {
+    engine: $("f-engine").value,
+    target_metric: $("f-target_metric").value,
     crf: parseInt($("f-crf").value, 10),
     preset: parseInt($("f-preset").value, 10),
     film_grain: parseInt($("f-film_grain").value, 10),
@@ -348,6 +436,56 @@ $("workersForm").addEventListener("submit", async e => {
   } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
 });
 
+async function loadOptimizer() {
+  try {
+    const o = await api("/api/settings/optimizer");
+    $("o-probe_crfs").value = (o.probe_crfs || []).join(",");
+    $("o-probe_preset").value = o.probe_preset;
+    $("o-probe_scale").value = o.probe_scale;
+    $("o-probing_rate").value = o.probing_rate;
+    $("o-probe_workers").value = o.probe_workers;
+    $("o-scenedetect_threshold").value = o.scenedetect_threshold;
+    $("o-min_scene_len").value = o.min_scene_len;
+    $("o-max_shots").value = o.max_shots;
+    $("o-vmaf_threads").value = o.vmaf_threads;
+    $("o-vmaf_model").value = o.vmaf_model;
+    $("o-ssimulacra2_model").value = o.ssimulacra2_model;
+    $("o-fractional_crf").value = String(!!o.fractional_crf);
+    $("o-keep_probes").value = String(!!o.keep_probes);
+    $("optimizerActive").textContent = `当前 metric 默认: ${o.probe_crfs.length} 个 CRF 探测点`;
+  } catch (err) {
+    $("optimizerActive").textContent = `读取优化器设置失败: ${err.message}`;
+  }
+}
+$("optimizerForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    const crfs = String($("o-probe_crfs").value).split(",").map(s => parseInt(s.trim(), 10)).filter(Number.isInteger);
+    if (!crfs.length) { showMsg("probe_crfs 至少需要一个整数", false); return; }
+    const body = {
+      probe_crfs: crfs,
+      probe_preset: parseInt($("o-probe_preset").value, 10),
+      probe_scale: $("o-probe_scale").value.trim(),
+      probing_rate: parseInt($("o-probing_rate").value, 10) || 1,
+      probe_workers: parseInt($("o-probe_workers").value, 10) || 0,
+      scenedetect_threshold: parseFloat($("o-scenedetect_threshold").value),
+      min_scene_len: parseInt($("o-min_scene_len").value, 10),
+      max_shots: parseInt($("o-max_shots").value, 10),
+      vmaf_threads: parseInt($("o-vmaf_threads").value, 10) || 0,
+      vmaf_model: $("o-vmaf_model").value.trim(),
+      ssimulacra2_model: $("o-ssimulacra2_model").value.trim(),
+      fractional_crf: $("o-fractional_crf").value === "true",
+      keep_probes: $("o-keep_probes").value === "true",
+    };
+    await api("/api/settings/optimizer", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    showMsg("已保存优化器设置", true);
+    loadOptimizer();
+  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
+});
+
 async function loadSafety() {
   try {
     const s = await api("/api/settings/safety");
@@ -382,6 +520,7 @@ async function presetsBuiltin(name) {
   return !!(presets[name] && presets[name]._builtin);
 }
 loadWorkers();
+loadOptimizer();
 loadSafety();
 loadList();
 </script>

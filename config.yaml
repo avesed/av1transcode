@@ -76,6 +76,27 @@ transcode:
     p5_method: libplacebo      # libplacebo (accurate, needs Vulkan) | zscale (approx)
     strip_rpu: true            # strip RPU/EL from P7/P8 streams before encode
 
+  # Netflix-style shot-based encoding engine (select per preset via
+  # VideoParams.engine = "optimizer"). Uses PySceneDetect for shot detection,
+  # probes every shot in PARALLEL at a grid of CRFs, interpolates a fine-grained
+  # per-shot CRF to hit target_quality, then encodes all shots in parallel.
+  optimizer:
+    probe_crfs: [20, 24, 28, 32, 36, 40, 44, 48]  # CRF grid probed per shot
+    probe_preset: 10             # fast SVT-AV1 preset for probe encodes
+    probe_scale: "960x540"       # probe resolution (scaled for speed)
+    probing_rate: 1              # probe every nth frame of each shot
+    vmaf_model: /usr/share/model/vmaf_v0.6.1.json
+    # SSIMULACRA2 需要带 ssimulacra2 的 libvmaf（官方 libvmaf 2.3.1 不带）。
+    # 可填 version=ssimulacra2（libvmaf 已编译进该模型时）或 path=/path/to/ssimulacra2.json
+    ssimulacra2_model: version=ssimulacra2
+    vmaf_threads: 0              # 0 = auto
+    probe_workers: 0             # parallel probe workers across shots (0 = cpu count)
+    scenedetect_threshold: 27.0  # PySceneDetect ContentDetector sensitivity
+    min_scene_len: 24            # minimum shot length in frames
+    max_shots: 3000              # cap; shortest shots merged past this
+    fractional_crf: false        # pass decimal CRF to SVT-AV1 (needs support)
+    keep_probes: false           # keep per-shot probe files for debugging
+
   hdr:
     preserve: true             # keep mastering display / CLL on output
     default_master_display: "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"

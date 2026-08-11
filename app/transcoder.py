@@ -490,15 +490,27 @@ def run_full_transcode(
             progress_cb(pct, stats)
 
     video = plan.params or settings.transcode.video
-    cmd = build_av1an_cmd(
-        settings, video, encode_input, output, tempdir, workers=settings.workers.av1an_workers,
-    )
-    logger.info("Starting av1an: {} -> {}", encode_input, output)
-    logger.debug("av1an full command: {}", " ".join(cmd))
-    t0 = time.monotonic()
-    run_av1an(cmd, log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
-              stage_cb=stage_cb)
-    logger.info("av1an finished in {:.1f}s", time.monotonic() - t0)
+    if video.engine == "optimizer":
+        from app.optimizer import run_shot_transcode
+
+        logger.info("Starting optimizer engine (shot-based): {} -> {}", encode_input, output)
+        t0 = time.monotonic()
+        run_shot_transcode(
+            settings, info, plan, encode_input, output, tempdir,
+            log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
+            stage_cb=stage_cb,
+        )
+        logger.info("optimizer finished in {:.1f}s", time.monotonic() - t0)
+    else:
+        cmd = build_av1an_cmd(
+            settings, video, encode_input, output, tempdir, workers=settings.workers.av1an_workers,
+        )
+        logger.info("Starting av1an: {} -> {}", encode_input, output)
+        logger.debug("av1an full command: {}", " ".join(cmd))
+        t0 = time.monotonic()
+        run_av1an(cmd, log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
+                  stage_cb=stage_cb)
+        logger.info("av1an finished in {:.1f}s", time.monotonic() - t0)
 
     if not output.exists() or output.stat().st_size == 0:
         raise TranscodeError("av1an produced no output file")

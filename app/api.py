@@ -194,11 +194,30 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         return {"ok": True, "workers": {
             "concurrency": concurrency, "av1an_workers": av1an_workers}}
 
+    # ---------- optimizer engine settings ----------
+    @router.get("/settings/optimizer")
+    def get_optimizer():
+        return settings.transcode.optimizer.model_dump()
+
+    @router.put("/settings/optimizer")
+    def put_optimizer(request: Request, body: dict):
+        _auth(request)
+        from app.config import OptimizerSettings
+
+        try:
+            params = OptimizerSettings.model_validate(body)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(422, f"invalid optimizer settings: {e}")
+        # persist (merge keeps workers / delete_source intact)
+        config.save_user_settings(settings, {"optimizer": params.model_dump()})
+        settings.transcode.optimizer = params
+        logger.info("Updated optimizer settings: {}", params.model_dump())
+        return {"ok": True, "optimizer": params.model_dump()}
+
     # ---------- safety settings (delete_source) ----------
     @router.get("/settings/safety")
     def get_safety():
         return {"delete_source": settings.transcode.delete_source}
-
     @router.put("/settings/delete_source")
     def put_delete_source(request: Request, body: dict):
         """Enable/disable source deletion after success.

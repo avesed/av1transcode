@@ -115,6 +115,17 @@ def decide_action(settings: Settings, info: MediaInfo, preset_name: str = "",
     plan.params = video
     plan.action_name = f"transcode:{preset_name}"
 
+    # Engine notes / validation
+    if video.engine == "optimizer":
+        if not (video.target_quality or "").strip():
+            plan.skip = True
+            plan.skip_reason = "engine=optimizer requires target_quality (e.g. 75 or 75-85)"
+            return plan
+        plan.notes.append(
+            f"shot-based engine (optimizer) with target_metric={video.target_metric}, "
+            f"target_quality={video.target_quality}"
+        )
+
     # DV detection/handling
     if info.dovi.present:
         plan.dovi_present = True

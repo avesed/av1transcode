@@ -51,6 +51,18 @@ class Watcher(BaseModel):
 
 class VideoParams(BaseModel):
     codec: Literal["svt-av1"] = "svt-av1"
+    # Which engine runs the encode:
+    #   av1an     - the current av1an pipeline (scene detection + serial VMAF
+    #               probing + parallel chunk encode, all inside av1an).
+    #   optimizer - Netflix-style shot-based encoding: shot detection via
+    #               PySceneDetect, per-shot quality probing in PARALLEL across
+    #               chunks, interpolated fine-grained CRF selection, then a
+    #               parallel per-shot encode and concat.
+    engine: Literal["av1an", "optimizer"] = "av1an"
+    # Quality metric used by the "optimizer" engine's probes.
+    #   vmaf        - Netflix VMAF (0-100, higher is better).
+    #   ssimulacra2 - SSIMULACRA2 via a libvmaf model (0-100, higher is better).
+    target_metric: Literal["vmaf", "ssimulacra2"] = "vmaf"
     # Constant rate factor / quality. Lower = higher quality.
     crf: int = 28
     # SVT-AV1 preset, 0 (slowest/best) - 13 (fastest). 4-6 is a good range.
@@ -86,6 +98,45 @@ class VideoParams(BaseModel):
     probe_video_params: str = ""
 
 
+class OptimizerSettings(BaseModel):
+    """Pipeline tuning for the "optimizer" (shot-based) engine.
+
+    These are job-wide defaults; per-preset VideoParams fields (probing_rate,
+    probe_res, vmaf_threads, probing_vmaf_features, probe_video_params)
+    override the matching values below when set.
+    """
+    # CRF grid sampled per shot during probing. Denser = more accurate CRF
+    # selection but more probe encodes. Probes run in parallel across shots.
+    probe_crfs: List[int] = Field(default_factory=lambda: [20, 24, 28, 32, 36, 40, 44, 48])
+    # Fast SVT-AV1 preset used for the probe encodes.
+    probe_preset: int = 10
+    # Probe resolution "WxH" (scaled down for fast probes). Empty = source res.
+    probe_scale: str = "960x540"
+    # Only probe every nth frame (1 = all frames of each shot).
+    probing_rate: int = 1
+    # libvmaf model configs. Accepts "path=/x.json", "version=NAME", or a bare
+    # path (wrapped as path=...). Note: stock libvmaf <= 2.3.1 has no
+    # ssimulacra2 model; a patched libvmaf or a ssimulacra2.json is required
+    # for target_metric=ssimulacra2.
+    vmaf_model: str = "/usr/share/model/vmaf_v0.6.1.json"
+    ssimulacra2_model: str = "version=ssimulacra2"
+    # Probe worker threads for the VMAF calculation (0 = encoder decides).
+    vmaf_threads: int = 0
+    # Parallel probe/encode workers across shots (0 = os.cpu_count()).
+    probe_workers: int = 0
+    # PySceneDetect ContentDetector threshold (higher = fewer/split less).
+    scenedetect_threshold: float = 27.0
+    # Minimum shot length in frames (shorter segments are merged).
+    min_scene_len: int = 24
+    # Cap on the number of shots; shortest adjacent shots are merged past this.
+    max_shots: int = 3000
+    # Pass decimal CRF values to SVT-AV1 (finer than integer CRF granularity).
+    # SVT-AV1 must accept fractional --crf for this to work.
+    fractional_crf: bool = False
+    # Keep per-shot probe files in the temp dir for debugging.
+    keep_probes: bool = False
+
+
 class DolbyVision(BaseModel):
     enabled: bool = True
     # Where to store extracted RPU files (relative to dirs.rpu)
@@ -117,6 +168,7 @@ class Transcode(BaseModel):
     default_preset: str = "balanced"
     dovi: DolbyVision = Field(default_factory=DolbyVision)
     hdr: Hdr = Field(default_factory=Hdr)
+    optimizer: OptimizerSettings = Field(default_factory=OptimizerSettings)
     # Skip files that are already AV1 at >= this resolution height (0 = never skip)
     skip_existing_av1: bool = True
     min_height_to_transcode: int = 0
@@ -210,24 +262,47 @@ def _load_config_dict(path: Path) -> Dict[str, Any]:
 
 
 def _merge_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Allow overriding every config value via AV1TC_<SECTION>_<KEY> env vars."""
+    """Allow overriding every config value via AV1TC_<SECTION>_<KEY> env vars.
+
+    Keys themselves may contain underscores (e.g. DIRS_SETTINGS_FILE,
+    TRANSCODE_VIDEO_PROBE_VIDEO_PARAMS): at each level the longest remaining
+    underscore-joined token that exists in the current node wins.
+    """
     for key, val in os.environ.items():
         if not key.startswith("AV1TC_"):
             continue
         parts = key[6:].lower().split("_")
         node = cfg
-        for part in parts[:-1]:
-            node = node.setdefault(part, {})
-        last = parts[-1]
-        if last in node and isinstance(node[last], bool):
-            node[last] = val.lower() in ("1", "true", "yes", "on")
-        elif last in node and isinstance(node[last], int):
-            try:
-                node[last] = int(val)
-            except ValueError:
-                pass
-        else:
-            node[last] = val
+        i = 0
+        while i < len(parts):
+            match = None
+            for j in range(len(parts), i, -1):
+                cand = "_".join(parts[i:j])
+                if cand in node:
+                    match = (cand, j)
+                    break
+            if match is None:
+                break
+            cand, j = match
+            nxt = node[cand]
+            if j == len(parts):
+                if isinstance(nxt, bool):
+                    node[cand] = val.lower() in ("1", "true", "yes", "on")
+                elif isinstance(nxt, int):
+                    try:
+                        node[cand] = int(val)
+                    except ValueError:
+                        pass
+                elif isinstance(nxt, list):
+                    node[cand] = [x.strip() for x in val.split(",")]
+                else:
+                    node[cand] = val
+                break
+            if isinstance(nxt, dict):
+                node = nxt
+                i = j
+            else:
+                break
     return cfg
 
 
@@ -266,6 +341,13 @@ def load_settings(config_path: Optional[Path] = None) -> Settings:
             pass
     if "delete_source" in usettings and isinstance(usettings["delete_source"], bool):
         settings.transcode.delete_source = usettings["delete_source"]
+    user_opt = usettings.get("optimizer") or {}
+    if user_opt:
+        try:
+            settings.transcode.optimizer = OptimizerSettings.model_validate(user_opt)
+        except Exception as e:  # noqa: BLE001
+            logger = __import__("loguru").logger
+            logger.warning("Ignoring invalid optimizer settings: {}", e)
     return settings
 
 
@@ -281,6 +363,8 @@ def load_user_settings(settings: Settings) -> Dict[str, Any]:
             out["workers"] = data["workers"]
         if "delete_source" in data:
             out["delete_source"] = data["delete_source"]
+        if data.get("optimizer"):
+            out["optimizer"] = data["optimizer"]
         return out
     except (OSError, ValueError):
         return {}

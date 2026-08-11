@@ -77,6 +77,8 @@
 <p>预设可在<b>设置</b>页添加/编辑/删除并持久化（存于 <code>dirs.presets_file</code>，默认 <code>/data/presets.json</code>）。自定义预设可覆盖内置同名预设，内置预设删除后自动恢复 config.yaml 中的定义。</p>
 <table>
   <tr><th>参数</th><th>默认</th><th>说明</th></tr>
+  <tr><td><code>engine</code></td><td>av1an</td><td><code>av1an</code>（默认，串行质量探测）或 <code>optimizer</code>（Netflix 式 Shot-based 并行探测）。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>target_metric</code></td><td>vmaf</td><td>optimizer 引擎的探测指标：<code>vmaf</code> 或 <code>ssimulacra2</code>（均 0-100，越高越好）。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>crf</code></td><td>28</td><td>恒定码率因子：越低质量越高、文件越大。<span class="tag core">核心</span></td></tr>
   <tr><td><code>preset</code></td><td>4</td><td>SVT-AV1 速度档 0-13：0 最慢最好，6 快；4-6 是常见区间。<span class="tag core">核心</span></td></tr>
   <tr><td><code>passes</code></td><td>1</td><td>编码遍数；2 = 两遍（先探测再编码）。</td></tr>
@@ -87,7 +89,7 @@
   <tr><td><code>min_scene_len</code></td><td>24</td><td>场景检测最小长度（帧），防止过碎分段。</td></tr>
   <tr><td><code>tune</code></td><td>0</td><td>0=VQ（视觉质量）、1=PSNR、2=SSIM。</td></tr>
   <tr><td><code>pixel_format</code></td><td>yuv420p10le</td><td>10-bit 保色阶；HDR 源请保持 10bit。</td></tr>
-  <tr><td><code>target_quality</code></td><td>空</td><td>av1an 分场景质量模式，如 <code>75-85</code>（VMAF 0-100）；每个场景自动调 CRF 命中区间。比固定 CRF 慢很多。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>target_quality</code></td><td>空</td><td>分场景质量目标。av1an 引擎：VMAF 区间如 <code>75-85</code>，每个场景用串行二分探测调 CRF。optimizer 引擎：并行探测 + 插值，取区间下限为目标。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probes</code></td><td>0</td><td>分场景探测次数上限（0 = av1an 默认 4）。越多越准越慢。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probing_rate</code></td><td>0</td><td>探测时每隔 n 帧取一帧算 VMAF（1 = 全部帧）；n&gt;4 通常不可用。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probe_res</code></td><td>空</td><td>探测用分辨率（如 <code>960x540</code>），缩小后探测更快。<span class="tag adv">进阶</span></td></tr>
@@ -101,6 +103,34 @@
 <p>首页表单的“自定义参数”框，或 CLI <code>--custom key=value</code>（可重复），按 <code>key=value</code> 逗号/分号分隔。值会覆盖所选预设的同名字段：</p>
 <pre>crf=24,preset=3,target_quality=75-85,film_grain_denoise=true</pre>
 <p>数字字段自动转 int（crf/preset/film_grain/passes/keyint/extra_split_sec/min_scene_len/tune），布尔字段接受 <code>true/false/1/0</code>（film_grain_denoise），其余按字符串（target_quality、additional_video_params、pixel_format）。预设选 <code>custom</code> 时以默认视频参数为基准，全部由自定义参数决定。</p>
+
+<h2>Shot-based 优化器引擎（engine=optimizer）</h2>
+<p>Netflix 风格的逐镜头（shot-based）编码。av1an 的 <code>--target-quality</code> 是<b>串行</b>探测：先完整探测完一个 chunk 再探测下一个。optimizer 引擎改为<b>所有镜头并行探测</b>，并用插值获得比 av1an 4 次二分更精细的每镜头 CRF：</p>
+<ol>
+  <li><b>分镜</b>：PySceneDetect ContentDetector 把源切成若干镜头（shot）。</li>
+  <li><b>并行探测</b>：用 <code>probe_workers</code> 个 worker 同时探测每个镜头的一串 CRF（<code>probe_crfs</code>），每个探测点快速编码 + 算 VMAF/SSIMULACRA2。探测分辨率默认 960x540（<code>probe_scale</code>），可每隔 n 帧取样（<code>probing_rate</code>）。</li>
+  <li><b>选 CRF</b>：对每个镜头在 (CRF, 分数) 曲线上插值，取命中 <code>target_quality</code> 下限的 CRF（区间超出探测范围时钳制到边界）。</li>
+  <li><b>并行编码</b>：所有镜头按各自 CRF 并行正式编码，最后拼接并重新复用源音频/字幕。</li>
+</ol>
+<p>启用方式：预设（设置页或 CLI <code>--custom engine=optimizer</code>）里设 <code>engine=optimizer</code>，并配合 <code>target_quality</code>（必填，如 <code>75</code> 或 <code>75-85</code>）。自定义参数同样适用：<code>--custom engine=optimizer --custom target_quality=80 --custom target_metric=ssimulacra2</code>。</p>
+<table>
+  <tr><th>配置</th><th>默认</th><th>说明</th></tr>
+  <tr><td><code>probe_crfs</code></td><td>[20,24,28,32,36,40,44,48]</td><td>每个镜头采样的 CRF 网格；越密越准、探测越多。</td></tr>
+  <tr><td><code>probe_preset</code></td><td>10</td><td>探测编码的 SVT-AV1 速度档（快、失真略大）。</td></tr>
+  <tr><td><code>probe_scale</code></td><td>960x540</td><td>探测分辨率；空 = 源分辨率。</td></tr>
+  <tr><td><code>probing_rate</code></td><td>1</td><td>探测每隔 n 帧取一帧。</td></tr>
+  <tr><td><code>probe_workers</code></td><td>0</td><td>跨镜头的并行探测/编码数；0 = 全部 CPU 核。</td></tr>
+  <tr><td><code>scenedetect_threshold</code></td><td>27.0</td><td>ContentDetector 灵敏度；越高分镜越少、片段越长。</td></tr>
+  <tr><td><code>min_scene_len</code></td><td>24</td><td>最小镜头长度（帧），更短的会合并。</td></tr>
+  <tr><td><code>max_shots</code></td><td>3000</td><td>镜头数量上限；超过时合并最短的相邻镜头。</td></tr>
+  <tr><td><code>vmaf_threads</code></td><td>0</td><td>VMAF 计算线程数。</td></tr>
+  <tr><td><code>vmaf_model</code></td><td>/usr/share/model/vmaf_v0.6.1.json</td><td>VMAF 模型。也接受 <code>version=…</code>。</td></tr>
+  <tr><td><code>ssimulacra2_model</code></td><td>version=ssimulacra2</td><td>SSIMULACRA2 模型。注意：官方 libvmaf 2.3.1 <b>不含</b> ssimulacra2，需自备兼容模型（<code>path=/x/ssimulacra2.json</code>）或带 ssimulacra2 的 libvmaf。</td></tr>
+  <tr><td><code>fractional_crf</code></td><td>false</td><td>把小数 CRF 传给 SVT-AV1（更精细；需编码器支持）。</td></tr>
+  <tr><td><code>keep_probes</code></td><td>false</td><td>保留探测临时文件（调试用）。</td></tr>
+</table>
+<p>资源占用：探测期峰值 ≈ <code>probe_workers</code> 个 libsvtav1 + VMAF 进程；临时文件在 <code>dirs.work</code>（成功/失败后清理，除非 <code>keep_temp</code>/<code>keep_probes</code>）。</p>
+<p>预设置的 <code>probing_rate</code>、<code>probe_res</code>、<code>probe_video_params</code>（如 <code>preset=10</code> 或 <code>copy</code>）、<code>vmaf_threads</code>、<code>probing_vmaf_features</code>（原样透传给 libvmaf 的 <code>feature=</code>）会覆盖上面的全局默认值。</p>
 
 <h2>Dolby Vision / HDR</h2>
 <table>
@@ -132,6 +162,7 @@
   <tr><td><code>transcode.dovi</code></td><td><code>enabled / save_rpu / strip_rpu</code></td><td>DV 转换开关 / 是否保存 RPU / P7·P8 剥离 RPU。</td></tr>
   <tr><td><code>transcode.dovi</code></td><td><code>p5_method</code></td><td><code>libplacebo</code>（准确，需 Vulkan）或 <code>zscale</code>（近似，纯软件）。</td></tr>
   <tr><td><code>transcode.hdr</code></td><td><code>preserve</code></td><td>输出保留 mastering display / CLL 元数据。</td></tr>
+  <tr><td><code>transcode.optimizer</code></td><td>—</td><td>Shot-based 优化器引擎的管线参数（见上节），设置页可改并持久化。</td></tr>
   <tr><td><code>web</code></td><td><code>enabled / host / port</code></td><td>Web UI 与 API 服务。</td></tr>
   <tr><td><code>web</code></td><td><code>api_key</code></td><td>写操作（提交任务/改预设）的 API 密钥；空 = 开放。</td></tr>
   <tr><td><code>tools</code></td><td><code>ffmpeg / ffprobe / av1an / …</code></td><td>各外部工具的可执行路径。</td></tr>
@@ -160,6 +191,7 @@ python3 -m app.cli status / cancel / check</pre>
   <tr><td>POST</td><td><code>/api/jobs/{id}/cancel</code></td><td>取消任务。</td></tr>
   <tr><td>PUT/DELETE</td><td><code>/api/presets/{name}</code></td><td>新增/修改 / 删除预设（写操作需 api_key）。</td></tr>
   <tr><td>PUT</td><td><code>/api/settings/workers</code></td><td>并行设置：<code>{"concurrency": 2, "av1an_workers": 4}</code>，即时生效并持久化。</td></tr>
+  <tr><td>GET/PUT</td><td><code>/api/settings/optimizer</code></td><td>优化器引擎管线参数读写（持久化到 settings_file）。</td></tr>
   <tr><td>GET</td><td><code>/api/jobs/{id}/log</code></td><td>任务日志。</td></tr>
 </table>
 

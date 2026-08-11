@@ -80,6 +80,14 @@
     <input type="text" id="path" placeholder="绝对路径：/media/input/xxx.mkv 或目录">
     <button type="button" class="ghost" id="browseBtn">浏览…</button>
     <select id="preset"></select>
+    <select id="engine" title="编码引擎">
+      <option value="av1an">av1an</option>
+      <option value="optimizer">optimizer</option>
+    </select>
+    <select id="target_metric" title="optimizer 探测指标" disabled>
+      <option value="vmaf">VMAF</option>
+      <option value="ssimulacra2">SSIMULACRA2</option>
+    </select>
     <input type="text" id="custom" placeholder="自定义参数: crf=24,preset=3,target_quality=75-85" style="max-width:280px">
     <button type="submit">提交转码</button>
     <div class="custom-hint" id="customHint">提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。</div>
@@ -150,6 +158,15 @@ function syncCustom() {
     : "提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。";
 }
 document.getElementById("preset").addEventListener("change", syncCustom);
+function syncEngine() {
+  const isOpt = document.getElementById("engine").value === "optimizer";
+  document.getElementById("target_metric").disabled = !isOpt;
+  document.getElementById("customHint").textContent = isOpt
+    ? "optimizer：Shot-based 并行探测，需填 target_quality（如 target_quality=80 或 75-85）。探测指标取右侧下拉（VMAF/SSIMULACRA2）。"
+    : "提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。";
+}
+document.getElementById("engine").addEventListener("change", syncEngine);
+syncEngine();
 let statusFilter = "all";
 async function refresh() {
   const [s, jobs] = await Promise.all([
@@ -207,6 +224,15 @@ document.getElementById("submit").addEventListener("submit", async e => {
       }
       overrides[kv[0].trim()] = kv[1].trim();
     }
+  }
+  // engine / target_metric selectors feed into overrides
+  const engine = document.getElementById("engine").value;
+  const metric = document.getElementById("target_metric").value;
+  if (engine && engine !== "av1an" && !("engine" in overrides)) overrides.engine = engine;
+  if (engine === "optimizer" && metric && !("target_metric" in overrides)) overrides.target_metric = metric;
+  if (engine === "optimizer" && !overrides.target_quality) {
+    err.textContent = "optimizer 引擎需要 target_quality（如 crf=24,preset=3,target_quality=80 或 75-85）";
+    err.style.display = "block"; return;
   }
   const r = await fetch("/api/jobs", { method:"POST",
     headers:{"Content-Type":"application/json"},

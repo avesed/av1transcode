@@ -10,6 +10,8 @@ os.environ.setdefault("AV1TC_DIRS_RPU", tempfile.mkdtemp(prefix="av1_rpu"))
 os.environ.setdefault("AV1TC_DIRS_WORK", tempfile.mkdtemp(prefix="av1_work"))
 os.environ.setdefault("AV1TC_DIRS_DB", ":memory-slack:")
 os.environ.setdefault("AV1TC_DIRS_LOGS", tempfile.mkdtemp(prefix="av1_logs"))
+os.environ.setdefault("AV1TC_DIRS_PRESETS_FILE", tempfile.mkdtemp(prefix="av1_presets") + "/presets.json")
+os.environ.setdefault("AV1TC_DIRS_SETTINGS_FILE", tempfile.mkdtemp(prefix="av1_settings") + "/settings.json")
 
 from app import db  # noqa: E402
 from app.analyzer import DolbyVisionInfo, MediaInfo  # noqa: E402
@@ -95,3 +97,42 @@ def test_parse_progress():
     assert parse_progress("Encoding: 45% done") == 45.0
     assert parse_progress("worker 100%") == 100.0
     assert parse_progress("no percent here") is None
+
+
+def test_optimizer_engine_requires_target_quality(settings):
+    info = MediaInfo(path=Path("/tmp/o.mkv"))
+    info.video_codec = "hevc"
+    info.is_av1 = False
+    info.width, info.height = 1920, 1080
+    plan = decide_action(settings, info, overrides={"engine": "optimizer"})
+    assert plan.skip
+    assert "target_quality" in plan.skip_reason
+
+
+def test_optimizer_engine_plan_note(settings):
+    info = MediaInfo(path=Path("/tmp/o2.mkv"))
+    info.video_codec = "hevc"
+    info.is_av1 = False
+    info.width, info.height = 1920, 1080
+    plan = decide_action(settings, info, overrides={
+        "engine": "optimizer", "target_quality": "75-85", "target_metric": "ssimulacra2",
+    })
+    assert not plan.skip
+    assert plan.params.engine == "optimizer"
+    assert any("optimizer" in n for n in plan.notes)
+
+
+def test_optimizer_user_settings_roundtrip(settings):
+    from app import config
+
+    config.save_user_settings(settings, {"optimizer": {
+        "probe_crfs": [22, 30],
+        "probe_preset": 11,
+        "probe_scale": "1280x720",
+        "max_shots": 100,
+    }})
+    reloaded = load_settings()
+    assert reloaded.transcode.optimizer.probe_crfs == [22, 30]
+    assert reloaded.transcode.optimizer.probe_preset == 11
+    assert reloaded.transcode.optimizer.probe_scale == "1280x720"
+    assert reloaded.transcode.optimizer.max_shots == 100
