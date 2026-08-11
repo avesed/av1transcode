@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -258,11 +259,20 @@ class ShotEncoder:
             self.stage_cb(stage)
         self._report(pct, 0, 0)
 
-    def _report(self, pct: float, done: int = 0, total: int = 0) -> None:
+    def _report(self, pct: float, done: int = 0, total: int = 0, fps: float = 0.0) -> None:
         if self.progress_cb:
-            self.progress_cb(min(max(pct, 0.0), 100.0),
-                             {"pct": min(max(pct, 0.0), 100.0), "done": done,
-                              "total": total, "fps": 0.0})
+            pct = min(max(pct, 0.0), 100.0)
+            self.progress_cb(pct, {"pct": pct, "done": done, "total": total, "fps": fps})
+
+    def _svt_lp(self, workers: int) -> int:
+        """Bound SVT-AV1 threads per parallel encoder instance.
+
+        N encoders run in parallel (probe/encode); giving each the full core
+        count spawns N x cores threads and can exhaust RAM on large machines.
+        Scale per-instance threads so total stays near the core count.
+        """
+        cores = os.cpu_count() or 1
+        return max(1, min(cores, round(cores / max(1, workers))))
 
     def _check_cancel(self) -> None:
         if self.cancel_flag and self.cancel_flag():
@@ -427,8 +437,8 @@ class ShotEncoder:
     def _extract_shot(self, idx: int, s0: int, s1: int, path: Path) -> None:
         start = s0 / self.fps
         dur = (s1 - s0) / self.fps
-        args = [self.ffmpeg, "-hide_banner", "-y", "-ss", f"{start:.6f}",
-                "-i", str(self.source), "-t", f"{dur:.6f}"]
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{start:.6f}", "-i", str(self.source), "-t", f"{dur:.6f}"]
         vf = []
         scale = self._probe_scale()
         if scale:
@@ -446,13 +456,14 @@ class ShotEncoder:
     def probe_all(self, shots: List[Shot], grid: List[int]) -> ProbeSamples:
         workers = self.opt.probe_workers or os.cpu_count() or 1
         workers = max(1, min(workers, len(shots) * len(grid) or 1))
+        lp = self._svt_lp(workers)
         tasks = [(i, s0, s1, crf) for i, (s0, s1) in enumerate(shots) for crf in grid]
         results: ProbeSamples = {}
         done_shots = 0
         per_shot_done = [0] * len(shots)
-        self._log(f"probing {len(shots)} shots x {len(grid)} crfs with {workers} workers")
+        self._log(f"probing {len(shots)} shots x {len(grid)} crfs with {workers} workers (svt lp={lp})")
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(self._probe_one, i, s0, s1, crf)
+            futs = [ex.submit(self._probe_one, i, s0, s1, crf, lp)
                     for i, s0, s1, crf in tasks]
             for fut in as_completed(futs):
                 self._check_cancel()
@@ -461,12 +472,12 @@ class ShotEncoder:
                 per_shot_done[i] += 1
                 if per_shot_done[i] == len(grid):
                     done_shots += 1
-                # probing spans 2%..47% of overall progress; report per SHOT
-                pct = 2 + done_shots / max(len(shots), 1) * 45
+                # stage-local progress: the bar matches done/total shots
+                pct = done_shots / max(len(shots), 1) * 100
                 self._report(pct, done_shots, len(shots))
         return results
 
-    def _probe_one(self, idx: int, s0: int, s1: int, crf: int) -> Tuple[int, int, float]:
+    def _probe_one(self, idx: int, s0: int, s1: int, crf: int, lp: int) -> Tuple[int, int, float]:
         entry = self._shot_cache(idx)
         try:
             self._check_cancel()
@@ -476,9 +487,11 @@ class ShotEncoder:
             if not entry.path.exists():
                 raise TranscodeError(f"shot {idx} extraction produced no frames")
             ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
-            args = [self.ffmpeg, "-hide_banner", "-y", "-i", str(entry.path),
-                    "-c:v", "libsvtav1", "-preset", str(self._probe_preset()),
-                    "-crf", str(crf), "-pix_fmt", "yuv420p", "-f", "ivf", str(ivf)]
+            args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(entry.path), "-c:v", "libsvtav1",
+                    "-preset", str(self._probe_preset()), "-crf", str(crf),
+                    "-svtav1-params", f"lp={lp}",
+                    "-pix_fmt", "yuv420p", "-f", "ivf", str(ivf)]
             self._run(args, timeout=3600)
             score = self._score_probe(entry.path, ivf, idx, crf)
             if not self.opt.keep_probes:
@@ -513,7 +526,8 @@ class ShotEncoder:
         n_threads = self._vmaf_threads()
         if n_threads:
             opts.append(f"n_threads={n_threads}")
-        args = [self.ffmpeg, "-hide_banner", "-y", "-i", str(ref), "-i", str(dist),
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(ref), "-i", str(dist),
                 "-lavfi", f"[0:v][1:v]libvmaf={':'.join(opts)}",
                 "-f", "null", "-"]
         try:
@@ -527,6 +541,7 @@ class ShotEncoder:
                 "model (e.g. path=/path/to/ssimulacra2.json) or use target_metric=vmaf."
             ) from e
         score = parse_score(out_json, self.metric)
+        self._log(f"shot {idx:05d} crf {crf} {self.metric}={score:.3f}")
         if not self.opt.keep_probes:
             try:
                 out_json.unlink()
@@ -563,11 +578,13 @@ class ShotEncoder:
     def encode_all(self, shots: List[Shot], chosen: Dict[int, float]) -> List[Path]:
         workers = self.opt.probe_workers or os.cpu_count() or 1
         workers = max(1, min(workers, len(shots) or 1))
+        lp = self._svt_lp(workers)
         ivf_paths: Dict[int, Path] = {}
         done_frames = 0
-        self._log(f"encoding {len(shots)} shots in parallel")
+        t0 = time.monotonic()
+        self._log(f"encoding {len(shots)} shots in parallel (svt lp={lp})")
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(self._encode_shot, i, s0, s1, chosen.get(i, self.video.crf)):
+            futs = {ex.submit(self._encode_shot, i, s0, s1, chosen.get(i, self.video.crf), lp):
                     (i, s1 - s0) for i, (s0, s1) in enumerate(shots)}
             for fut in as_completed(futs):
                 self._check_cancel()
@@ -575,24 +592,26 @@ class ShotEncoder:
                 ivf = fut.result()
                 ivf_paths[i] = ivf
                 done_frames += span
-                # encoding spans 47%..100% of overall progress
-                pct = 47 + done_frames / max(self.total_frames, 1) * 53
-                self._report(pct, done_frames, self.total_frames)
+                # stage-local progress so the bar matches done/total frames
+                elapsed = max(time.monotonic() - t0, 1e-6)
+                pct = done_frames / max(self.total_frames, 1) * 100
+                self._report(pct, done_frames, self.total_frames,
+                             fps=done_frames / elapsed)
         return [ivf_paths[i] for i in range(len(shots))]
 
-    def _encode_shot(self, idx: int, s0: int, s1: int, crf: float) -> Path:
+    def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int) -> Path:
         dst = self.probe_dir / f"enc_{idx:05d}.ivf"
         start = s0 / self.fps
         dur = (s1 - s0) / self.fps
-        args = [self.ffmpeg, "-hide_banner", "-y", "-ss", f"{start:.6f}",
-                "-i", str(self.source), "-t", f"{dur:.6f}", "-map", "0:v:0",
-                "-c:v", "libsvtav1", "-preset", str(self.video.preset),
-                "-crf", self._fmt_crf(crf)]
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{start:.6f}", "-i", str(self.source), "-t", f"{dur:.6f}",
+                "-map", "0:v:0", "-c:v", "libsvtav1",
+                "-preset", str(self.video.preset), "-crf", self._fmt_crf(crf)]
         if self.video.keyint:
             args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]
         svt = _svt_params_dict(self.video)
-        if svt:
-            args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items())]
+        svt["lp"] = lp
+        args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items())]
         args += ["-pix_fmt", self.video.pixel_format, "-f", "ivf", str(dst)]
         self._run(args, timeout=7200)
         if not dst.exists() or dst.stat().st_size == 0:
@@ -632,8 +651,8 @@ class ShotEncoder:
             shots = self.detect_shots()
             self._log(f"{len(shots)} shot(s) from scene detection")
 
-            self._stage("probing", 2.0)
-            self._report(2.0, 0, len(shots))  # surface the shot count to the UI
+            self._stage("probing", 0.0)
+            self._report(0.0, 0, len(shots))  # surface the shot count to the UI
             grid = self._probe_grid()
             samples = self.probe_all(shots, grid)
             chosen = self.pick_all_crfs(samples, grid)
@@ -646,9 +665,9 @@ class ShotEncoder:
             crf_line = ", ".join(f"{i}:{chosen[i]:g}" for i in sorted(chosen))
             self._log(f"chosen per-shot CRFs -> {crf_line}")
 
-            self._stage("encoding", 47.0)
+            self._stage("encoding", 0.0)
             ivf_paths = self.encode_all(shots, chosen)
-            self._report(99.0, self.total_frames, self.total_frames)
+            self._report(100.0, self.total_frames, self.total_frames)
 
             self.concat_shots(ivf_paths)
             self._report(100.0, self.total_frames, self.total_frames)

@@ -427,10 +427,14 @@ def test_run_full_pipeline(settings, info, plan, tmp_path):
     assert "probing" in stages
     assert "encoding" in stages
     assert progress[-1][0] == 100.0
-    # probing progress reports the SHOT count (3 shots), not probe count
-    probing = [s for pct, s in progress if s.get("total") and 0 < pct <= 50]
+    # probing progress reports the SHOT count (3 shots), stage-local pct 0->100
+    probing = [s for _, s in progress if s.get("total") == 3]
     assert probing, "no probing progress reported"
-    assert all(s["total"] == 3 for s in probing)
     assert probing[-1]["done"] == 3
+    assert probing[-1]["pct"] == pytest.approx(100.0, abs=1e-6)
+    # encoding progress reports frames with a real fps and stage-local pct
+    encoding = [s for _, s in progress if s.get("total") == 1800 and s.get("fps", 0) > 0]
+    assert encoding, "no encoding progress with fps reported"
+    assert encoding[-1]["pct"] == pytest.approx(100.0, abs=1e-6)
     # chosen crf for target 75 should interpolate between 32@77 and 36@71
     assert opt.pick_crf([(c, score_at[c]) for c in score_at], 75.0) == pytest.approx(33.33, abs=0.1)

@@ -130,7 +130,7 @@
   <tr><td><code>fractional_crf</code></td><td>false</td><td>把小数 CRF 传给 SVT-AV1（更精细；需编码器支持）。</td></tr>
   <tr><td><code>keep_probes</code></td><td>false</td><td>保留探测临时文件（调试用）。</td></tr>
 </table>
-<p>资源占用：探测期峰值 ≈ <code>probe_workers</code> 个 libsvtav1 + VMAF 进程；临时文件在 <code>dirs.work</code>（成功/失败后清理，除非 <code>keep_temp</code>/<code>keep_probes</code>）。</p>
+<p>资源占用：探测/编码阶段会并行启动 <code>probe_workers</code> 个 SVT-AV1 实例；为防线程爆炸，每个实例的 SVT 线程数（<code>lp</code>）会自动按 <code>核心数 / workers</code> 分配，总线程≈核心数。若机器内存紧张请降低 <code>probe_workers</code>。临时文件在 <code>dirs.work</code>（成功/失败后清理，除非 <code>keep_temp</code>/<code>keep_probes</code>）。</p>
 <p>预设置的 <code>probing_rate</code>、<code>probe_res</code>、<code>probe_video_params</code>（如 <code>preset=10</code> 或 <code>copy</code>）、<code>vmaf_threads</code>、<code>probing_vmaf_features</code>（原样透传给 libvmaf 的 <code>feature=</code>）会覆盖上面的全局默认值。</p>
 
 <h2>Dolby Vision / HDR</h2>
