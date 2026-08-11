@@ -129,6 +129,11 @@ class OptimizerSettings(BaseModel):
     vmaf_threads: int = 0
     # Parallel probe/encode workers across shots (0 = os.cpu_count()).
     probe_workers: int = 0
+    # Parallel FINAL ENCODE instances. Separate from probe_workers because a
+    # single SVT-AV1 encode of 4K can use several GB regardless of threads;
+    # too many parallel instances OOM the machine. 0 = auto (capped by RAM:
+    # roughly total_mem / 8, so total encode memory stays under ~half of RAM).
+    encode_workers: int = 0
     # PySceneDetect ContentDetector threshold (higher = fewer/split less).
     scenedetect_threshold: float = 27.0
     # Minimum shot length in frames (shorter segments are merged).

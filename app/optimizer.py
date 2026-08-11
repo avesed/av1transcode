@@ -289,6 +289,35 @@ class ShotEncoder:
         cores = os.cpu_count() or 1
         return max(1, min(cores, round(cores / max(1, workers))))
 
+    @staticmethod
+    def _ram_gb() -> int:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) // (1024 * 1024)
+        except (OSError, ValueError):
+            return 8
+        return 8
+
+    def _encode_workers(self, num_shots: int) -> int:
+        """Final-encode concurrency. Each parallel SVT-AV1 encode of 4K can use
+        several GB regardless of thread count, so too many instances OOM the
+        machine. Default scales workers from total RAM (ram_gb // 12) so total
+        encode memory stays bounded."""
+        w = self.opt.encode_workers
+        if not w or w <= 0:
+            cores = os.cpu_count() or 1
+            w = max(1, min(cores, max(1, self._ram_gb() // 16)))
+        return max(1, min(w, num_shots))
+
+    def _encode_lp(self, workers: int) -> int:
+        """Per-instance SVT threads for the FINAL encode. At 4K the frame
+        buffers already cost GBs and threads multiply them; cap each instance
+        so workers x per-instance memory stays within RAM."""
+        cores = os.cpu_count() or 1
+        return max(1, min(cores, round(cores / max(1, workers)), 6))
+
     def _check_cancel(self) -> None:
         if self.cancel_flag and self.cancel_flag():
             self._kill_all()
@@ -399,9 +428,14 @@ class ShotEncoder:
         # progress bars) is dropped on success; the failure path below still
         # surfaces the tail of the output.
         if proc.returncode != 0:
-            raise TranscodeError(
-                f"{args[0]} failed (rc={proc.returncode}):\n{out[-2000:]}"
-            )
+            msg = f"{args[0]} failed (rc={proc.returncode}):\n{out[-2000:]}"
+            if proc.returncode == -9:
+                msg += (
+                    "\nHint: the encoder was killed (likely out of memory). "
+                    "Lower transcode.optimizer.encode_workers (parallel encodes) "
+                    "or probe_workers."
+                )
+            raise TranscodeError(msg)
         return out
 
     def _terminate(self, proc: subprocess.Popen) -> None:
@@ -809,9 +843,8 @@ class ShotEncoder:
 
     # ---------- phase 4: parallel final encode ----------
     def encode_all(self, shots: List[Shot], chosen: Dict[int, float]) -> List[Path]:
-        workers = self.opt.probe_workers or os.cpu_count() or 1
-        workers = max(1, min(workers, len(shots) or 1))
-        lp = self._svt_lp(workers)
+        workers = self._encode_workers(len(shots))
+        lp = self._encode_lp(workers)
         ivf_paths: Dict[int, Path] = {}
         done_frames = 0
         t0 = time.monotonic()
@@ -881,12 +914,25 @@ class ShotEncoder:
                 "-i", str(list_file), "-c", "copy", "-fflags", "+genpts",
                 "-f", "matroska", str(video_only)]
         self._run(args, timeout=1800)
-        # re-mux: video from the concat, audio + subs copied from the source
-        args = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only),
-                "-i", str(self.source), "-map", "0:v:0", "-map", "1:a?",
-                "-map", "1:s?", "-c", "copy", "-map_metadata", "1",
-                str(self.output)]
-        self._run(args, timeout=1800)
+        # re-mux: video from the concat, audio + subs from the ORIGINAL source
+        # (info.path, not self.source: for Dolby Vision the encode input is a
+        # video-only stripped intermediate, so muxing from it would drop audio).
+        # subtitle -c copy fails for mov_text (tx3g) into matroska; retry with
+        # -c:s srt which converts them to a mkv-native format.
+        audio_src = str(self.info.path if self.info.path else self.source)
+        base = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only),
+                "-i", audio_src, "-map", "0:v:0", "-map", "1:a?",
+                "-map", "1:s?", "-c", "copy", "-map_metadata", "1"]
+        try:
+            self._run(base + [str(self.output)], timeout=1800)
+        except TranscodeError:
+            if self.output.exists():
+                try:
+                    self.output.unlink()
+                except OSError:
+                    pass
+            logger.warning("subtitle stream copy failed, converting subtitles to srt")
+            self._run(base + ["-c:s", "srt", str(self.output)], timeout=1800)
         if not self.output.exists() or self.output.stat().st_size == 0:
             raise TranscodeError("optimizer produced no output file")
 

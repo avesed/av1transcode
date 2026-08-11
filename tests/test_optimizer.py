@@ -249,6 +249,21 @@ def test_probe_rate_for_caps_long_shots(settings, info, plan, tmp_path):
     assert enc._probe_rate_for(0, 600) == 3
 
 
+def test_encode_workers_ram_aware(settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(opt.ShotEncoder, "_ram_gb", staticmethod(lambda: 31))
+    # 31GB / 16 = 1 worker (capped by shot count and cores)
+    assert enc._encode_workers(11) == 1
+    assert enc._encode_workers(1) == 1  # fewer shots than workers
+    # explicit setting wins
+    settings.transcode.optimizer.encode_workers = 6
+    assert enc._encode_workers(11) == 6
+    # per-instance threads for the final encode are capped
+    monkeypatch.setattr(opt.ShotEncoder, "_ram_gb", staticmethod(lambda: 31))
+    assert enc._encode_lp(2) <= 6
+    assert enc._encode_lp(1) <= 6
+
+
 def test_pick_all_crfs_clamps_to_grid(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     enc.target = 75.0
