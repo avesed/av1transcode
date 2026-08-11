@@ -242,6 +242,8 @@ class ShotEncoder:
         # per-shot y4m cache: path + refcount + lock so each shot is decoded once
         self._cache: Dict[int, _ShotCacheEntry] = {}
         self._cache_lock = threading.Lock()
+        # one-time warning for av1an-style probing_vmaf_features
+        self._feature_warned = False
 
     # ---------- callbacks / logging ----------
     def _log(self, line: str) -> None:
@@ -497,10 +499,11 @@ class ShotEncoder:
             # av1an's --probing-vmaf-features uses its own CLI syntax
             # (e.g. "default motionless", "weighted neg") which ffmpeg's
             # libvmaf filter cannot parse. Only forward valid ffmpeg feature
-            # configs (contain '=' / '|'); ignore the rest with a warning.
+            # configs (contain '=' / '|'); ignore the rest, warning once.
             if "=" in feats or "|" in feats:
                 opts.append(f"feature={feats}")
-            else:
+            elif not self._feature_warned:
+                self._feature_warned = True
                 logger.warning(
                     "optimizer: ignoring probing_vmaf_features {!r} (av1an-style, "
                     "not understood by ffmpeg libvmaf; use feature=name=... "

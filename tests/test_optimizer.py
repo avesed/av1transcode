@@ -356,6 +356,32 @@ def test_probe_forwards_ffmpeg_style_vmaf_features(settings, info, plan, tmp_pat
     assert "feature=name=motion" in seen["lavfi"]
 
 
+def test_feature_warning_logged_once(settings, info, plan, tmp_path, monkeypatch):
+    plan.params.probing_vmaf_features = "default motionless"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if any("libvmaf=" in a for a in args):
+            lavfi = args[args.index("-lavfi") + 1]
+            log_path = lavfi.split("log_path=")[1].split(":")[0]
+            Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
+            return ""
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    ref = tmp_path / "r.y4m"
+    ref.write_bytes(b"x")
+    dist = tmp_path / "d.ivf"
+    dist.write_bytes(b"x")
+    for crf in (20, 24, 28):
+        enc._score_probe(ref, dist, 0, crf)
+    assert len(warnings) == 1
+    assert "ignoring probing_vmaf_features" in str(warnings[0][0])
+
+
 # ---- full pipeline with a fake ffmpeg ----
 def test_run_full_pipeline(settings, info, plan, tmp_path):
     _install_fake_scenedetect([(0, 300), (300, 900), (900, 1800)])
