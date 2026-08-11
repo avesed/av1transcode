@@ -119,6 +119,7 @@
   <tr><td><code>probe_preset</code></td><td>10</td><td>探测编码的 SVT-AV1 速度档（快、失真略大）。</td></tr>
   <tr><td><code>probe_scale</code></td><td>960x540</td><td>探测分辨率；空 = 源分辨率。</td></tr>
   <tr><td><code>probing_rate</code></td><td>1</td><td>探测每隔 n 帧取一帧。</td></tr>
+  <tr><td><code>probe_max_frames</code></td><td>1200</td><td>每镜头探测帧数上限。长镜头（单镜头数分钟）会在 probe_scale 下生成数 GB 的临时 y4m 并被每个 CRF 反复读取，撑爆磁盘/内存缓存；超过上限会自动加大取样间隔。<span class="tag core">核心</span></td></tr>
   <tr><td><code>probe_workers</code></td><td>0</td><td>跨镜头的并行探测/编码数；0 = 全部 CPU 核。</td></tr>
   <tr><td><code>scenedetect_threshold</code></td><td>27.0</td><td>ContentDetector 灵敏度；越高分镜越少、片段越长。</td></tr>
   <tr><td><code>min_scene_len</code></td><td>24</td><td>最小镜头长度（帧），更短的会合并。</td></tr>

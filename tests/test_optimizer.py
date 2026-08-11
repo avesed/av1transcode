@@ -232,6 +232,20 @@ def test_fmt_crf(settings, info, plan, tmp_path):
     assert enc._fmt_crf(33.33) == "33.33"
 
 
+def test_probe_rate_for_caps_long_shots(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    settings.transcode.optimizer.probe_max_frames = 1200
+    settings.transcode.optimizer.probing_rate = 1
+    # 60s @ 30fps = 1800 frames > 1200 cap -> sample every 2nd frame
+    assert enc._probe_rate_for(0, 1800) == 2
+    # short shot stays at the configured rate
+    assert enc._probe_rate_for(0, 600) == 1
+    # explicit probing_rate is respected as a floor
+    settings.transcode.optimizer.probing_rate = 3
+    assert enc._probe_rate_for(0, 1800) == 3
+    assert enc._probe_rate_for(0, 600) == 3
+
+
 def test_pick_all_crfs_clamps_to_grid(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     enc.target = 75.0

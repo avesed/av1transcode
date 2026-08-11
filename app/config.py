@@ -114,6 +114,11 @@ class OptimizerSettings(BaseModel):
     probe_scale: str = "960x540"
     # Only probe every nth frame (1 = all frames of each shot).
     probing_rate: int = 1
+    # Cap on frames extracted per shot for probing. Long shots (e.g. a single
+    # minutes-long take) would otherwise produce multi-GB probe y4m files at
+    # probe_scale that get re-read for every CRF, ballooning disk + page cache.
+    # When a shot exceeds this, the probe sampling rate is raised accordingly.
+    probe_max_frames: int = 1200
     # libvmaf model configs. Accepts "path=/x.json", "version=NAME", or a bare
     # path (wrapped as path=...). Note: stock libvmaf <= 2.3.1 has no
     # ssimulacra2 model; a patched libvmaf or a ssimulacra2.json is required

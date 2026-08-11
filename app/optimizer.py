@@ -19,6 +19,7 @@ ffmpeg's libvmaf filter, so both go through identical plumbing.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -280,6 +281,61 @@ class ShotEncoder:
             raise TranscodeError("Job cancelled by user")
 
     # ---------- subprocess ----------
+    @staticmethod
+    def _rss_kb(pid: int) -> int:
+        """Current RSS of a process in kB, 0 if it is gone."""
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1])
+        except (OSError, ValueError):
+            return 0
+        return 0
+
+    def _py_rss_mb(self) -> float:
+        return self._rss_kb(os.getpid()) / 1024.0
+
+    def _children_rss_mb(self) -> float:
+        total = 0.0
+        with self._proc_lock:
+            procs = list(self._procs)
+        for p in procs:
+            total += self._rss_kb(p.pid) / 1024.0
+        return total
+
+    def _start_mem_sampler(self) -> Tuple["threading.Event", List[float]]:
+        """Background sampler tracking peak total child RSS while a parallel
+        phase runs. Caller must stop.set() when done, then read peak[0]."""
+        stop = threading.Event()
+        peak = [0.0]
+
+        def _sample() -> None:
+            while not stop.is_set():
+                total = self._children_rss_mb()
+                if total > peak[0]:
+                    peak[0] = total
+                stop.wait(2.0)
+
+        threading.Thread(target=_sample, daemon=True).start()
+        return stop, peak
+
+    def _monitor_peak_rss(self, pid: int) -> Tuple["threading.Event", List[float], "threading.Thread"]:
+        """Sample a child's live VmRSS until stopped; returns (stop, peak, thread)."""
+        peak = [0.0]
+        stop = threading.Event()
+
+        def _sample() -> None:
+            while not stop.is_set():
+                kb = self._rss_kb(pid)
+                if kb > peak[0]:
+                    peak[0] = kb
+                stop.wait(0.4)
+
+        t = threading.Thread(target=_sample, daemon=True)
+        t.start()
+        return stop, peak, t
+
     def _run(self, args: List[str], timeout: Optional[int] = None) -> str:
         self._check_cancel()
         self._log("$ " + " ".join(map(str, args)))
@@ -292,14 +348,27 @@ class ShotEncoder:
             raise TranscodeError(f"command not found: {args[0]}")
         with self._proc_lock:
             self._procs.add(proc)
+        stop, peak, mon = self._monitor_peak_rss(proc.pid)
         try:
             out, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             self._terminate(proc)
+            # release the pipes so communicate()'s reader threads and fds
+            # don't linger after we abandon the process
+            for stream in (proc.stdout, proc.stderr):
+                if stream:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
             raise TranscodeError(f"command timed out after {timeout}s: {args[0]}")
         finally:
             with self._proc_lock:
                 self._procs.discard(proc)
+            stop.set()
+            mon.join(timeout=2)
+        peak_mb = peak[0] / 1024.0
+        self._log(f"[mem] {Path(args[0]).name} peak={peak_mb:.0f}MB rc={proc.returncode}")
         if out.strip():
             self._log(out[-4000:])
         if proc.returncode != 0:
@@ -392,6 +461,22 @@ class ShotEncoder:
         rate = self.video.probing_rate or self.opt.probing_rate
         return max(1, rate)
 
+    def _probe_rate_for(self, s0: int, s1: int) -> int:
+        """Effective probe sampling rate for a shot.
+
+        A shot's probe frames are extracted to a y4m at probe_scale (default
+        960x540, ~0.8MB/frame). Long shots therefore balloon into multi-GB
+        temp files that get re-read for every CRF probe, blowing up disk +
+        page cache. Cap the number of frames actually probed (probe_max_frames)
+        by sampling more aggressively on long shots.
+        """
+        rate = self._probing_rate()
+        shot_frames = max(1, s1 - s0)
+        max_frames = max(1, self.opt.probe_max_frames)
+        if shot_frames // rate > max_frames:
+            rate = max(rate, math.ceil(shot_frames / max_frames))
+        return max(1, rate)
+
     def _vmaf_threads(self) -> int:
         return self.video.vmaf_threads or self.opt.vmaf_threads
 
@@ -443,15 +528,21 @@ class ShotEncoder:
         scale = self._probe_scale()
         if scale:
             vf.append(f"scale={scale}")
-        rate = self._probing_rate()
+        rate = self._probe_rate_for(s0, s1)
         if rate > 1:
-            # sample every nth frame; no -r re-timing so the sample stays
-            # down-sampled (both ref and probe then use the same sampled frames)
-            vf.append(f"select='not(mod(n\\,{rate}))'")
+            # sample every nth frame by re-timing to fps/rate. Note: the
+            # select='not(mod(n,N))' filter does NOT drop frames when piping
+            # to yuv4mpegpipe on ffmpeg master (1799/1800 frames kept), while
+            # fps= cleanly subsamples (900/1800).
+            vf.append(f"fps={self.fps / rate:g}")
         if vf:
             args += ["-vf", ",".join(vf)]
         args += ["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", str(path)]
         self._run(args, timeout=1800)
+        if path.exists():
+            size_mb = path.stat().st_size / 1024 / 1024
+            self._log(f"[mem] shot {idx:05d} probe y4m={size_mb:.1f}MB "
+                      f"(frames {s1 - s0}, probe rate {rate})")
 
     def probe_all(self, shots: List[Shot], grid: List[int]) -> ProbeSamples:
         workers = self.opt.probe_workers or os.cpu_count() or 1
@@ -462,19 +553,25 @@ class ShotEncoder:
         done_shots = 0
         per_shot_done = [0] * len(shots)
         self._log(f"probing {len(shots)} shots x {len(grid)} crfs with {workers} workers (svt lp={lp})")
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(self._probe_one, i, s0, s1, crf, lp)
-                    for i, s0, s1, crf in tasks]
-            for fut in as_completed(futs):
-                self._check_cancel()
-                i, crf, score = fut.result()
-                results.setdefault(i, {})[crf] = score
-                per_shot_done[i] += 1
-                if per_shot_done[i] == len(grid):
-                    done_shots += 1
-                # stage-local progress: the bar matches done/total shots
-                pct = done_shots / max(len(shots), 1) * 100
-                self._report(pct, done_shots, len(shots))
+        stop, peak = self._start_mem_sampler()
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(self._probe_one, i, s0, s1, crf, lp)
+                        for i, s0, s1, crf in tasks]
+                for fut in as_completed(futs):
+                    self._check_cancel()
+                    i, crf, score = fut.result()
+                    results.setdefault(i, {})[crf] = score
+                    per_shot_done[i] += 1
+                    if per_shot_done[i] == len(grid):
+                        done_shots += 1
+                    # stage-local progress: the bar matches done/total shots
+                    pct = done_shots / max(len(shots), 1) * 100
+                    self._report(pct, done_shots, len(shots))
+        finally:
+            stop.set()
+        self._log(f"[mem] probing peak children RSS={peak[0]:.0f}MB "
+                  f"(python={self._py_rss_mb():.0f}MB)")
         return results
 
     def _probe_one(self, idx: int, s0: int, s1: int, crf: int, lp: int) -> Tuple[int, int, float]:
@@ -583,20 +680,26 @@ class ShotEncoder:
         done_frames = 0
         t0 = time.monotonic()
         self._log(f"encoding {len(shots)} shots in parallel (svt lp={lp})")
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(self._encode_shot, i, s0, s1, chosen.get(i, self.video.crf), lp):
-                    (i, s1 - s0) for i, (s0, s1) in enumerate(shots)}
-            for fut in as_completed(futs):
-                self._check_cancel()
-                i, span = futs[fut]
-                ivf = fut.result()
-                ivf_paths[i] = ivf
-                done_frames += span
-                # stage-local progress so the bar matches done/total frames
-                elapsed = max(time.monotonic() - t0, 1e-6)
-                pct = done_frames / max(self.total_frames, 1) * 100
-                self._report(pct, done_frames, self.total_frames,
-                             fps=done_frames / elapsed)
+        stop, peak = self._start_mem_sampler()
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(self._encode_shot, i, s0, s1, chosen.get(i, self.video.crf), lp):
+                        (i, s1 - s0) for i, (s0, s1) in enumerate(shots)}
+                for fut in as_completed(futs):
+                    self._check_cancel()
+                    i, span = futs[fut]
+                    ivf = fut.result()
+                    ivf_paths[i] = ivf
+                    done_frames += span
+                    # stage-local progress so the bar matches done/total frames
+                    elapsed = max(time.monotonic() - t0, 1e-6)
+                    pct = done_frames / max(self.total_frames, 1) * 100
+                    self._report(pct, done_frames, self.total_frames,
+                                 fps=done_frames / elapsed)
+        finally:
+            stop.set()
+        self._log(f"[mem] encoding peak children RSS={peak[0]:.0f}MB "
+                  f"(python={self._py_rss_mb():.0f}MB)")
         return [ivf_paths[i] for i in range(len(shots))]
 
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int) -> Path:
@@ -648,6 +751,9 @@ class ShotEncoder:
     def run(self) -> None:
         try:
             self._stage("scenedetect", 0.0)
+            self._log(f"[mem] job start python={self._py_rss_mb():.0f}MB "
+                      f"source={self.info.duration:.1f}s @ {self.fps:g}fps "
+                      f"~{self.total_frames} frames")
             shots = self.detect_shots()
             self._log(f"{len(shots)} shot(s) from scene detection")
 

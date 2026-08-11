@@ -85,6 +85,7 @@ transcode:
     probe_preset: 10             # fast SVT-AV1 preset for probe encodes
     probe_scale: "960x540"       # probe resolution (scaled for speed)
     probing_rate: 1              # probe every nth frame of each shot
+    probe_max_frames: 1200       # 每镜头探测帧数上限(长镜头自动加大取样间隔，防 y4m 爆盘/爆缓存)
     vmaf_model: /usr/share/model/vmaf_v0.6.1.json
     # SSIMULACRA2 需要带 ssimulacra2 的 libvmaf（官方 libvmaf 2.3.1 不带）。
     # 可填 version=ssimulacra2（libvmaf 已编译进该模型时）或 path=/path/to/ssimulacra2.json
