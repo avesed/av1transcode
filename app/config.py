@@ -133,6 +133,11 @@ class OptimizerSettings(BaseModel):
     scenedetect_threshold: float = 27.0
     # Minimum shot length in frames (shorter segments are merged).
     min_scene_len: int = 24
+    # ffmpeg scale filter used to make a small detection copy before running
+    # PySceneDetect. OpenCV decodes frame-by-frame and 4K HEVC is unusably slow
+    # (minutes per scene); a downscaled copy (same fps, frame numbers map 1:1)
+    # is 5-10x faster. e.g. "-2:540". Empty = detect on the source directly.
+    scenedetect_scale: str = "-2:540"
     # Cap on the number of shots; shortest adjacent shots are merged past this.
     max_shots: int = 3000
     # Bound the per-shot CRF jump between neighbouring shots (0 = disable).

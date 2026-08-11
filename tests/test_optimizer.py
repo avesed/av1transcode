@@ -1,6 +1,7 @@
 import json
 import shutil
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -23,6 +24,8 @@ def settings(tmp_path, monkeypatch):
     s.dirs.logs = tmp_path / "logs"
     s.dirs.work.mkdir(parents=True, exist_ok=True)
     s.dirs.logs.mkdir(parents=True, exist_ok=True)
+    # unit tests don't spawn a real ffmpeg downscale pass; detect on source
+    s.transcode.optimizer.scenedetect_scale = ""
     return s
 
 
@@ -293,7 +296,7 @@ def test_detect_shots_falls_back_to_single_shot(settings, info, plan, tmp_path):
     assert enc.detect_shots() == [(0, enc.total_frames)]
 
 
-def test_detect_shots_reports_cuts_via_callback(settings, info, plan, tmp_path):
+def test_detect_shots_reports_frame_progress(settings, info, plan, tmp_path):
     mod = types.ModuleType("scenedetect")
     mod.ContentDetector = type("ContentDetector", (), {"__init__": lambda self, **k: None})
 
@@ -304,22 +307,41 @@ def test_detect_shots_reports_cuts_via_callback(settings, info, plan, tmp_path):
         def detect_scenes(self, video, show_progress=False, callback=None):
             for pos in (100, 200, 400):
                 callback(None, _FrameNum(pos))
+                time.sleep(0.1)
 
         def get_scene_list(self):
             return [(_FrameNum(0), _FrameNum(100)), (_FrameNum(100), _FrameNum(200)),
                     (_FrameNum(200), _FrameNum(400)), (_FrameNum(400), _FrameNum(800))]
 
+    class _V:
+        frame_number = 0
+
     mod.SceneManager = _SM
-    mod.open_video = lambda path: object()
+    mod.open_video = lambda path: _V()
     sys.modules["scenedetect"] = mod
     enc = make_encoder(settings, info, plan, tmp_path)
     reports = []
     enc.progress_cb = lambda pct, stats: reports.append((pct, stats))
     shots = enc.detect_shots()
     assert shots == [(0, 100), (100, 200), (200, 400), (400, 800)]
-    # scenedetect progress reports the running cut count (total=0 = indeterminate)
-    sc = [s for _, s in reports if s.get("total") == 0 and s.get("done")]
-    assert [s["done"] for s in sc] == [1, 2, 3]
+    # scene detection reports frame-level progress (done/total = frames)
+    frame_reports = [s for _, s in reports if s.get("total") == enc.total_frames]
+    assert frame_reports, "no frame progress reported during scene detection"
+
+
+def test_make_detection_copy(settings, info, plan, tmp_path, monkeypatch):
+    settings.transcode.optimizer.scenedetect_scale = "-2:540"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = {}
+    monkeypatch.setattr(enc, "_run_with_progress",
+                        lambda args, timeout, total_seconds, tag: calls.update(
+                            {"args": args, "timeout": timeout, "total_seconds": total_seconds,
+                             "tag": tag}) or (enc.probe_dir / "detect_copy.mkv").write_bytes(b"x"))
+    p = enc._make_detection_copy()
+    assert p is not None and p.exists()
+    assert "-2:540" in " ".join(calls["args"])
+    assert calls["tag"] == "downscale for detection"
+    assert calls["total_seconds"] == pytest.approx(info.duration)
 
 
 # ---- vmaf feature config guard ----

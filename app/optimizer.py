@@ -429,6 +429,94 @@ class ShotEncoder:
             self._log_handle = None
 
     # ---------- phase 1: scene detection ----------
+    def _make_detection_copy(self) -> Optional[Path]:
+        """Downscale the source so PySceneDetect/OpenCV isn't decoding 4K
+        frame-by-frame (that is unusably slow on a 4K HEVC source). The copy
+        keeps the same fps and frame count, so cut frame numbers map 1:1 back
+        to the source. Reports progress while ffmpeg runs."""
+        scale = (self.opt.scenedetect_scale or "").strip()
+        if not scale:
+            return None
+        out = self.probe_dir / "detect_copy.mkv"
+        total_sec = max(self.info.duration, 1.0)
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(self.source), "-vf", f"scale={scale}",
+                "-c:v", "libx264", "-preset", "ultrafast", "-an", "-sn",
+                "-f", "matroska", str(out)]
+        self._run_with_progress(args, timeout=7200, total_seconds=total_sec,
+                                tag="downscale for detection")
+        if not out.exists() or out.stat().st_size == 0:
+            raise TranscodeError("scene detection downscale produced no output")
+        return out
+
+    def _run_with_progress(self, args: List[str], timeout: int,
+                           total_seconds: float, tag: str) -> None:
+        """Run ffmpeg with -progress and report out_time progress to the UI."""
+        args = args + ["-progress", "pipe:1", "-nostats"]
+        self._log("$ " + " ".join(map(str, args)))
+        self._check_cancel()
+        try:
+            proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", start_new_session=True,
+            )
+        except FileNotFoundError:
+            raise TranscodeError(f"command not found: {args[0]}")
+        with self._proc_lock:
+            self._procs.add(proc)
+        stop, peak, mon = self._monitor_peak_rss(proc.pid)
+        last_pct = -1.0
+        _noise = ("frame=", "fps=", "stream_", "bitrate=", "total_size=",
+                  "out_time_ms=", "out_time=", "dup_frames=", "drop_frames=",
+                  "speed=", "progress=", "out_time_us=")
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                line = line.rstrip()
+                if line.startswith("out_time_us="):
+                    try:
+                        sec = int(line.split("=", 1)[1]) / 1e6
+                        pct = min(sec / max(total_seconds, 1.0) * 100, 100.0)
+                        if pct > last_pct + 0.5:
+                            last_pct = pct
+                            self._report(pct, int(sec), int(total_seconds))
+                    except ValueError:
+                        pass
+                elif line and not line.startswith(_noise):
+                    self._log(line)
+        finally:
+            stop.set()
+            mon.join(timeout=2)
+            with self._proc_lock:
+                self._procs.discard(proc)
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._terminate(proc)
+                for stream in (proc.stdout, proc.stderr):
+                    if stream:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                raise TranscodeError(f"command timed out: {args[0]}")
+        self._mem_log(f"[mem] {tag} ({self._cmd_desc(args)}) peak={peak[0] / 1024:.0f}MB rc={rc}",
+                      level="debug")
+        if rc != 0:
+            raise TranscodeError(f"{args[0]} failed (rc={rc}): {tag}")
+
+    def _detect_frame(self, video) -> int:
+        """Current frame number decoded by a PySceneDetect VideoStream."""
+        try:
+            return int(video.frame_number)
+        except Exception:
+            try:
+                return int(video.position.frame_num)
+            except Exception:
+                return 0
+
     def detect_shots(self) -> List[Shot]:
         try:
             from scenedetect import ContentDetector, open_video, SceneManager
@@ -437,28 +525,46 @@ class ShotEncoder:
                 "engine=optimizer requires PySceneDetect. "
                 "pip install scenedetect (and opencv-python-headless)."
             ) from e
-        video = open_video(str(self.source))
-        sm = SceneManager()
-        sm.add_detector(ContentDetector(
-            threshold=self.opt.scenedetect_threshold,
-            min_scene_len=self.opt.min_scene_len,
-        ))
-        cuts_found = 0
+        total = max(self.total_frames, 1)
+        det_path = self._make_detection_copy()
+        try:
+            video = open_video(str(det_path) if det_path else str(self.source))
+            sm = SceneManager()
+            sm.add_detector(ContentDetector(
+                threshold=self.opt.scenedetect_threshold,
+                min_scene_len=self.opt.min_scene_len,
+            ))
 
-        def on_cut(_frame, _position) -> None:
-            # report scene analysis progress as cuts discovered so far
-            nonlocal cuts_found
-            cuts_found += 1
-            self._report(0.0, cuts_found, 0)
+            def on_cut(_frame, _position) -> None:
+                nonlocal cuts_found
+                cuts_found += 1
 
-        sm.detect_scenes(video, show_progress=False, callback=on_cut)
-        scenes = sm.get_scene_list()
-        shots = [(int(a.frame_num), int(b.frame_num)) for a, b in scenes]
-        if not shots:
-            shots = [(0, self.total_frames)]
-        shots = merge_to_max(shots, max(1, self.opt.max_shots))
-        logger.info("optimizer: {} shot(s) detected", len(shots))
-        return shots
+            cuts_found = 0
+
+            def _detect() -> None:
+                sm.detect_scenes(video, show_progress=False, callback=on_cut)
+
+            thread = threading.Thread(target=_detect, daemon=True)
+            thread.start()
+            # report real frame progress while detection runs in the background
+            while thread.is_alive():
+                cur = self._detect_frame(video)
+                self._report(min(cur / total * 100, 100.0), cur, total)
+                thread.join(timeout=0.5)
+            thread.join()
+            scenes = sm.get_scene_list()
+            shots = [(int(a.frame_num), int(b.frame_num)) for a, b in scenes]
+            if not shots:
+                shots = [(0, self.total_frames)]
+            shots = merge_to_max(shots, max(1, self.opt.max_shots))
+            logger.info("optimizer: {} shot(s) detected", len(shots))
+            return shots
+        finally:
+            if det_path is not None:
+                try:
+                    det_path.unlink()
+                except OSError:
+                    pass
 
     # ---------- probe configuration ----------
     def _probe_grid(self) -> List[int]:

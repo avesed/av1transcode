@@ -94,6 +94,7 @@ transcode:
     probe_workers: 0             # parallel probe workers across shots (0 = cpu count)
     scenedetect_threshold: 27.0  # PySceneDetect ContentDetector sensitivity
     min_scene_len: 24            # minimum shot length in frames
+    scenedetect_scale: "-2:540"  # 4K 分镜前先用 ffmpeg 降采样(帧号1:1)，避免 OpenCV 逐帧解 4K 卡死
     max_shots: 3000              # cap; shortest shots merged past this
     max_crf_delta: 4.0           # 相邻镜头 CRF 差上限(0=关闭)，避免质量跳变
     fractional_crf: false        # pass decimal CRF to SVT-AV1 (needs support)
