@@ -246,6 +246,8 @@ class ShotEncoder:
         self._cache_lock = threading.Lock()
         # one-time warning for av1an-style probing_vmaf_features
         self._feature_warned = False
+        # (peak_mb, command) of the heaviest child this phase, for diagnostics
+        self._heaviest_cmd: Tuple[float, str] = (0.0, "")
 
     # ---------- callbacks / logging ----------
     def _log(self, line: str) -> None:
@@ -254,6 +256,18 @@ class ShotEncoder:
             return
         with self._log_lock:
             self._log_handle.write(line.rstrip() + "\n")
+
+    def _mem_log(self, line: str, level: str = "info") -> None:
+        """Memory diagnostics: always written to the job log file; console
+        shows summaries at INFO and per-command detail at DEBUG (set
+        AV1TC_LOGGING_LEVEL=DEBUG to see it in the console)."""
+        if self._log_handle is not None:
+            with self._log_lock:
+                self._log_handle.write(line.rstrip() + "\n")
+        if level == "info":
+            logger.info("optimizer: {}", line)
+        else:
+            logger.debug("optimizer: {}", line)
 
     def _stage(self, stage: str, pct: float) -> None:
         if self.stage_cb:
@@ -336,6 +350,14 @@ class ShotEncoder:
         t.start()
         return stop, peak, t
 
+    @staticmethod
+    def _cmd_desc(args: List[str]) -> str:
+        """Short descriptor for a subprocess: the output filename, or 'vmaf'."""
+        out = str(args[-1]) if args else ""
+        if out in ("-", "null", ""):
+            return "vmaf"
+        return Path(out).name
+
     def _run(self, args: List[str], timeout: Optional[int] = None) -> str:
         self._check_cancel()
         self._log("$ " + " ".join(map(str, args)))
@@ -368,7 +390,11 @@ class ShotEncoder:
             stop.set()
             mon.join(timeout=2)
         peak_mb = peak[0] / 1024.0
-        self._log(f"[mem] {Path(args[0]).name} peak={peak_mb:.0f}MB rc={proc.returncode}")
+        desc = self._cmd_desc(args)
+        if peak_mb > self._heaviest_cmd[0]:
+            self._heaviest_cmd = (peak_mb, desc)
+        self._mem_log(f"[mem] {desc} peak={peak_mb:.0f}MB rc={proc.returncode}",
+                      level="debug")
         if out.strip():
             self._log(out[-4000:])
         if proc.returncode != 0:
@@ -541,8 +567,8 @@ class ShotEncoder:
         self._run(args, timeout=1800)
         if path.exists():
             size_mb = path.stat().st_size / 1024 / 1024
-            self._log(f"[mem] shot {idx:05d} probe y4m={size_mb:.1f}MB "
-                      f"(frames {s1 - s0}, probe rate {rate})")
+            self._mem_log(f"[mem] shot {idx:05d} probe y4m={size_mb:.1f}MB "
+                          f"(frames {s1 - s0}, probe rate {rate})", level="debug")
 
     def probe_all(self, shots: List[Shot], grid: List[int]) -> ProbeSamples:
         workers = self.opt.probe_workers or os.cpu_count() or 1
@@ -552,6 +578,7 @@ class ShotEncoder:
         results: ProbeSamples = {}
         done_shots = 0
         per_shot_done = [0] * len(shots)
+        self._heaviest_cmd = (0.0, "")
         self._log(f"probing {len(shots)} shots x {len(grid)} crfs with {workers} workers (svt lp={lp})")
         stop, peak = self._start_mem_sampler()
         try:
@@ -570,8 +597,10 @@ class ShotEncoder:
                     self._report(pct, done_shots, len(shots))
         finally:
             stop.set()
-        self._log(f"[mem] probing peak children RSS={peak[0]:.0f}MB "
-                  f"(python={self._py_rss_mb():.0f}MB)")
+        heavy = f"; heaviest: {self._heaviest_cmd[1]} {self._heaviest_cmd[0]:.0f}MB" \
+            if self._heaviest_cmd[1] else ""
+        self._mem_log(f"[mem] probing peak children RSS={peak[0]:.0f}MB "
+                      f"(python={self._py_rss_mb():.0f}MB){heavy}")
         return results
 
     def _probe_one(self, idx: int, s0: int, s1: int, crf: int, lp: int) -> Tuple[int, int, float]:
@@ -679,6 +708,7 @@ class ShotEncoder:
         ivf_paths: Dict[int, Path] = {}
         done_frames = 0
         t0 = time.monotonic()
+        self._heaviest_cmd = (0.0, "")
         self._log(f"encoding {len(shots)} shots in parallel (svt lp={lp})")
         stop, peak = self._start_mem_sampler()
         try:
@@ -698,8 +728,10 @@ class ShotEncoder:
                                  fps=done_frames / elapsed)
         finally:
             stop.set()
-        self._log(f"[mem] encoding peak children RSS={peak[0]:.0f}MB "
-                  f"(python={self._py_rss_mb():.0f}MB)")
+        heavy = f"; heaviest: {self._heaviest_cmd[1]} {self._heaviest_cmd[0]:.0f}MB" \
+            if self._heaviest_cmd[1] else ""
+        self._mem_log(f"[mem] encoding peak children RSS={peak[0]:.0f}MB "
+                      f"(python={self._py_rss_mb():.0f}MB){heavy}")
         return [ivf_paths[i] for i in range(len(shots))]
 
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int) -> Path:
@@ -751,9 +783,9 @@ class ShotEncoder:
     def run(self) -> None:
         try:
             self._stage("scenedetect", 0.0)
-            self._log(f"[mem] job start python={self._py_rss_mb():.0f}MB "
-                      f"source={self.info.duration:.1f}s @ {self.fps:g}fps "
-                      f"~{self.total_frames} frames")
+            self._mem_log(f"[mem] job start python={self._py_rss_mb():.0f}MB "
+                          f"source={self.info.duration:.1f}s @ {self.fps:g}fps "
+                          f"~{self.total_frames} frames")
             shots = self.detect_shots()
             self._log(f"{len(shots)} shot(s) from scene detection")
 
