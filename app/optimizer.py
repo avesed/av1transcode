@@ -214,6 +214,7 @@ class ShotEncoder:
         self.plan = plan
         self.source = Path(source)
         self.output = Path(output)
+        self.output.parent.mkdir(parents=True, exist_ok=True)
         self.tempdir = Path(tempdir)
         self.log_path = log_path
         self.progress_cb = progress_cb

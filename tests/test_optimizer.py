@@ -52,6 +52,16 @@ def make_encoder(settings, info, plan, tmp_path):
     return enc
 
 
+def test_init_creates_output_dir(settings, info, plan, tmp_path):
+    # output inside a source-relative av1/ subdir that does not exist yet
+    out = tmp_path / "movie" / "av1" / "movie.av1.mkv"
+    src = tmp_path / "movie" / "movie.mkv"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.touch()
+    opt.ShotEncoder(settings, info, plan, src, out, tmp_path / "temp")
+    assert out.parent.is_dir()
+
+
 # ---- parse_target ----
 def test_parse_target_plain():
     assert opt.parse_target("75") == (75.0, None)
