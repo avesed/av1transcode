@@ -956,9 +956,14 @@ class ShotEncoder:
         # subtitle -c copy fails for mov_text (tx3g) into matroska; retry with
         # -c:s srt which converts them to a mkv-native format.
         audio_src = str(self.info.path if self.info.path else self.source)
+        # NB: do NOT -map_metadata from the source: WEB-DL sources carry a
+        # title like "...DV.HDR10.PLUS..." and the output is plain HDR10 AV1,
+        # so copying it makes players/media-servers misclassify the file as
+        # Dolby Vision and fail/refuse to play. Stream tags (language etc.)
+        # are preserved with the mapped streams anyway.
         base = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only),
                 "-i", audio_src, "-map", "0:v:0", "-map", "1:a?",
-                "-map", "1:s?", "-c", "copy", "-map_metadata", "1"]
+                "-map", "1:s?", "-c", "copy", "-map_metadata", "-1"]
         try:
             self._run(base + [str(self.output)], timeout=1800)
         except TranscodeError:
