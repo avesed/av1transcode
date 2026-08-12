@@ -252,16 +252,35 @@ def test_probe_rate_for_caps_long_shots(settings, info, plan, tmp_path):
 def test_encode_workers_ram_aware(settings, info, plan, tmp_path, monkeypatch):
     enc = make_encoder(settings, info, plan, tmp_path)
     monkeypatch.setattr(opt.ShotEncoder, "_ram_gb", staticmethod(lambda: 31))
-    # 31GB / 16 = 1 worker (capped by shot count and cores)
-    assert enc._encode_workers(11) == 1
+    # 31GB / 8 = 3 workers (capped by shot count and cores)
+    assert enc._encode_workers(11) == 3
     assert enc._encode_workers(1) == 1  # fewer shots than workers
     # explicit setting wins
     settings.transcode.optimizer.encode_workers = 6
     assert enc._encode_workers(11) == 6
-    # per-instance threads for the final encode are capped
-    monkeypatch.setattr(opt.ShotEncoder, "_ram_gb", staticmethod(lambda: 31))
+    # per-instance lookahead for the final encode is capped
     assert enc._encode_lp(2) <= 6
     assert enc._encode_lp(1) <= 6
+
+
+def test_encode_threads_affinity(settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(opt.os, "cpu_count", lambda: 32)
+    # auto: cores / workers
+    assert enc._encode_threads(4) == 8
+    assert enc._encode_threads(1) == 32
+    # explicit setting wins and is clamped to cores
+    settings.transcode.optimizer.encode_threads = 16
+    assert enc._encode_threads(4) == 16
+    settings.transcode.optimizer.encode_threads = 99
+    assert enc._encode_threads(1) == 32
+    settings.transcode.optimizer.encode_threads = 0
+    # single worker spanning all cores -> no taskset wrapper
+    assert enc._affinity_prefix(0, 32) == []
+    # workers get disjoint, wrapping core ranges
+    assert enc._affinity_prefix(0, 8) == ["taskset", "-c", "0-7"]
+    assert enc._affinity_prefix(3, 8) == ["taskset", "-c", "24-31"]
+    assert enc._affinity_prefix(4, 8) == ["taskset", "-c", "0-7"]  # wraps
 
 
 def test_pick_all_crfs_clamps_to_grid(settings, info, plan, tmp_path):

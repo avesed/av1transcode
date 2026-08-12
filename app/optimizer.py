@@ -301,20 +301,47 @@ class ShotEncoder:
         return 8
 
     def _encode_workers(self, num_shots: int) -> int:
-        """Final-encode concurrency. Each parallel SVT-AV1 encode of 4K can use
-        several GB regardless of thread count, so too many instances OOM the
-        machine. Default scales workers from total RAM (ram_gb // 12) so total
-        encode memory stays bounded."""
+        """Final-encode concurrency. Each SVT-AV1 instance has a private frame
+        buffer pool costing several GB at 4K regardless of thread count
+        (measured ~8GB at preset 6 / lp=6), so workers are bounded by RAM, not
+        cores. Default scales from total memory (ram_gb // 8 keeps total encode
+        memory under ~half of RAM)."""
         w = self.opt.encode_workers
         if not w or w <= 0:
             cores = os.cpu_count() or 1
-            w = max(1, min(cores, max(1, self._ram_gb() // 16)))
+            w = max(1, min(cores, max(1, self._ram_gb() // 8)))
         return max(1, min(w, num_shots))
 
+    def _encode_threads(self, workers: int) -> int:
+        """CPU cores allotted per final-encode instance. SVT-AV1 does not honour
+        -threads and spawns ~80+ threads at 4K regardless of cores, so this is
+        enforced with taskset affinity (each worker gets a disjoint core range).
+        It does not reduce per-instance memory; it only stops parallel instances
+        from oversubscribing cores and thrashing each other."""
+        cores = os.cpu_count() or 1
+        t = self.opt.encode_threads
+        if not t or t <= 0:
+            t = max(1, cores // max(1, workers))
+        return max(1, min(t, cores))
+
+    def _affinity_prefix(self, worker_idx: int, threads: int) -> List[str]:
+        """taskset prefix pinning worker `worker_idx` to a disjoint slice of
+        `threads` cores. Empty when the slice covers every core (single worker
+        on a free machine), letting SVT-AV1 use all cores without extra
+        subprocess overhead."""
+        cores = os.cpu_count() or 1
+        if threads >= cores:
+            return []
+        start = (worker_idx * threads) % cores
+        end = start + threads - 1
+        if end >= cores:
+            start, end = 0, threads - 1
+        return ["taskset", "-c", f"{start}-{end}"]
+
     def _encode_lp(self, workers: int) -> int:
-        """Per-instance SVT threads for the FINAL encode. At 4K the frame
-        buffers already cost GBs and threads multiply them; cap each instance
-        so workers x per-instance memory stays within RAM."""
+        """SVT-AV1 lookahead (lp) for the FINAL encode. lp scales the frame
+        buffer pool that dominates 4K memory, so back it off when many
+        instances run to keep workers x per-instance memory within RAM."""
         cores = os.cpu_count() or 1
         return max(1, min(cores, round(cores / max(1, workers)), 6))
 
@@ -432,8 +459,9 @@ class ShotEncoder:
             if proc.returncode == -9:
                 msg += (
                     "\nHint: the encoder was killed (likely out of memory). "
-                    "Lower transcode.optimizer.encode_workers (parallel encodes) "
-                    "or probe_workers."
+                    "Lower transcode.optimizer.encode_workers (parallel final "
+                    "encodes; each 4K instance holds a multi-GB frame pool) or "
+                    "probe_workers."
                 )
             raise TranscodeError(msg)
         return out
@@ -844,17 +872,22 @@ class ShotEncoder:
     # ---------- phase 4: parallel final encode ----------
     def encode_all(self, shots: List[Shot], chosen: Dict[int, float]) -> List[Path]:
         workers = self._encode_workers(len(shots))
+        threads = self._encode_threads(workers)
         lp = self._encode_lp(workers)
         ivf_paths: Dict[int, Path] = {}
         done_frames = 0
         t0 = time.monotonic()
         self._heaviest_cmd = (0.0, "")
-        self._log(f"encoding {len(shots)} shots in parallel (svt lp={lp})")
+        aff = f" taskset {threads}c" if threads < (os.cpu_count() or 1) else ""
+        self._log(f"encoding {len(shots)} shots in parallel"
+                  f" (svt lp={lp}, workers={workers}, threads={threads}/instance{aff})")
         stop, peak = self._start_mem_sampler()
         try:
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(self._encode_shot, i, s0, s1, chosen.get(i, self.video.crf), lp):
-                        (i, s1 - s0) for i, (s0, s1) in enumerate(shots)}
+                futs = {
+                    ex.submit(self._encode_shot, i, s0, s1,
+                              chosen.get(i, self.video.crf), lp, threads):
+                    (i, s1 - s0) for i, (s0, s1) in enumerate(shots)}
                 for fut in as_completed(futs):
                     self._check_cancel()
                     i, span = futs[fut]
@@ -874,18 +907,20 @@ class ShotEncoder:
                       f"(python={self._py_rss_mb():.0f}MB){heavy}")
         return [ivf_paths[i] for i in range(len(shots))]
 
-    def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int) -> Path:
+    def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int,
+                     threads: int) -> Path:
         dst = self.probe_dir / f"enc_{idx:05d}.ivf"
         start = s0 / self.fps
         # encode exactly (s1 - s0) frames: `-t` on input-seeked shots is not
         # frame-exact (off by a frame per shot), and 762 shots x 1 frame drift
         # = seconds of A/V desync once the audio is muxed whole. `-frames:v`
         # guarantees the exact frame count so the concat sums to the source.
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{start:.6f}", "-i", str(self.source),
-                "-frames:v", str(s1 - s0),
-                "-map", "0:v:0", "-c:v", "libsvtav1",
-                "-preset", str(self.video.preset), "-crf", self._fmt_crf(crf)]
+        args = self._affinity_prefix(idx, threads)
+        args += [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                 "-ss", f"{start:.6f}", "-i", str(self.source),
+                 "-frames:v", str(s1 - s0),
+                 "-map", "0:v:0", "-c:v", "libsvtav1",
+                 "-preset", str(self.video.preset), "-crf", self._fmt_crf(crf)]
         if self.video.keyint:
             args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]
         svt = _svt_params_dict(self.video)

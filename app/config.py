@@ -130,10 +130,17 @@ class OptimizerSettings(BaseModel):
     # Parallel probe/encode workers across shots (0 = os.cpu_count()).
     probe_workers: int = 0
     # Parallel FINAL ENCODE instances. Separate from probe_workers because a
-    # single SVT-AV1 encode of 4K can use several GB regardless of threads;
-    # too many parallel instances OOM the machine. 0 = auto (capped by RAM:
-    # roughly total_mem / 8, so total encode memory stays under ~half of RAM).
+    # single SVT-AV1 encode of 4K uses several GB regardless of thread count
+    # (measured ~8GB at preset 6 / lp=6); too many parallel instances OOM the
+    # machine. 0 = auto (total_mem / 8, so total encode memory stays under
+    # ~half of RAM).
     encode_workers: int = 0
+    # CPU cores allotted to each final-encode instance (0 = auto:
+    # cores / encode_workers). Enforced with taskset affinity per instance.
+    # This does NOT reduce per-instance memory (SVT-AV1 spawns 80+ threads at
+    # 4K regardless); it only prevents thread oversubscription between
+    # parallel instances so they do not thrash each other.
+    encode_threads: int = 0
     # PySceneDetect ContentDetector threshold (higher = fewer/split less).
     scenedetect_threshold: float = 27.0
     # Minimum shot length in frames (shorter segments are merged).

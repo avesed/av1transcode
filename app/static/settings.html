@@ -110,6 +110,10 @@
         <input type="number" id="o-encode_workers" min="0" max="128">
       </div>
       <div class="field">
+        <label>encode_threads（每个编码实例分配的 CPU 核数，0=自动=核数/实例数）</label>
+        <input type="number" id="o-encode_threads" min="0" max="512">
+      </div>
+      <div class="field">
         <label>scenedetect_threshold（分镜灵敏度，越高分镜越少）</label>
         <input type="number" id="o-scenedetect_threshold" min="0" step="0.5">
       </div>
@@ -458,6 +462,7 @@ async function loadOptimizer() {
     $("o-probe_max_frames").value = o.probe_max_frames;
     $("o-probe_workers").value = o.probe_workers;
     $("o-encode_workers").value = o.encode_workers;
+    $("o-encode_threads").value = o.encode_threads;
     $("o-scenedetect_threshold").value = o.scenedetect_threshold;
     $("o-min_scene_len").value = o.min_scene_len;
     $("o-max_shots").value = o.max_shots;
@@ -485,6 +490,7 @@ $("optimizerForm").addEventListener("submit", async e => {
       probe_max_frames: parseInt($("o-probe_max_frames").value, 10) || 1200,
       probe_workers: parseInt($("o-probe_workers").value, 10) || 0,
       encode_workers: parseInt($("o-encode_workers").value, 10) || 0,
+      encode_threads: parseInt($("o-encode_threads").value, 10) || 0,
       scenedetect_threshold: parseFloat($("o-scenedetect_threshold").value),
       min_scene_len: parseInt($("o-min_scene_len").value, 10),
       max_shots: parseInt($("o-max_shots").value, 10),
