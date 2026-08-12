@@ -293,6 +293,38 @@ def test_encode_threads_affinity(settings, info, plan, tmp_path, monkeypatch):
     assert enc._affinity_prefix(4, 8) == ["taskset", "-c", "0-7"]  # wraps
 
 
+def test_mkvmerge_mux_success(settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    out = enc.output
+    out.write_bytes(b"")
+    video_only = tmp_path / "video_only.mkv"
+    audio_subs = tmp_path / "audio_subs.mkv"
+    video_only.touch()
+    audio_subs.touch()
+
+    def fake_run(cmd, capture_output=False, text=False, timeout=None):
+        out.write_bytes(b"\x1aE\xdf\xa3")
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(opt.subprocess, "run", fake_run)
+    assert enc._mkvmerge_mux("mkvmerge", video_only, audio_subs) is True
+    assert out.stat().st_size > 0
+
+
+def test_mkvmerge_mux_failure_falls_back(settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    video_only = tmp_path / "video_only.mkv"
+    audio_subs = tmp_path / "audio_subs.mkv"
+    video_only.touch()
+    audio_subs.touch()
+
+    def fake_run(cmd, capture_output=False, text=False, timeout=None):
+        return types.SimpleNamespace(returncode=1, stderr="boom")
+
+    monkeypatch.setattr(opt.subprocess, "run", fake_run)
+    assert enc._mkvmerge_mux("mkvmerge", video_only, audio_subs) is False
+
+
 def test_pick_all_crfs_clamps_to_grid(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     enc.target = 75.0

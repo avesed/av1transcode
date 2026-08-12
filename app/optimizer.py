@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -950,19 +951,33 @@ class ShotEncoder:
                 "-i", str(list_file), "-c", "copy", "-fflags", "+genpts",
                 "-f", "matroska", str(video_only)]
         self._run(args, timeout=1800)
-        # re-mux: video from the concat, audio + subs from the ORIGINAL source
-        # (info.path, not self.source: for Dolby Vision the encode input is a
-        # video-only stripped intermediate, so muxing from it would drop audio).
-        # subtitle -c copy fails for mov_text (tx3g) into matroska; retry with
-        # -c:s srt which converts them to a mkv-native format.
+        # audio + subs from the ORIGINAL source (info.path, not self.source:
+        # for Dolby Vision the encode input is a video-only stripped
+        # intermediate, so muxing from it would drop audio). mov_text (tx3g)
+        # subtitles cannot be copied into matroska, so convert them to srt.
         audio_src = str(self.info.path if self.info.path else self.source)
-        # NB: do NOT -map_metadata from the source: WEB-DL sources carry a
-        # title like "...DV.HDR10.PLUS..." and the output is plain HDR10 AV1,
-        # so copying it makes players/media-servers misclassify the file as
-        # Dolby Vision and fail/refuse to play. Stream tags (language etc.)
-        # are preserved with the mapped streams anyway.
+        audio_subs = self.tempdir / "audio_subs.mkv"
+        self._run(
+            [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
+             "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
+             "-c:a", "copy", "-c:s", "srt", "-map_metadata", "-1",
+             str(audio_subs)],
+            timeout=1800,
+        )
+        # Final mux via mkvmerge: ffmpeg's -c copy remux of the concat leaves
+        # the shot-boundary structure that Plex's 4K AV1 transcode hangs on
+        # (runs for 10-20 min then stops producing HLS segments; verified on
+        # 4K DV-P8 output while a single-continuous encode is fine). mkvmerge
+        # rebuilds the container so the same bitstream plays and seeks fine.
+        # NB: mkvmerge does NOT copy the source's global metadata (which would
+        # carry a misleading "...DV.HDR10.PLUS..." title onto an HDR10 stream).
+        mkvmerge = self.settings.tools.mkvmerge
+        if shutil.which(mkvmerge) and self._mkvmerge_mux(mkvmerge, video_only,
+                                                        audio_subs):
+            return
+        logger.warning("mkvmerge unavailable or failed; falling back to ffmpeg mux")
         base = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only),
-                "-i", audio_src, "-map", "0:v:0", "-map", "1:a?",
+                "-i", audio_subs, "-map", "0:v:0", "-map", "1:a?",
                 "-map", "1:s?", "-c", "copy", "-map_metadata", "-1"]
         try:
             self._run(base + [str(self.output)], timeout=1800)
@@ -976,6 +991,25 @@ class ShotEncoder:
             self._run(base + ["-c:s", "srt", str(self.output)], timeout=1800)
         if not self.output.exists() or self.output.stat().st_size == 0:
             raise TranscodeError("optimizer produced no output file")
+
+    def _mkvmerge_mux(self, mkvmerge: str, video_only: Path,
+                      audio_subs: Path) -> bool:
+        """Final mux with mkvmerge. Returns True on a valid output file."""
+        try:
+            if self.output.exists():
+                self.output.unlink()
+            proc = subprocess.run(
+                [mkvmerge, "-o", str(self.output), str(video_only),
+                 str(audio_subs)],
+                capture_output=True, text=True, timeout=1800,
+            )
+            if proc.returncode != 0:
+                logger.error("mkvmerge failed: {}", (proc.stderr or "")[-500:])
+                return False
+            return self.output.exists() and self.output.stat().st_size > 0
+        except Exception as e:  # noqa: BLE001
+            logger.error("mkvmerge mux error: {}", e)
+            return False
 
     # ---------- orchestration ----------
     def run(self) -> None:
