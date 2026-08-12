@@ -957,10 +957,14 @@ class ShotEncoder:
         # subtitles cannot be copied into matroska, so convert them to srt.
         audio_src = str(self.info.path if self.info.path else self.source)
         audio_subs = self.tempdir / "audio_subs.mkv"
+        # NB: no -map_metadata -1 here: it strips per-stream LANGUAGE tags
+        # from the subtitle/audio streams (Plex then shows every subtitle as
+        # English). The source's global "DV.HDR10.PLUS" title is harmless in
+        # this intermediate - mkvmerge does not copy it into the final file.
         self._run(
             [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
              "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
-             "-c:a", "copy", "-c:s", "srt", "-map_metadata", "-1",
+             "-c:a", "copy", "-c:s", "srt",
              str(audio_subs)],
             timeout=1800,
         )
@@ -976,9 +980,12 @@ class ShotEncoder:
                                                         audio_subs):
             return
         logger.warning("mkvmerge unavailable or failed; falling back to ffmpeg mux")
+        # fallback: global metadata comes from the first input (video_only,
+        # which has no title), stream language tags ride along with the
+        # mapped streams, so no -map_metadata -1 needed here either.
         base = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only),
                 "-i", audio_subs, "-map", "0:v:0", "-map", "1:a?",
-                "-map", "1:s?", "-c", "copy", "-map_metadata", "-1"]
+                "-map", "1:s?", "-c", "copy"]
         try:
             self._run(base + [str(self.output)], timeout=1800)
         except TranscodeError:
