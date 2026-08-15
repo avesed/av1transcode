@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.4
 # =====================================================================
 # AV1 Transcode Archive - all-in-one image
-# Native ffmpeg (v9/master) + SVT-AV1 v4.2 + av1an + dovi_tool +
+# Native ffmpeg 9.0.1 + SVT-AV1 v4.2 + av1an + dovi_tool +
 # mkvtoolnix + mediainfo + Python scheduler/UI.
 #
 #   docker build -t av1transcode .
@@ -89,13 +89,21 @@ RUN git clone --depth 1 --branch ${VMAF_TAG} \
     cp -a /build/vmaf/model/vmaf_v0.6.1.json /out/share/model/ && \
     cp -a /out/usr/local/bin/vmaf /out/bin/ 2>/dev/null; true
 
-# ---------- stage 4: ffmpeg v9 (master branch, DV support) ----------
+# ---------- stage 4: ffmpeg 9.0.1 release (DV support) ----------
 FROM debian:bookworm-slim AS ffmpeg-builder
-ARG FFMPEG_REF=master
+# A release tag, and it is actually used - this ARG was previously declared and
+# then ignored while the source was cloned from master, so no two builds of this
+# image contained the same ffmpeg. The optimizer's measurement path depends on
+# specific libvmaf, libplacebo and framesync behaviour, which is not something
+# to re-roll on every rebuild. Verified present in 9.0.1: framesync
+# ts_sync_mode, libplacebo apply_dolbyvision, the dovi_rpu/dovi_split bitstream
+# filters, and libsvtav1's SVT_AV1_CHECK_VERSION(4,0,0) path for the SVT-AV1
+# v4.2.0 built above. Bump deliberately.
+ARG FFMPEG_REF=n9.0.1
 ARG JOBS=8
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential pkg-config git nasm yasm ca-certificates \
+    build-essential pkg-config curl nasm yasm ca-certificates \
     libvpx-dev libx264-dev libx265-dev libopus-dev libvorbis-dev \
     libmp3lame-dev libass-dev libfreetype-dev libfontconfig1-dev \
     libvulkan-dev liblcms2-dev libdav1d-dev \
@@ -112,8 +120,14 @@ COPY --from=vmaf-builder /out/include/ /usr/local/include/
 COPY --from=vmaf-builder /out/lib/pkgconfig/ /usr/local/lib/pkgconfig/
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-RUN git clone --depth 1 https://git.ffmpeg.org/ffmpeg.git ffmpeg && \
-    cd ffmpeg && \
+# The release tarball from the GitHub mirror, not a clone of git.ffmpeg.org:
+# that host answers ICMP but refuses TCP on 80/443/9418, which fails the build
+# outright, and a tarball is 17MB against 137MB for the shallowest useful
+# fetch. The tree carries a RELEASE file, so the version string stays correct
+# without a .git directory.
+RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}.tar.gz" \
+      | tar xz && \
+    cd "FFmpeg-${FFMPEG_REF}" && \
     ./configure --prefix=/usr/local \
         --enable-gpl --enable-nonfree \
         --enable-libvpx --enable-libx264 --enable-libx265 \
