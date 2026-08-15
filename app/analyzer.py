@@ -196,11 +196,20 @@ def analyze(settings: Settings, path: str) -> Optional[MediaInfo]:
                 info.is_hdr = True
             elif "arib-std-b67" in transfer or "hlg" in transfer:
                 info.is_hlg = True
-            ra = st.get("avg_frame_rate") or "0/1"
-            try:
-                num, den = ra.split("/")
-                info.fps = round(float(num) / (float(den) or 1.0), 6)
-            except Exception:
+            # avg_frame_rate first (it is the true average on VFR sources), but
+            # it is "0/0" on some streams; r_frame_rate then still gives a
+            # usable rate. The shot-based engine converts every frame number to
+            # a timestamp with this, so a wrong value mis-cuts the whole encode.
+            for key in ("avg_frame_rate", "r_frame_rate"):
+                try:
+                    num, den = (st.get(key) or "0/1").split("/")
+                    fps = float(num) / (float(den) or 1.0)
+                except (ValueError, ZeroDivisionError, AttributeError):
+                    continue
+                if fps > 0:
+                    info.fps = round(fps, 6)
+                    break
+            else:
                 info.fps = 0.0
         elif ct == "audio":
             info.audio_count += 1
