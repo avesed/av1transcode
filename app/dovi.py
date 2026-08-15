@@ -32,14 +32,26 @@ def extract_rpu(settings: Settings, source: Path, dest: Path, profile: int) -> b
                  "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
-            proc = subprocess.run(
-                [dovi, "extract-rpu", "-", "-o", str(dest)],
-                stdin=proc_in.stdout,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=1800,
-            )
-            rc, out = proc.returncode, (proc.stderr or b"").decode(errors="replace")
-            proc_in.wait(timeout=60)
+            try:
+                proc = subprocess.run(
+                    [dovi, "extract-rpu", "-", "-o", str(dest)],
+                    stdin=proc_in.stdout,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=1800,
+                )
+                rc, out = proc.returncode, (proc.stderr or b"").decode(errors="replace")
+            finally:
+                # Drop the parent's copy of the pipe so ffmpeg gets EPIPE when
+                # dovi_tool exits, then make sure it is gone: without this an
+                # early dovi_tool exit leaves ffmpeg blocked on a full pipe,
+                # decoding a whole 4K movie into nothing.
+                if proc_in.stdout:
+                    proc_in.stdout.close()
+                try:
+                    proc_in.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc_in.kill()
+                    proc_in.wait(timeout=10)
         if rc != 0 or not dest.exists() or dest.stat().st_size == 0:
             logger.error("RPU extraction failed for {}: {}", source, out[-500:])
             if dest.exists():
