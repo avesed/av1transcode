@@ -1,6 +1,8 @@
 # Runtime data
 data/
 media/
+# local test footage (tens of GB)
+sample/
 *.db
 *.db-wal
 *.db-shm
