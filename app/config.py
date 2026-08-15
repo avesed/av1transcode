@@ -205,6 +205,12 @@ class DolbyVision(BaseModel):
     #   libplacebo: accurate, requires Vulkan (recommended)
     #   zscale:     fast software, approximate colors
     p5_method: Literal["libplacebo", "zscale"] = "libplacebo"
+    # Vulkan device for the libplacebo P5 conversion, as ffmpeg's
+    # -init_hw_device selector (an index, or a substring of the device name).
+    # Empty (recommended) = let ffmpeg pick, which takes the GPU when one is
+    # passed into the container and falls back to Mesa's llvmpipe software
+    # renderer when there is none. Pin it to "llvmpipe" only to force software.
+    vulkan_device: str = ""
     # For Profile 7/8: strip RPU/EL from the stream fed to the encoder.
     strip_rpu: bool = True
 

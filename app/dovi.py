@@ -93,8 +93,15 @@ def convert_p5_to_hdr10(settings: Settings, source: str, out: str,
             ":colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084,"
             "hwdownload,format=yuv420p10le"
         )
+        # Device selection is deliberately NOT pinned to llvmpipe: ffmpeg's
+        # "vulkan=vk:<sel>" picks the device whose name matches <sel>, so
+        # hardcoding the software renderer meant a host GPU was never used even
+        # when it was passed into the container. Bare "vulkan=vk" takes device
+        # 0 - the GPU when present, lavapipe when not - and measured no slower
+        # than the pinned form on a GPU-less host.
+        device = (settings.transcode.dovi.vulkan_device or "").strip()
         pre = [
-            "-init_hw_device", "vulkan=vk:llvmpipe",
+            "-init_hw_device", f"vulkan=vk:{device}" if device else "vulkan=vk",
             "-filter_hw_device", "vk",
         ]
     else:
