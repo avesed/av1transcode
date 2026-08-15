@@ -186,6 +186,26 @@ def parse_score(json_path: Path, metric: str) -> float:
     raise TranscodeError(f"could not parse {metric} score from {json_path}")
 
 
+class _Shard:
+    """A converted per-shot clip, shared by every probe of that shot.
+
+    Ref-counted because the probe pool schedules one task per (shot, CRF): the
+    5 tasks of a shot must convert once, not five times, and the shard has to
+    survive until the last of them is done.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.refs = 0
+        self.lock = threading.Lock()
+
+    def unlink(self) -> None:
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
 # ---- the engine -----------------------------------------------------------
 
 def run_shot_transcode(
@@ -270,6 +290,12 @@ class ShotEncoder:
         # pool-thread -> core slice index, for taskset affinity (see _worker_slot)
         self._slots: Dict[int, int] = {}
         self._slot_lock = threading.Lock()
+        # Dolby Vision Profile 5: the base layer is ICtCp, so it has to have its
+        # RPU applied before it means anything. Done per shot rather than once
+        # over the whole file - see _acquire_shard.
+        self._p5 = bool(plan.p5 and settings.transcode.dovi.enabled)
+        self._shards: Dict[int, "_Shard"] = {}
+        self._shard_lock = threading.Lock()
         # (peak_mb, command) of the heaviest child this phase, for diagnostics
         self._heaviest_cmd: Tuple[float, str] = (0.0, "")
 
@@ -778,6 +804,86 @@ class ShotEncoder:
         pf = self.video.pixel_format
         return "yuv420p" if pf == "yuv420p8le" else pf
 
+    # ---------- Dolby Vision Profile 5 shards ----------
+    def _shard_bytes(self, frames: int) -> int:
+        """Rough size of a lossless FFV1 shard, for the tmpfs fit check.
+
+        Measured 1.4-1.8MB per 4K 10-bit frame on real content; 0.35MB per
+        megapixel per frame stays comfortably above that.
+        """
+        return int(frames * self._megapixels() * 0.35 * 1024 * 1024)
+
+    def _shard_dir(self, frames: int) -> Path:
+        """Where to put a shard of `frames` frames.
+
+        Preference is tmpfs (p5_cache_dir), which keeps the DV path off disk
+        completely: the alternative is a whole-file intermediate that runs to
+        ~100GB at 4K for a 45-minute episode, and gets re-read 11 times per
+        shot. Falls back to the work dir when the shard would not comfortably
+        fit - free space is checked live, so concurrent shards are accounted
+        for without a separate budget knob.
+        """
+        cache = self.settings.transcode.dovi.p5_cache_dir
+        if cache:
+            try:
+                st = os.statvfs(cache)
+                free = st.f_bavail * st.f_frsize
+                if self._shard_bytes(frames) * 2 < free:
+                    return Path(cache)
+            except OSError:
+                pass
+        return self.tempdir
+
+    def _make_shard(self, idx: int, w0: int, w1: int, vf: List[str], dest: Path) -> None:
+        """Apply the DV RPU to frames [w0, w1) and store them losslessly.
+
+        Every probe of a shot reads its frames 11 times over (5 probe encodes,
+        5 VMAF reference reads, 1 final encode), so converting once per shot
+        and re-reading a small shard costs one libplacebo pass and leaves the
+        repeat reads in page cache.
+        """
+        from app import dovi  # local import avoids a cycle
+
+        pre, chain = dovi.dv_apply_chain(self.settings)
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
+                "-ss", f"{w0 / self.fps:.6f}", "-t", f"{(w1 - w0) / self.fps:.6f}",
+                "-i", str(self.source), "-map", "0:v:0",
+                "-vf", ",".join([*vf, chain]),
+                "-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
+                "-an", "-sn", "-f", "matroska", str(dest)]
+        self._run(args, timeout=3600)
+        if not dest.exists() or dest.stat().st_size == 0:
+            raise TranscodeError(f"DV shard for shot {idx} produced no output")
+
+    def _acquire_shard(self, idx: int, w0: int, w1: int, vf: List[str]) -> Optional[Path]:
+        """Ref-counted converted shard for a shot, or None when not a P5 job."""
+        if not self._p5:
+            return None
+        with self._shard_lock:
+            entry = self._shards.get(idx)
+            if entry is None:
+                dest = self._shard_dir(w1 - w0) / f"dv_{id(self):x}_{idx:05d}.mkv"
+                entry = _Shard(dest)
+                self._shards[idx] = entry
+            entry.refs += 1
+        with entry.lock:
+            if not entry.path.exists():
+                self._make_shard(idx, w0, w1, vf, entry.path)
+        return entry.path
+
+    def _release_shard(self, idx: int) -> None:
+        if not self._p5:
+            return
+        with self._shard_lock:
+            entry = self._shards.get(idx)
+            if entry is None:
+                return
+            entry.refs -= 1
+            if entry.refs > 0:
+                return
+            self._shards.pop(idx, None)
+        entry.unlink()
+
     def _vmaf_threads(self) -> int:
         """Threads for the libvmaf calculation.
 
@@ -826,14 +932,20 @@ class ShotEncoder:
         return f"path={raw}"
 
     # ---------- phase 2: parallel probing ----------
-    def _probe_input(self, w0: int, w1: int) -> Tuple[List[str], List[str]]:
+    def _probe_input(self, w0: int, w1: int,
+                     shard: Optional[Path] = None) -> Tuple[List[str], List[str]]:
         """(input args, video filters) reading frames [w0, w1) of the source.
 
         Used identically by the probe encode and by the VMAF reference read, so
         the two are frame-aligned by construction and there is no multi-GB y4m
         intermediate to cache: at 4K 10-bit a y4m frame is 22MB, and the frames
         would have to be re-read once per CRF anyway.
+
+        A DV shard already holds exactly these frames with the probe-side
+        filters baked in, so it is read whole and needs no filters of its own.
         """
+        if shard is not None:
+            return ["-i", str(shard)], []
         args = ["-ss", f"{w0 / self.fps:.6f}", "-t", f"{(w1 - w0) / self.fps:.6f}",
                 "-i", str(self.source)]
         vf: List[str] = []
@@ -904,8 +1016,17 @@ class ShotEncoder:
     def _probe_one(self, idx: int, s0: int, s1: int, crf: int, lp: int) -> Tuple[int, int, float]:
         self._check_cancel()
         w0, w1 = self._probe_window(s0, s1)
+        _, probe_vf = self._probe_input(w0, w1)
+        shard = self._acquire_shard(idx, w0, w1, probe_vf)
+        try:
+            return self._probe_encode_and_score(idx, w0, w1, crf, lp, shard)
+        finally:
+            self._release_shard(idx)
+
+    def _probe_encode_and_score(self, idx: int, w0: int, w1: int, crf: int,
+                                lp: int, shard: Optional[Path]) -> Tuple[int, int, float]:
         ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
-        in_args, vf = self._probe_input(w0, w1)
+        in_args, vf = self._probe_input(w0, w1, shard)
         args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"] + in_args
         if vf:
             args += ["-vf", ",".join(vf)]
@@ -922,7 +1043,7 @@ class ShotEncoder:
         args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items()),
                  "-pix_fmt", self._pix_fmt(), "-f", "ivf", str(ivf)]
         self._run(args, timeout=3600)
-        score = self._score_probe(w0, w1, ivf, idx, crf)
+        score = self._score_probe(w0, w1, ivf, idx, crf, shard)
         if not self.opt.keep_probes:
             try:
                 ivf.unlink()
@@ -930,7 +1051,8 @@ class ShotEncoder:
                 pass
         return idx, crf, score
 
-    def _score_probe(self, w0: int, w1: int, dist: Path, idx: int, crf: int) -> float:
+    def _score_probe(self, w0: int, w1: int, dist: Path, idx: int, crf: int,
+                     shard: Optional[Path] = None) -> float:
         out_json = self.probe_dir / f"score_{idx:05d}_{crf}.json"
         # ts_sync_mode=nearest is NOT optional. The reference is read straight
         # from the source container while the distorted side is an ivf carrying
@@ -969,7 +1091,7 @@ class ShotEncoder:
         # encode and VIF sees detail being *added* rather than lost, which
         # inflates and flattens the whole CRF curve (measured +5 VMAF at CRF 20
         # and +18 at CRF 44 on 4K HDR10).
-        ref_args, ref_vf = self._probe_input(w0, w1)
+        ref_args, ref_vf = self._probe_input(w0, w1, shard)
         scale = self._vmaf_scale_filter()
         fmt = f"format={self._pix_fmt()}"
         dist_chain = ",".join(f for f in (scale, fmt) if f)
@@ -1099,10 +1221,22 @@ class ShotEncoder:
         # = seconds of A/V desync once the audio is muxed whole. `-frames:v`
         # guarantees the exact frame count so the concat sums to the source.
         args = self._affinity_prefix(self._worker_slot(workers), threads)
-        args += [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                 "-ss", f"{start:.6f}", "-i", str(self.source),
-                 "-frames:v", str(s1 - s0),
-                 "-map", "0:v:0", "-c:v", "libsvtav1",
+        args += [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        vf: List[str] = []
+        if self._p5:
+            # The final encode reads each shot exactly once, so there is nothing
+            # for a shard to amortise here: apply the RPU straight into the
+            # encoder instead of staging a file.
+            from app import dovi  # local import avoids a cycle
+
+            pre, chain = dovi.dv_apply_chain(self.settings)
+            args += pre
+            vf.append(chain)
+        args += ["-ss", f"{start:.6f}", "-i", str(self.source),
+                 "-frames:v", str(s1 - s0), "-map", "0:v:0"]
+        if vf:
+            args += ["-vf", ",".join(vf)]
+        args += ["-c:v", "libsvtav1",
                  "-preset", str(self.video.preset), "-crf", self._fmt_crf(crf)]
         if self.video.keyint:
             args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]

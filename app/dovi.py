@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from loguru import logger
 
@@ -64,54 +64,44 @@ def extract_rpu(settings: Settings, source: Path, dest: Path, profile: int) -> b
         return False
 
 
+def dv_apply_chain(settings: Settings) -> Tuple[List[str], str]:
+    """(ffmpeg pre-input args, filter chain) that applies a Dolby Vision RPU.
+
+    libplacebo is the only thing in ffmpeg that can APPLY an RPU - dovi_rpu can
+    only strip or compress the metadata, and the hevc decoder has no switch for
+    it - so a Profile 5 base layer (ICtCp) has no other route to HDR10.
+
+    `-init_hw_device vulkan=vk` + `-filter_hw_device` gives libplacebo a device:
+    the host GPU when one is passed into the container, Mesa's lavapipe software
+    renderer when not. `format=` on both sides of the hwupload/hwdownload pair
+    keeps the hwframe sw-formats consistent, and it must stay 10-bit - nv12 is
+    8 bits per component and truncating there quantises the base layer BEFORE
+    the mapping is applied, baking banding into a PQ signal.
+    """
+    device = (settings.transcode.dovi.vulkan_device or "").strip()
+    pre = [
+        "-init_hw_device", f"vulkan=vk:{device}" if device else "vulkan=vk",
+        "-filter_hw_device", "vk",
+    ]
+    chain = (
+        "format=yuv420p10le,hwupload,"
+        "libplacebo=apply_dolbyvision=1:format=yuv420p10le"
+        ":colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084,"
+        "hwdownload,format=yuv420p10le"
+    )
+    return pre, chain
+
+
 def convert_p5_to_hdr10(settings: Settings, source: str, out: str,
                         method: str = "libplacebo") -> Optional[str]:
-    """Convert a Dolby Vision Profile 5 BL (ICtCp) into an HDR10 equivalent before AV1 encode.
+    """Convert a whole Dolby Vision Profile 5 BL (ICtCp) into an HDR10 file.
 
-    Two strategies:
-      libplacebo : GPU (Vulkan) filter that applies the DV RPU in-place and
-                   remaps to BT.2020/PQ. Most accurate; falls back to CPU
-                   (llvmpipe) rendering when no GPU is available.
-      zscale     : software approximation, no Vulkan required but approximate.
-    Returns path to an intermediate lossless Matroska (FFV1 10-bit), or the
-    source path when no conversion is needed.
+    Writes a lossless FFV1 10-bit Matroska, which at 4K runs to ~100GB for a
+    45-minute episode. The shot-based engine avoids it entirely by converting
+    one shot at a time (see optimizer); this whole-file path is what the av1an
+    engine needs, since av1an owns its own chunking.
     """
-    if method == "libplacebo":
-        # Run the DV application on the llvmpipe software Vulkan device (works
-        # without a GPU). `-init_hw_device vulkan:llvmpipe` + `-filter_hw_device`
-        # makes libplacebo accept the software renderer, and `format=` inside the
-        # filter keeps the hwframe input/output sw-formats consistent so
-        # hwdownload knows how to map them back to system memory.
-        # The upload format must stay 10-bit: nv12 is 8 bits per component, so
-        # feeding it truncated the P5 base layer BEFORE the RPU mapping was
-        # applied and baked banding into a PQ signal. Measured against the
-        # 10-bit path that cost 25.4dB PSNR, ran 27% slower (3.56 vs 4.51fps at
-        # 4K) and inflated the lossless intermediate by 60% with dither noise.
-        filt = (
-            "format=yuv420p10le,hwupload,"
-            "libplacebo=apply_dolbyvision=1:format=yuv420p10le"
-            ":colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084,"
-            "hwdownload,format=yuv420p10le"
-        )
-        # Device selection is deliberately NOT pinned to llvmpipe: ffmpeg's
-        # "vulkan=vk:<sel>" picks the device whose name matches <sel>, so
-        # hardcoding the software renderer meant a host GPU was never used even
-        # when it was passed into the container. Bare "vulkan=vk" takes device
-        # 0 - the GPU when present, lavapipe when not - and measured no slower
-        # than the pinned form on a GPU-less host.
-        device = (settings.transcode.dovi.vulkan_device or "").strip()
-        pre = [
-            "-init_hw_device", f"vulkan=vk:{device}" if device else "vulkan=vk",
-            "-filter_hw_device", "vk",
-        ]
-    else:
-        # zscale: software primaries conversion
-        filt = (
-            "zscale=matrixin=bt2020:primariesin=bt2020:transferin=smpte2084"
-            ":matrix=bt2020nc:primaries=bt2020:transfer=smpte2084"
-            ":rangein=limited:range=limited,format=yuv420p10le"
-        )
-        pre = []
+    pre, filt = dv_apply_chain(settings)
     cmd = [
         settings.tool_path("ffmpeg"), "-y", "-loglevel", "error",
         *pre,

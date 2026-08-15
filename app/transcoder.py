@@ -452,6 +452,7 @@ def run_full_transcode(
     work_dir.mkdir(parents=True, exist_ok=True)
     tmp_files: List[Path] = []
     encode_input = source
+    video = plan.params or settings.transcode.video
 
     # --- Dolby Vision pre-processing ---
     if info.dovi.present:
@@ -462,7 +463,14 @@ def run_full_transcode(
 
         dovi_cfg = settings.transcode.dovi
         if dovi_cfg.enabled:
-            if plan.p5:
+            if plan.p5 and video.engine == "optimizer":
+                # The shot-based engine applies the RPU per shot, into tmpfs.
+                # Converting the whole file up front instead would write a
+                # lossless intermediate of ~100GB for a 45-minute 4K episode
+                # and then re-read it 11 times per shot.
+                logger.info("P5: RPU applied per shot by the optimizer engine "
+                            "(no whole-file intermediate)")
+            elif plan.p5:
                 method = plan.p5_method
                 intermediate = work_dir / f"{source.stem}.dv_p5.mkv"
                 ok_file = dovi.convert_p5_to_hdr10(settings, str(source), str(intermediate), method)
@@ -489,7 +497,6 @@ def run_full_transcode(
         if progress_cb:
             progress_cb(pct, stats)
 
-    video = plan.params or settings.transcode.video
     if video.engine == "optimizer":
         from app.optimizer import run_shot_transcode
 

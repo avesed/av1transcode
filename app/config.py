@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT_DIR = APP_DIR.parent
@@ -201,10 +201,17 @@ class DolbyVision(BaseModel):
     enabled: bool = True
     # Where to store extracted RPU files (relative to dirs.rpu)
     save_rpu: bool = True
-    # Conversion method for Profile 5 (ICtCp -> HDR10):
-    #   libplacebo: accurate, requires Vulkan (recommended)
-    #   zscale:     fast software, approximate colors
-    p5_method: Literal["libplacebo", "zscale"] = "libplacebo"
+    # Conversion method for Profile 5 (ICtCp -> HDR10). libplacebo is the only
+    # option: it is the one filter in ffmpeg that can APPLY a DV RPU. The old
+    # "zscale" alternative is accepted and ignored - that build of the filter
+    # chain converted bt2020/PQ to bt2020/PQ, i.e. it relabelled the ICtCp
+    # signal without converting anything, and zscale is not compiled into the
+    # shipped ffmpeg either.
+    p5_method: Literal["libplacebo"] = "libplacebo"
+    # Where the shot-based engine stores its per-shot converted shards. tmpfs
+    # keeps the DV path off disk entirely (a whole-file intermediate is ~100GB
+    # at 4K); a shard that would not fit falls back to dirs.work automatically.
+    p5_cache_dir: Path = Path("/dev/shm")
     # Vulkan device for the libplacebo P5 conversion, as ffmpeg's
     # -init_hw_device selector (an index, or a substring of the device name).
     # Empty (recommended) = let ffmpeg pick, which takes the GPU when one is
@@ -213,6 +220,20 @@ class DolbyVision(BaseModel):
     vulkan_device: str = ""
     # For Profile 7/8: strip RPU/EL from the stream fed to the encoder.
     strip_rpu: bool = True
+
+    @field_validator("p5_method", mode="before")
+    @classmethod
+    def _retire_zscale(cls, v: object) -> object:
+        """Existing configs and saved settings may still say "zscale"; accept
+        them rather than refusing to start, but say what is happening."""
+        if isinstance(v, str) and v.strip().lower() == "zscale":
+            logger = __import__("loguru").logger  # module avoids a hard dep here
+            logger.warning(
+                "transcode.dovi.p5_method=zscale is no longer supported "
+                "(it relabelled the ICtCp signal without converting it, and "
+                "zscale is not built into the shipped ffmpeg); using libplacebo")
+            return "libplacebo"
+        return v
 
 
 class Hdr(BaseModel):

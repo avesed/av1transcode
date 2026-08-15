@@ -744,3 +744,92 @@ def test_run_full_pipeline(settings, info, plan, tmp_path):
     assert encoding[-1]["pct"] == pytest.approx(100.0, abs=1e-6)
     # chosen crf for target 75 should interpolate between 32@77 and 36@71
     assert opt.pick_crf([(c, score_at[c]) for c in score_at], 75.0) == pytest.approx(33.33, abs=0.1)
+
+
+# ---- Dolby Vision Profile 5: per-shot shards instead of a whole-file convert ----
+def _p5_encoder(settings, info, plan, tmp_path, cache_dir):
+    plan.p5 = True
+    info.width, info.height = 3840, 1920
+    settings.transcode.dovi.p5_cache_dir = cache_dir
+    return make_encoder(settings, info, plan, tmp_path)
+
+
+def test_p5_probe_converts_once_per_shot(settings, info, plan, tmp_path):
+    """Every CRF of a shot must share one converted shard: the probe pool runs
+    one task per (shot, CRF), so converting per task would apply the RPU five
+    times over, and a whole-file intermediate is ~100GB at 4K."""
+    cache = tmp_path / "shm"
+    cache.mkdir()
+    enc = _p5_encoder(settings, info, plan, tmp_path, cache)
+    cmds = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        if "ffv1" in args:                       # shard conversion
+            Path(args[-1]).write_bytes(b"shard")
+        elif any("libvmaf=" in a for a in args):
+            lavfi = args[args.index("-lavfi") + 1]
+            log_path = lavfi.split("log_path=")[1].split(":")[0]
+            Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 92.0}}}))
+        elif "-f" in args and args[args.index("-f") + 1] == "ivf":
+            Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    grid = [20, 32, 44]
+    with __import__("concurrent.futures", fromlist=["x"]).ThreadPoolExecutor(3) as ex:
+        list(ex.map(lambda c: enc._probe_one(0, 0, 90, c, 4), grid))
+
+    shard_cmds = [c for c in cmds if "ffv1" in c]
+    assert len(shard_cmds) == 1, "the shot was converted more than once"
+    # the RPU is applied while building the shard, on a Vulkan device
+    assert "-init_hw_device" in shard_cmds[0]
+    assert any("apply_dolbyvision=1" in a for a in shard_cmds[0])
+    assert shard_cmds[0][-1].startswith(str(cache))    # landed in the cache dir
+    # and the shard is released once the last CRF is done
+    assert not list(cache.iterdir())
+
+    # every probe encode AND every VMAF reference now reads the shard, not the
+    # raw ICtCp source - comparing against the unconverted source is meaningless
+    for c in cmds:
+        if "libsvtav1" in c or any("libvmaf=" in a for a in c):
+            assert str(enc.source) not in c
+
+
+def test_p5_shard_falls_back_to_workdir_when_cache_is_small(settings, info, plan, tmp_path,
+                                                            monkeypatch):
+    enc = _p5_encoder(settings, info, plan, tmp_path, tmp_path / "shm")
+    (tmp_path / "shm").mkdir()
+    assert enc._shard_dir(120) == tmp_path / "shm"
+    # a shot far too big for the tmpfs goes to the work dir instead
+    monkeypatch.setattr(opt.os, "statvfs",
+                        lambda p: types.SimpleNamespace(f_bavail=1, f_frsize=4096))
+    assert enc._shard_dir(120) == enc.tempdir
+
+
+def test_p5_final_encode_applies_rpu_inline(settings, info, plan, tmp_path):
+    """The final encode reads a shot exactly once, so there is nothing for a
+    shard to amortise - the RPU goes straight into the encoder."""
+    enc = _p5_encoder(settings, info, plan, tmp_path, tmp_path)
+    cmds = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc._encode_shot(0, 0, 90, 30.0, lp=4, threads=32, workers=1)
+    cmd = cmds[0]
+    assert "-init_hw_device" in cmd
+    assert "apply_dolbyvision=1" in cmd[cmd.index("-vf") + 1]
+    assert "ffv1" not in cmd                    # no staging file
+    assert str(enc.source) in cmd
+
+
+def test_non_p5_job_never_builds_a_shard(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._acquire_shard(0, 0, 90, []) is None
+    enc._release_shard(0)                       # must be a no-op, not a crash

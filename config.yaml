@@ -73,7 +73,12 @@ transcode:
   dovi:
     enabled: true
     save_rpu: true             # extract & archive RPU .bin
-    p5_method: libplacebo      # libplacebo (accurate, needs Vulkan) | zscale (approx)
+    p5_method: libplacebo      # 唯一选项：ffmpeg 里只有 libplacebo 能真正“应用”DV RPU。
+                               # 旧值 zscale 会被忽略并告警（那条链是空转换，且未编译进 ffmpeg）
+    vulkan_device: ""          # libplacebo 用的 Vulkan 设备（-init_hw_device 选择器）。
+                               # 空=自动：有 GPU 用 GPU，没有退回 llvmpipe 软件渲染
+    p5_cache_dir: /dev/shm     # optimizer 引擎逐镜头转换的分片存放处(tmpfs=不落盘)。
+                               # 放不下的镜头自动退回 dirs.work
     strip_rpu: true            # strip RPU/EL from P7/P8 streams before encode
 
   # Netflix-style shot-based encoding engine (select per preset via
