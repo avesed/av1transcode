@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from loguru import logger
 
@@ -525,32 +525,77 @@ def run_full_transcode(
             shutil.rmtree(t, ignore_errors=True)
 
 
-def _parse_master_display(md: str) -> Optional[dict]:
-    """Parse mkvmerge-style mastering display string into coordinate fields.
+def _md_number(token: str, scale: float, real_limit: float) -> float:
+    """One mastering-display number, normalised to real units.
 
-    Format: G(gx,gy)B(bx,by)R(rx,ry)WP(wx,wy)L(max,min)
-    Coordinates are in units of 0.00002; luminance in units of 0.0001 cd/m^2.
+    Three spellings reach us:
+      "11408507/16777216"  ffprobe side data, an arbitrary rational that IS
+                           already the real value (this is what an MKV HDR
+                           source reports at stream level)
+      "34000"              x265/mkvmerge integer units of 1/scale
+      "0.68"               already real
+    `real_limit` separates the last two: a chromaticity is always <= 1, a real
+    max luminance never reaches 10000 * ... , while the integer-unit spelling
+    of either is orders of magnitude larger.
+    """
+    if "/" in token:
+        num, den = token.split("/", 1)
+        den_f = float(den)
+        if den_f == 0:
+            raise ValueError(f"zero denominator in mastering display: {token}")
+        return float(num) / den_f
+    value = float(token)
+    return value / scale if value > real_limit else value
+
+
+def _md_fmt(value: float) -> str:
+    """Format a mastering-display number the way mkvpropedit will accept it.
+
+    mkvpropedit only parses plain decimal notation, while Python's str() flips
+    to scientific below 1e-4 - a min-luminance of 0.00005 becomes "5e-05" and
+    mkvpropedit then rejects the ENTIRE --set command ("The file has not been
+    modified"), so the file silently loses every colour tag, not just the
+    mastering display. Six decimals covers real luminance floors (1e-6 nits)
+    and rounds float noise out of the chromaticity coordinates.
+    """
+    text = f"{value:.6f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
+def _parse_master_display(md: str) -> Optional[dict]:
+    """Parse a mastering display string into mkvpropedit coordinate fields.
+
+    Format: G(gx,gy)B(bx,by)R(rx,ry)WP(wx,wy)L(max,min), where each number is
+    either an ffprobe rational, integer units of 0.00002 (chromaticity) /
+    0.0001 cd/m^2 (luminance), or a plain real. See _md_number.
     """
     m = re.match(
-        r"G\(([\d.]+),([\d.]+)\)B\(([\d.]+),([\d.]+)\)R\(([\d.]+),([\d.]+)\)"
-        r"WP\(([\d.]+),([\d.]+)\)L\(([\d.]+),([\d.]+)\)",
-        md,
+        r"G\(([\d./]+),([\d./]+)\)B\(([\d./]+),([\d./]+)\)R\(([\d./]+),([\d./]+)\)"
+        r"WP\(([\d./]+),([\d./]+)\)L\(([\d./]+),([\d./]+)\)",
+        md.strip(),
     )
     if not m:
         return None
-    gx, gy, bx, by, rx, ry, wx, wy, lmax, lmin = (float(v) for v in m.groups())
-    return {
-        "chromaticity-coordinates-green-x": gx / 50000,
-        "chromaticity-coordinates-green-y": gy / 50000,
-        "chromaticity-coordinates-blue-x": bx / 50000,
-        "chromaticity-coordinates-blue-y": by / 50000,
-        "chromaticity-coordinates-red-x": rx / 50000,
-        "chromaticity-coordinates-red-y": ry / 50000,
-        "white-coordinates-x": wx / 50000,
-        "white-coordinates-y": wy / 50000,
-        "max-luminance": lmax / 10000,
-        "min-luminance": lmin / 10000,
-    }
+    gx, gy, bx, by, rx, ry, wx, wy, lmax, lmin = m.groups()
+    try:
+        coords = [_md_number(t, 50000, 1.0)
+                  for t in (gx, gy, bx, by, rx, ry, wx, wy)]
+        # a real display peak is 100-10000 nits; the same figure in 1/10000
+        # units is >= 1e6. A real display floor is always well under 1 nit.
+        max_l = _md_number(lmax, 10000, 10000.0)
+        # a real display floor is 0.0001-0.05 nits; the integer-unit spelling of
+        # the same figure is >= 1, so anything above half a nit is unit-scaled.
+        min_l = _md_number(lmin, 10000, 0.5)
+    except (ValueError, ZeroDivisionError):
+        return None
+    names = ("chromaticity-coordinates-green-x", "chromaticity-coordinates-green-y",
+             "chromaticity-coordinates-blue-x", "chromaticity-coordinates-blue-y",
+             "chromaticity-coordinates-red-x", "chromaticity-coordinates-red-y",
+             "white-coordinates-x", "white-coordinates-y")
+    fields: Dict[str, float] = dict(zip(names, coords))
+    fields["max-luminance"] = max_l
+    fields["min-luminance"] = min_l
+    return fields
 
 
 def _colorpropedit_hdr(settings: Settings, output: Path, plan: TranscodePlan) -> None:
@@ -577,11 +622,17 @@ def _colorpropedit_hdr(settings: Settings, output: Path, plan: TranscodePlan) ->
         ]
     if md:
         fields = _parse_master_display(md)
+        if not fields:
+            # Don't ship an HDR10 file with no mastering display at all just
+            # because the source spelled it in a form we could not read: the
+            # configured default is a far better answer than nothing.
+            fallback = settings.transcode.hdr.default_master_display
+            logger.warning("Could not parse master-display string {!r}; "
+                           "falling back to the configured default", md)
+            fields = _parse_master_display(fallback) if fallback else None
         if fields:
             for name, value in fields.items():
-                cmd += ["--set", f"{name}={value}"]
-        else:
-            logger.warning("Could not parse master-display string: {}", md)
+                cmd += ["--set", f"{name}={_md_fmt(value)}"]
     if cll:
         try:
             max_cll, max_fall = (float(v) for v in str(cll).split(","))
@@ -590,7 +641,15 @@ def _colorpropedit_hdr(settings: Settings, output: Path, plan: TranscodePlan) ->
         except ValueError:
             logger.warning("Could not parse MaxCLL string: {}", cll)
     try:
-        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=120)
+        # NB: mkvpropedit is all-or-nothing - one rejected --set value aborts
+        # the whole edit and the file keeps NO colour tags at all, so the
+        # result has to be checked rather than discarded.
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True,
+                              timeout=120)
+        if proc.returncode != 0:
+            logger.warning(
+                "mkvpropedit did not tag {} (rc={}): {} - the output keeps no "
+                "HDR colour metadata", output.name, proc.returncode,
+                ((proc.stdout or "") + (proc.stderr or "")).strip()[-300:])
     except Exception as e:  # noqa: BLE001
         logger.warning("mkvpropedit failed (ignored): {}", e)

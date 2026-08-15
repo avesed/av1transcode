@@ -136,3 +136,90 @@ def test_optimizer_user_settings_roundtrip(settings):
     assert reloaded.transcode.optimizer.probe_preset == 11
     assert reloaded.transcode.optimizer.probe_scale == "1280x720"
     assert reloaded.transcode.optimizer.max_shots == 100
+
+# ---- HDR10 mastering display parsing ----
+# Every spelling that reaches us in practice must land on the same real values.
+MD_CASES = {
+    # config default / x265 / mkvmerge: integer units of 1/50000 and 1/10000
+    "integer_units": "G(13250,34500)B(7500,3000)R(34000,16000)"
+                     "WP(15635,16450)L(10000000,1)",
+    # ffprobe side data on an mp4 source: rationals over a fixed denominator
+    "ffprobe_mp4": "G(13250/50000,34500/50000)B(7500/50000,3000/50000)"
+                   "R(34000/50000,16000/50000)WP(15635/50000,16450/50000)"
+                   "L(10000000/10000,1/10000)",
+    # ffprobe side data on an MKV source: rationals over arbitrary denominators
+    "ffprobe_mkv": "G(2222981/8388608,11576279/16777216)"
+                   "B(5033165/33554432,16106127/268435456)"
+                   "R(11408507/16777216,5368709/16777216)"
+                   "WP(10492471/33554432,689963/2097152)"
+                   "L(1000/1,209800/2098000053)",
+    # SVT-AV1 / plain real numbers
+    "real": "G(0.265,0.690)B(0.150,0.060)R(0.680,0.320)"
+            "WP(0.3127,0.3290)L(1000,0.0001)",
+}
+
+
+@pytest.mark.parametrize("name", sorted(MD_CASES))
+def test_parse_master_display_all_spellings(name):
+    from app.transcoder import _parse_master_display
+
+    f = _parse_master_display(MD_CASES[name])
+    assert f is not None, f"{name} failed to parse"
+    assert f["chromaticity-coordinates-green-x"] == pytest.approx(0.265, abs=1e-4)
+    assert f["chromaticity-coordinates-green-y"] == pytest.approx(0.690, abs=1e-4)
+    assert f["chromaticity-coordinates-blue-x"] == pytest.approx(0.150, abs=1e-4)
+    assert f["chromaticity-coordinates-red-x"] == pytest.approx(0.680, abs=1e-4)
+    assert f["white-coordinates-x"] == pytest.approx(0.3127, abs=1e-4)
+    assert f["white-coordinates-y"] == pytest.approx(0.3290, abs=1e-4)
+    assert f["max-luminance"] == pytest.approx(1000.0, rel=1e-4)
+    assert f["min-luminance"] == pytest.approx(0.0001, abs=1e-6)
+
+
+def test_parse_master_display_rejects_garbage():
+    from app.transcoder import _parse_master_display
+
+    assert _parse_master_display("not a display string") is None
+    assert _parse_master_display("") is None
+    # a malformed rational must not raise out of the parser
+    assert _parse_master_display(
+        "G(1/0,1/2)B(1/2,1/2)R(1/2,1/2)WP(1/2,1/2)L(1000,0.1)") is None
+
+
+def test_md_fmt_never_uses_scientific_notation():
+    """mkvpropedit is all-or-nothing: it rejects "5e-05" and then applies NONE
+    of the --set values, so the output silently keeps no colour tags at all."""
+    from app.transcoder import _md_fmt
+
+    assert _md_fmt(0.0001) == "0.0001"
+    assert _md_fmt(0.00005) == "0.00005"
+    assert _md_fmt(9.999999747378462e-05) == "0.0001"   # float noise from an mkv
+    assert _md_fmt(1000.0) == "1000.0"
+    assert _md_fmt(0.26499998569488525) == "0.265"
+    assert _md_fmt(0.0) == "0.0"
+    for v in (0.0, 1e-7, 1e-5, 0.0001, 0.265, 1000.0, 10000.0):
+        assert "e" not in _md_fmt(v).lower(), v
+
+
+def test_colorpropedit_falls_back_when_display_unparseable(settings, monkeypatch, tmp_path):
+    """An unreadable source string must not cost the file its mastering
+    display: the configured default is better than nothing."""
+    from app import transcoder
+    from app.decisions import TranscodePlan
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(transcoder.subprocess, "run", fake_run)
+    monkeypatch.setattr(transcoder.Settings, "tool_path", lambda self, n: f"/usr/bin/{n}")
+    out = tmp_path / "o.mkv"
+    out.touch()
+    plan = TranscodePlan()
+    plan.color_trc = "smpte2084"
+    plan.master_display = "totally unparseable"
+    transcoder._colorpropedit_hdr(settings, out, plan)
+    joined = " ".join(seen["cmd"])
+    assert "chromaticity-coordinates-green-x=0.265" in joined
+    assert "max-luminance=1000.0" in joined
