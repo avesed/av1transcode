@@ -81,17 +81,22 @@ transcode:
   # probes every shot in PARALLEL at a grid of CRFs, interpolates a fine-grained
   # per-shot CRF to hit target_quality, then encodes all shots in parallel.
   optimizer:
-    probe_crfs: [20, 24, 28, 32, 36, 40, 44, 48]  # CRF grid probed per shot
-    probe_preset: 10             # fast SVT-AV1 preset for probe encodes
-    probe_scale: "960x540"       # probe resolution (scaled for speed)
-    probing_rate: 1              # probe every nth frame of each shot
-    probe_max_frames: 1200       # 每镜头探测帧数上限(长镜头自动加大取样间隔，防 y4m 爆盘/爆缓存)
+    probe_crfs: [20, 26, 32, 38, 44]  # CRF grid probed per shot
+    probe_preset: 10             # fast SVT-AV1 preset for probe encodes (4K 下 SVT 自动降到 9)
+    probe_scale: ""              # 空=按源分辨率探测。填了就等于用另一个分辨率的 RD 曲线
+                                 # 去挑 CRF，4K 实测会把 CRF 20..44 压成 5 个 VMAF 点
+    probing_rate: 1              # probe every nth frame of each shot (>1 会低估质量)
+    probe_max_frames: 120        # 每镜头探测帧数上限；超长镜头取中间一段连续帧，不做抽帧
     vmaf_model: /usr/share/model/vmaf_v0.6.1.json
     # SSIMULACRA2 需要带 ssimulacra2 的 libvmaf（官方 libvmaf 2.3.1 不带）。
     # 可填 version=ssimulacra2（libvmaf 已编译进该模型时）或 path=/path/to/ssimulacra2.json
     ssimulacra2_model: version=ssimulacra2
-    vmaf_threads: 0              # 0 = auto
-    probe_workers: 0             # parallel probe workers across shots (0 = cpu count)
+    vmaf_width: 1920             # 送进 libvmaf 前把两路都缩到这个宽度(只缩不放，保持比例)。
+                                 # vmaf_v0.6.1 是 1080p 训练的，直接测 4K 超出模型适用范围
+    vmaf_threads: 0              # 0 = auto(核数/probe_workers)。libvmaf 自己的默认是单线程，
+                                 # 在 4K 上比它要测的探测编码还慢(7.0s vs 8 线程 2.1s，分数一样)
+    probe_workers: 0             # parallel probe workers across shots (0=自动按内存: 内存/8,
+                                 # 4K 探测实例实测峰值 3.5GB)
     encode_workers: 0            # 并行正式编码实例数 (0=自动按内存: 内存/8, 防 4K 多实例 OOM)
     encode_threads: 0            # 每实例分配的 CPU 核数 (0=自动=核数/实例数, taskset 绑定)
     scenedetect_threshold: 27.0  # PySceneDetect ContentDetector sensitivity
@@ -99,6 +104,9 @@ transcode:
     scenedetect_scale: "-2:540"  # 4K 分镜前先用 ffmpeg 降采样(帧号1:1)，避免 OpenCV 逐帧解 4K 卡死
     max_shots: 3000              # cap; shortest shots merged past this
     max_crf_delta: 4.0           # 相邻镜头 CRF 差上限(0=关闭)，避免质量跳变
+    min_crf: 0                   # CRF 硬下限(0=用 probe_crfs 最小值)。目标不可达时每个镜头都会
+                                 # 掉到网格最低 CRF，这正是文件反而变大的原因，设这个可以兜底
+    probe_crf_offset: 0.0        # 探测用的 preset 比正式编码快，会低估成品质量；正值把这部分偏差换回体积
     fractional_crf: false        # pass decimal CRF to SVT-AV1 (needs support)
     keep_probes: false           # keep per-shot probe files for debugging
 

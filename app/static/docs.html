@@ -92,9 +92,9 @@
   <tr><td><code>target_quality</code></td><td>空</td><td>分场景质量目标。av1an 引擎：VMAF 区间如 <code>75-85</code>，每个场景用串行二分探测调 CRF。optimizer 引擎：并行探测 + 插值，取区间下限为目标。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probes</code></td><td>0</td><td>分场景探测次数上限（0 = av1an 默认 4）。越多越准越慢。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probing_rate</code></td><td>0</td><td>探测时每隔 n 帧取一帧算 VMAF（1 = 全部帧）；n&gt;4 通常不可用。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>probe_res</code></td><td>空</td><td>探测用分辨率（如 <code>960x540</code>），缩小后探测更快。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>probe_res</code></td><td>空</td><td>探测用分辨率，覆盖 <code>probe_scale</code>。<b>建议留空</b>：探测分辨率与正式编码不同，等于用另一条 RD 曲线挑 CRF，选出来的值不成立。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probing_vmaf_features</code></td><td>空</td><td>探测用 VMAF 特征组合，如 <code>default motionless</code>、<code>weighted neg</code>。<b>仅 av1an 引擎</b>生效；optimizer 引擎忽略该值（ffmpeg libvmaf 无法解析 av1an 语法，默认 VMAF 特征已够用）。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>vmaf_threads</code></td><td>0</td><td>探测阶段 VMAF 计算线程数（0 = 自动）。<span class="tag adv">进阶</span></td></tr>
+  <tr><td><code>vmaf_threads</code></td><td>0</td><td>探测阶段 VMAF 计算线程数（0 = 自动 = 核数/probe_workers）。ffmpeg libvmaf 自身默认是单线程，4K 下比它要测的探测编码还慢。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>probe_video_params</code></td><td>空</td><td>探测阶段编码参数，建议更快 preset 如 <code>preset=10</code>；<code>copy</code> = 与正式编码相同。<span class="tag adv">进阶</span></td></tr>
   <tr><td><code>additional_video_params</code></td><td>空</td><td>原样透传给 SVT-AV1 的额外参数，空格分隔，如 <code>--sharpness 1</code>。<span class="tag adv">进阶</span></td></tr>
 </table>
@@ -108,26 +108,29 @@
 <p>Netflix 风格的逐镜头（shot-based）编码。av1an 的 <code>--target-quality</code> 是<b>串行</b>探测：先完整探测完一个 chunk 再探测下一个。optimizer 引擎改为<b>所有镜头并行探测</b>，并用插值获得比 av1an 4 次二分更精细的每镜头 CRF：</p>
 <ol>
   <li><b>分镜</b>：PySceneDetect ContentDetector 把源切成若干镜头（shot）。</li>
-  <li><b>并行探测</b>：用 <code>probe_workers</code> 个 worker 同时探测每个镜头的一串 CRF（<code>probe_crfs</code>），每个探测点快速编码 + 算 VMAF/SSIMULACRA2。探测分辨率默认 960x540（<code>probe_scale</code>），可每隔 n 帧取样（<code>probing_rate</code>）。</li>
+  <li><b>并行探测</b>：用 <code>probe_workers</code> 个 worker 同时探测每个镜头的一串 CRF（<code>probe_crfs</code>），每个探测点按<b>源分辨率、源位深、与正式编码相同的编码参数</b>（仅 preset 更快）编码，再算 VMAF/SSIMULACRA2。送进 libvmaf 前两路统一缩到 <code>vmaf_width</code>（默认 1920，只缩不放、保持比例），因为 vmaf_v0.6.1 是按 1080p 训练的。镜头过长时按 <code>probe_max_frames</code> 取中间一段<b>连续</b>帧。</li>
   <li><b>选 CRF</b>：对每个镜头在 (CRF, 分数) 曲线上插值，取命中 <code>target_quality</code> 下限的 CRF（区间超出探测范围时钳制到边界）。</li>
   <li><b>并行编码</b>：所有镜头按各自 CRF 并行正式编码，最后拼接并重新复用源音频/字幕。</li>
 </ol>
 <p>启用方式：预设（设置页或 CLI <code>--custom engine=optimizer</code>）里设 <code>engine=optimizer</code>，并配合 <code>target_quality</code>（必填，如 <code>75</code> 或 <code>75-85</code>）。自定义参数同样适用：<code>--custom engine=optimizer --custom target_quality=80 --custom target_metric=ssimulacra2</code>。</p>
 <table>
   <tr><th>配置</th><th>默认</th><th>说明</th></tr>
-  <tr><td><code>probe_crfs</code></td><td>[20,24,28,32,36,40,44,48]</td><td>每个镜头采样的 CRF 网格；越密越准、探测越多。</td></tr>
-  <tr><td><code>probe_preset</code></td><td>10</td><td>探测编码的 SVT-AV1 速度档（快、失真略大）。</td></tr>
-  <tr><td><code>probe_scale</code></td><td>960x540</td><td>探测分辨率；空 = 源分辨率。</td></tr>
-  <tr><td><code>probing_rate</code></td><td>1</td><td>探测每隔 n 帧取一帧。</td></tr>
-  <tr><td><code>probe_max_frames</code></td><td>1200</td><td>每镜头探测帧数上限。长镜头（单镜头数分钟）会在 probe_scale 下生成数 GB 的临时 y4m 并被每个 CRF 反复读取，撑爆磁盘/内存缓存；超过上限会自动加大取样间隔。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>probe_workers</code></td><td>0</td><td>跨镜头的并行探测/编码数；0 = 全部 CPU 核。</td></tr>
+  <tr><td><code>probe_crfs</code></td><td>[20,26,32,38,44]</td><td>每个镜头采样的 CRF 网格；越密越准、探测越多。探测按源分辨率跑，每多一个点就多一遍全片探测。</td></tr>
+  <tr><td><code>probe_preset</code></td><td>10</td><td>探测编码的 SVT-AV1 速度档。注意 SVT-AV1 在 4K 及以上（RA 模式）最高只到 M9，填 10+ 实际按 9 跑。比正式 preset 快必然低估成品质量，用 <code>probe_crf_offset</code> 补。</td></tr>
+  <tr><td><code>probe_scale</code></td><td>空</td><td>探测分辨率；<b>空 = 源分辨率（推荐）</b>。填了就是在另一个分辨率上测 RD 曲线：4K HDR 实测 960x540 会把 CRF 20..44 压成 5 个 VMAF 点、整条曲线封顶在 91 以下，于是任何 &gt;91 的目标都会让每个镜头掉到网格最低 CRF，成品反而比源更大。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>probing_rate</code></td><td>1</td><td>探测每隔 n 帧取一帧。&gt;1 会拉大相邻帧间距、让帧间预测变难，从而低估质量；控制探测开销请优先用 <code>probe_max_frames</code>。</td></tr>
+  <tr><td><code>probe_max_frames</code></td><td>120</td><td>每镜头探测帧数上限。探测按源分辨率编码，数分钟的长镜头会让每个 CRF 都花上几分钟的 4K 编码；超过上限时取镜头<b>中间一段连续帧</b>（不抽帧，抽帧会歪曲结果）。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>probe_workers</code></td><td>0</td><td>跨镜头的并行探测数。探测已改为按源分辨率编码，单实例 4K 实测峰值 3.5GB，所以按内存限而不是按核数：0 = 自动（总内存/8）。<span class="tag core">核心</span></td></tr>
   <tr><td><code>encode_workers</code></td><td>0</td><td>并行<b>正式编码</b>实例数。每个 4K 实例持有独立帧池（实测 preset6/lp6 约 8GB，与线程数无关），所以实例数必须按内存限：0 = 自动（总内存/8，总编码内存压在半数以下）。<span class="tag core">核心</span></td></tr>
   <tr><td><code>encode_threads</code></td><td>0</td><td>每个编码实例分配的 CPU 核数，用 taskset 绑定互不重叠的核心区间，防止多实例线程超订互抢。SVT-AV1 在 4K 下会自发 80+ 线程且无视 <code>-threads</code>，此值<b>不降低单实例内存</b>，只控制并发。0 = 自动（核数/实例数）。</td></tr>
   <tr><td><code>scenedetect_threshold</code></td><td>27.0</td><td>ContentDetector 灵敏度；越高分镜越少、片段越长。</td></tr>
   <tr><td><code>min_scene_len</code></td><td>24</td><td>最小镜头长度（帧），更短的会合并。</td></tr>
   <tr><td><code>max_shots</code></td><td>3000</td><td>镜头数量上限；超过时合并最短的相邻镜头。</td></tr>
   <tr><td><code>max_crf_delta</code></td><td>4.0</td><td>相邻镜头 CRF 差上限（0=关闭）。每个镜头独立命中目标可能导致相邻镜头 CRF 跳变（如 22→31）造成观感不连续；平滑后限制差值。代价是部分镜头可能略低于目标。</td></tr>
-  <tr><td><code>vmaf_threads</code></td><td>0</td><td>VMAF 计算线程数。</td></tr>
+  <tr><td><code>min_crf</code></td><td>0</td><td>CRF 硬下限（0 = 用 <code>probe_crfs</code> 最小值）。目标质量不可达时每个镜头都会回落到网格最低 CRF——这正是文件反而变大的机制；设一个下限可以兜底。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>probe_crf_offset</code></td><td>0.0</td><td>加在插值出的 CRF 上。探测用的 preset 比正式编码快，会低估成品质量；正值把这部分偏差换回体积。</td></tr>
+  <tr><td><code>vmaf_width</code></td><td>1920</td><td>送进 libvmaf 前把<b>两路</b>都缩到的宽度（只缩不放、保持比例，非 16:9 源不会被压扁）。vmaf_v0.6.1 按 1080p、3H 视距训练，直接拿 4K 或 540p 去测都在模型适用范围之外。0 = 按原分辨率比。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>vmaf_threads</code></td><td>0</td><td>VMAF 计算线程数；0 = 自动（核数/probe_workers）。ffmpeg libvmaf 自身默认单线程，4K 下实测 7.0s vs 8 线程 2.1s（分数一致）。</td></tr>
   <tr><td><code>vmaf_model</code></td><td>/usr/share/model/vmaf_v0.6.1.json</td><td>VMAF 模型。也接受 <code>version=…</code>。</td></tr>
   <tr><td><code>ssimulacra2_model</code></td><td>version=ssimulacra2</td><td>SSIMULACRA2 模型。注意：官方 libvmaf 2.3.1 <b>不含</b> ssimulacra2，需自备兼容模型（<code>path=/x/ssimulacra2.json</code>）或带 ssimulacra2 的 libvmaf。</td></tr>
   <tr><td><code>fractional_crf</code></td><td>false</td><td>把小数 CRF 传给 SVT-AV1（更精细；需编码器支持）。</td></tr>

@@ -107,27 +107,48 @@ class OptimizerSettings(BaseModel):
     """
     # CRF grid sampled per shot during probing. Denser = more accurate CRF
     # selection but more probe encodes. Probes run in parallel across shots.
-    probe_crfs: List[int] = Field(default_factory=lambda: [20, 24, 28, 32, 36, 40, 44, 48])
-    # Fast SVT-AV1 preset used for the probe encodes.
+    # Probes encode at source resolution, so each extra grid point costs a full
+    # extra pass over every shot; 5 well-spread points interpolate fine.
+    probe_crfs: List[int] = Field(default_factory=lambda: [20, 26, 32, 38, 44])
+    # Fast SVT-AV1 preset used for the probe encodes. NB: SVT-AV1 clamps to M9
+    # for 4K and above in random-access mode, so 10+ behaves as 9 there. The
+    # probe preset is always faster than the final one, which makes the probe
+    # under-report quality a little - see probe_crf_offset.
     probe_preset: int = 10
-    # Probe resolution "WxH" (scaled down for fast probes). Empty = source res.
-    probe_scale: str = "960x540"
-    # Only probe every nth frame (1 = all frames of each shot).
+    # Probe resolution "WxH". Empty (recommended) = probe at source resolution.
+    # Setting this encodes the probes at a DIFFERENT resolution than the final
+    # encode, so the CRF that hits the target on the probe does not hit it on
+    # the real encode - measured on 4K HDR, a 960x540 probe compressed CRF
+    # 20..44 into 5 VMAF points and capped the whole curve below 91.
+    probe_scale: str = ""
+    # Only probe every nth frame (1 = all frames of each shot). Values > 1 widen
+    # the gap between consecutive frames, making inter prediction artificially
+    # hard, so the probe under-reports quality: prefer probe_max_frames to bound
+    # probing cost.
     probing_rate: int = 1
-    # Cap on frames extracted per shot for probing. Long shots (e.g. a single
-    # minutes-long take) would otherwise produce multi-GB probe y4m files at
-    # probe_scale that get re-read for every CRF, ballooning disk + page cache.
-    # When a shot exceeds this, the probe sampling rate is raised accordingly.
-    probe_max_frames: int = 1200
+    # Cap on frames probed per shot. Probes encode at source resolution, so a
+    # minutes-long take would cost minutes of 4K encoding per CRF. Shots longer
+    # than this are probed over a contiguous window taken from their middle
+    # (not subsampled - see probing_rate).
+    probe_max_frames: int = 120
     # libvmaf model configs. Accepts "path=/x.json", "version=NAME", or a bare
     # path (wrapped as path=...). Note: stock libvmaf <= 2.3.1 has no
     # ssimulacra2 model; a patched libvmaf or a ssimulacra2.json is required
     # for target_metric=ssimulacra2.
     vmaf_model: str = "/usr/share/model/vmaf_v0.6.1.json"
     ssimulacra2_model: str = "version=ssimulacra2"
-    # Probe worker threads for the VMAF calculation (0 = encoder decides).
+    # Both libvmaf inputs are downscaled to at most this width (aspect
+    # preserved, never upscaled) before the comparison. vmaf_v0.6.1 is trained
+    # on 1080p at 3H viewing distance; scoring a 4K pair with it is outside the
+    # model's domain. 0 = compare at native resolution.
+    vmaf_width: int = 1920
+    # Threads for the libvmaf calculation. 0 = auto (cores / probe_workers).
+    # NB: ffmpeg's own libvmaf default is single-threaded, which now costs more
+    # than the probe encode it measures (7.0s vs 2.1s at 8 threads, same score).
     vmaf_threads: int = 0
-    # Parallel probe/encode workers across shots (0 = os.cpu_count()).
+    # Parallel probe workers across shots. Probes now encode at source
+    # resolution, so each instance holds a multi-GB frame pool at 4K just like
+    # the final encode (measured 3.5GB at 4K). 0 = auto (total_mem / 8).
     probe_workers: int = 0
     # Parallel FINAL ENCODE instances. Separate from probe_workers because a
     # single SVT-AV1 encode of 4K uses several GB regardless of thread count
@@ -158,6 +179,17 @@ class OptimizerSettings(BaseModel):
     # keeps |CRF[i] - CRF[i+1]| <= max_crf_delta. May lower some shots a
     # little below target to keep the picture continuous.
     max_crf_delta: float = 4.0
+    # Hard floor on the CRF any shot may be assigned (0 = the bottom of
+    # probe_crfs). When target_quality is out of reach - which is easy to do at
+    # 4K against an already-compressed source - every such shot otherwise falls
+    # back to the lowest probed CRF, i.e. the most expensive setting available,
+    # and the output ends up larger than the source.
+    min_crf: int = 0
+    # Added to every interpolated CRF before clamping. The probes run at
+    # probe_preset while the delivery runs at the (slower, better) preset, so
+    # the probe under-reports the quality the final encode will actually
+    # deliver; a positive offset trades that bias back for size. 0 = off.
+    probe_crf_offset: float = 0.0
     # Pass decimal CRF values to SVT-AV1 (finer than integer CRF granularity).
     # SVT-AV1 must accept fractional --crf for this to work.
     fractional_crf: bool = False

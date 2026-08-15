@@ -19,7 +19,6 @@ ffmpeg's libvmaf filter, so both go through identical plumbing.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import shutil
@@ -164,14 +163,26 @@ def parse_score(json_path: Path, metric: str) -> float:
         mean = pooled[metric].get("mean")
         if mean is not None:
             return float(mean)
-    if pooled:
-        first = next(iter(pooled.values()))
-        mean = first.get("mean")
+    # Fall back to the only metric present, but ONLY if there is exactly one.
+    # A default VMAF run pools integer_adm2, integer_motion2, integer_vif_* and
+    # vmaf together, so picking "the first one" for an unknown metric name
+    # returns integer_adm2 (~0.95) as if it were a 0-100 score: every shot then
+    # reads far below any target, every shot falls back to the lowest CRF, and
+    # the output balloons. Fail loudly instead.
+    if len(pooled) == 1:
+        mean = next(iter(pooled.values())).get("mean")
         if mean is not None:
             return float(mean)
     agg = data.get("aggregateVMAF")
     if agg is not None:
         return float(agg)
+    if pooled:
+        raise TranscodeError(
+            f"{json_path} has no '{metric}' metric; libvmaf reported "
+            f"{sorted(pooled)}. Check transcode.optimizer."
+            f"{'ssimulacra2_model' if metric == 'ssimulacra2' else 'vmaf_model'} "
+            f"- the configured model does not produce '{metric}'."
+        )
     raise TranscodeError(f"could not parse {metric} score from {json_path}")
 
 
@@ -226,7 +237,16 @@ class ShotEncoder:
         self.opt = settings.transcode.optimizer
         self.ffmpeg = settings.tool_path("ffmpeg")
 
-        self.fps = float(info.fps or 25.0)
+        # Every shot boundary is converted from a frame number to a -ss
+        # timestamp with this, so a made-up frame rate silently encodes the
+        # wrong parts of the source. Refuse rather than guess 25.
+        if not info.fps or info.fps <= 0:
+            raise TranscodeError(
+                f"engine=optimizer needs a frame rate for {self.source.name} but "
+                "ffprobe reported none (avg_frame_rate and r_frame_rate are both "
+                "unset). Use engine=av1an for this source."
+            )
+        self.fps = float(info.fps)
         self.total_frames = int(self.fps * max(info.duration, 0.0)) or 1
 
         self.metric = self.video.target_metric
@@ -243,11 +263,13 @@ class ShotEncoder:
         self._proc_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._log_handle = open(log_path, "a", buffering=1) if log_path else None
-        # per-shot y4m cache: path + refcount + lock so each shot is decoded once
-        self._cache: Dict[int, _ShotCacheEntry] = {}
-        self._cache_lock = threading.Lock()
         # one-time warning for av1an-style probing_vmaf_features
         self._feature_warned = False
+        # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads)
+        self._probe_worker_count = 1
+        # pool-thread -> core slice index, for taskset affinity (see _worker_slot)
+        self._slots: Dict[int, int] = {}
+        self._slot_lock = threading.Lock()
         # (peak_mb, command) of the heaviest child this phase, for diagnostics
         self._heaviest_cmd: Tuple[float, str] = (0.0, "")
 
@@ -281,15 +303,20 @@ class ShotEncoder:
             pct = min(max(pct, 0.0), 100.0)
             self.progress_cb(pct, {"pct": pct, "done": done, "total": total, "fps": fps})
 
-    def _svt_lp(self, workers: int) -> int:
-        """Bound SVT-AV1 threads per parallel encoder instance.
+    # SVT-AV1 only accepts a level of parallelism in [0, 6]; anything higher is
+    # clamped with a warning on every single probe. It is also the main driver
+    # of per-instance memory at 4K, since it sizes the picture buffer pool.
+    MAX_LP = 6
 
-        N encoders run in parallel (probe/encode); giving each the full core
-        count spawns N x cores threads and can exhaust RAM on large machines.
-        Scale per-instance threads so total stays near the core count.
+    def _svt_lp(self, workers: int) -> int:
+        """Bound SVT-AV1 parallelism per parallel probe instance.
+
+        N encoders run at once; giving each the full core count spawns
+        N x cores threads and can exhaust RAM on large machines. Scale
+        per-instance parallelism so the total stays near the core count.
         """
         cores = os.cpu_count() or 1
-        return max(1, min(cores, round(cores / max(1, workers))))
+        return max(1, min(cores, self.MAX_LP, round(cores / max(1, workers))))
 
     @staticmethod
     def _ram_gb() -> int:
@@ -302,16 +329,49 @@ class ShotEncoder:
             return 8
         return 8
 
+    def _megapixels(self) -> float:
+        px = (self.info.width or 0) * (self.info.height or 0)
+        return max(0.5, px / 1e6) if px else 2.0
+
+    def _est_encode_gb(self) -> float:
+        """Peak RSS of ONE final-encode instance, in GB.
+
+        SVT-AV1's picture buffer pool dominates, and it scales with frame size,
+        which the old flat "ram_gb // 8" rule ignored entirely. Measured on this
+        codebase's defaults (preset 4, 10-bit, 144-frame shots, uncontended):
+
+            3840x1920  9.2GB @ lp=6   7.25GB @ lp=4
+            1920x960   2.6GB @ lp=6   2.50GB @ lp=4
+            1280x640   1.8GB @ lp=6   1.64GB @ lp=4
+
+        0.8 + 0.9/Mpx tracks the lp<=4 column and stays slightly above every
+        measured point, which is the right side to err on for an OOM guard.
+        """
+        return 0.8 + 0.9 * self._megapixels()
+
+    def _est_probe_gb(self) -> float:
+        """Same, for a probe instance: probe_preset is far faster and lp is
+        smaller, measured 3.5GB at 4K against 9.2GB for the final encode."""
+        return 0.5 + 0.5 * self._megapixels()
+
+    def _mem_bounded_workers(self, per_instance_gb: float) -> int:
+        """How many encoder instances fit in RAM, with headroom.
+
+        75% of total memory: the rest is the OS, page cache for a multi-GB
+        source read, and whatever else shares the box. Also capped at cores//4,
+        because throughput saturates long before that anyway - measured at 4K on
+        32 cores, 3 workers already reach 23.8fps and 4 or 6 add nothing.
+        """
+        cores = os.cpu_count() or 1
+        budget = self._ram_gb() * 0.75
+        return max(1, min(int(budget / max(0.5, per_instance_gb)),
+                          max(1, cores // 4)))
+
     def _encode_workers(self, num_shots: int) -> int:
-        """Final-encode concurrency. Each SVT-AV1 instance has a private frame
-        buffer pool costing several GB at 4K regardless of thread count
-        (measured ~8GB at preset 6 / lp=6), so workers are bounded by RAM, not
-        cores. Default scales from total memory (ram_gb // 8 keeps total encode
-        memory under ~half of RAM)."""
+        """Final-encode concurrency, bounded by RAM rather than cores."""
         w = self.opt.encode_workers
         if not w or w <= 0:
-            cores = os.cpu_count() or 1
-            w = max(1, min(cores, max(1, self._ram_gb() // 8)))
+            w = self._mem_bounded_workers(self._est_encode_gb())
         return max(1, min(w, num_shots))
 
     def _encode_threads(self, workers: int) -> int:
@@ -340,12 +400,35 @@ class ShotEncoder:
             start, end = 0, threads - 1
         return ["taskset", "-c", f"{start}-{end}"]
 
+    def _worker_slot(self, workers: int) -> int:
+        """Stable 0..workers-1 slot for the calling pool thread.
+
+        Core ranges must be keyed on the WORKER, not the shot index: shots
+        finish out of order, so `shot_idx % workers` puts two concurrent
+        encoders on the same core slice while another slice sits idle.
+        ThreadPoolExecutor reuses its threads, so one slot per thread ident is
+        stable for the whole phase.
+        """
+        tid = threading.get_ident()
+        with self._slot_lock:
+            slot = self._slots.get(tid)
+            if slot is None:
+                slot = len(self._slots) % max(1, workers)
+                self._slots[tid] = slot
+            return slot
+
     def _encode_lp(self, workers: int) -> int:
-        """SVT-AV1 lookahead (lp) for the FINAL encode. lp scales the frame
-        buffer pool that dominates 4K memory, so back it off when many
-        instances run to keep workers x per-instance memory within RAM."""
+        """SVT-AV1 level of parallelism for the FINAL encode.
+
+        lp sizes the frame buffer pool that dominates 4K memory, and the top of
+        its range does not pay for itself: at 4K the picture buffer count jumps
+        from 107 (lp=4) to 305 (lp=6) for no throughput gain. Measured with 3
+        parallel workers on 32 cores, lp=4 was both lighter and marginally
+        faster than lp=6 (23.8fps / 21.2GB vs 23.3fps / 22.4GB), and one
+        instance alone drops from 9.2GB to 7.25GB. So cap at 4, not 6.
+        """
         cores = os.cpu_count() or 1
-        return max(1, min(cores, round(cores / max(1, workers)), 6))
+        return max(1, min(cores, round(cores / max(1, workers)), 4))
 
     def _check_cancel(self) -> None:
         if self.cancel_flag and self.cancel_flag():
@@ -632,13 +715,22 @@ class ShotEncoder:
 
     # ---------- probe configuration ----------
     def _probe_grid(self) -> List[int]:
-        grid = list(self.opt.probe_crfs or [])
+        grid = sorted(set(self.opt.probe_crfs or []))
         if not grid:
             raise TranscodeError("transcode.optimizer.probe_crfs is empty")
         probes = self.video.probes
-        if probes and probes > 0:
-            grid = grid[:probes]
-        return sorted(grid)
+        if probes and 0 < probes < len(grid):
+            # Spread the allowed probes evenly and KEEP BOTH ENDPOINTS. Simply
+            # truncating (grid[:probes]) drops the high-CRF end, so any target
+            # cheaper than the surviving max is clamped to it and the "fewer
+            # probes" knob silently biases every shot towards a bigger file.
+            if probes == 1:
+                grid = [grid[len(grid) // 2]]
+            else:
+                last = len(grid) - 1
+                picks = {round(i * last / (probes - 1)) for i in range(probes)}
+                grid = [grid[j] for j in sorted(picks)]
+        return grid
 
     def _probe_preset(self) -> int:
         raw = (self.video.probe_video_params or "").strip()
@@ -658,24 +750,62 @@ class ShotEncoder:
         rate = self.video.probing_rate or self.opt.probing_rate
         return max(1, rate)
 
-    def _probe_rate_for(self, s0: int, s1: int) -> int:
-        """Effective probe sampling rate for a shot.
+    def _probe_window(self, s0: int, s1: int) -> Tuple[int, int]:
+        """The frame window of a shot that is actually probed.
 
-        A shot's probe frames are extracted to a y4m at probe_scale (default
-        960x540, ~0.8MB/frame). Long shots therefore balloon into multi-GB
-        temp files that get re-read for every CRF probe, blowing up disk +
-        page cache. Cap the number of frames actually probed (probe_max_frames)
-        by sampling more aggressively on long shots.
+        Probes now encode at the source resolution (see _probe_input), so a
+        minutes-long take would cost minutes of 4K encoding per CRF. Long shots
+        are therefore probed over a bounded CONTIGUOUS window taken from the
+        middle of the shot rather than by subsampling the whole of it:
+        subsampling widens the gap between consecutive frames, which makes
+        inter prediction artificially hard and biases the measured quality
+        downwards (i.e. towards a lower CRF and a larger file).
         """
         rate = self._probing_rate()
-        shot_frames = max(1, s1 - s0)
-        max_frames = max(1, self.opt.probe_max_frames)
-        if shot_frames // rate > max_frames:
-            rate = max(rate, math.ceil(shot_frames / max_frames))
-        return max(1, rate)
+        want = max(1, self.opt.probe_max_frames) * rate
+        n = max(1, s1 - s0)
+        if n <= want:
+            return s0, s1
+        start = s0 + (n - want) // 2
+        return start, start + want
+
+    def _pix_fmt(self) -> str:
+        """ffmpeg pixel format for probe + final encodes.
+
+        VideoParams spells 8-bit as "yuv420p8le", which is not an ffmpeg
+        format name; everything else passes through.
+        """
+        pf = self.video.pixel_format
+        return "yuv420p" if pf == "yuv420p8le" else pf
 
     def _vmaf_threads(self) -> int:
-        return self.video.vmaf_threads or self.opt.vmaf_threads
+        """Threads for the libvmaf calculation.
+
+        ffmpeg's libvmaf defaults n_threads to 0, which is single-threaded, and
+        the score is now computed on 1080p frames decoded from 4K sources - the
+        measurement ends up slower than the probe encode it is measuring (7.0s
+        vs 2.1s at n_threads=8 for the same clip, identical score). Auto-size it
+        to the cores each probe worker has to itself.
+        """
+        explicit = self.video.vmaf_threads or self.opt.vmaf_threads
+        if explicit:
+            return explicit
+        cores = os.cpu_count() or 1
+        return max(1, cores // max(1, self._probe_worker_count))
+
+    def _vmaf_scale_filter(self) -> str:
+        """scale filter applied to BOTH libvmaf inputs before comparison.
+
+        vmaf_v0.6.1 is trained on 1080p viewed at 3H; scoring a 4K (or a 540p)
+        pair with it is outside the model's domain and compresses the whole
+        CRF range into a couple of VMAF points. Downscale-only and
+        aspect-preserving: upscaling a smaller source would invent detail, and
+        forcing an exact WxH would distort non-16:9 sources (e.g. 3840x1920).
+        """
+        w = int(self.opt.vmaf_width or 0)
+        if w <= 0:
+            return ""
+        return f"scale=w='min(iw,{w})':h=-2:flags=bicubic"
 
     def _vmaf_features(self) -> str:
         return (self.video.probing_vmaf_features or "").strip()
@@ -696,55 +826,52 @@ class ShotEncoder:
         return f"path={raw}"
 
     # ---------- phase 2: parallel probing ----------
-    def _shot_cache(self, idx: int) -> "_ShotCacheEntry":
-        with self._cache_lock:
-            entry = self._cache.get(idx)
-            if entry is None:
-                entry = _ShotCacheEntry(self.probe_dir / f"shot_{idx:05d}.y4m")
-                self._cache[idx] = entry
-            entry.refs += 1
-            return entry
+    def _probe_input(self, w0: int, w1: int) -> Tuple[List[str], List[str]]:
+        """(input args, video filters) reading frames [w0, w1) of the source.
 
-    def _release_cache(self, idx: int) -> None:
-        with self._cache_lock:
-            entry = self._cache.get(idx)
-            if entry is None:
-                return
-            entry.refs -= 1
-            if entry.refs <= 0:
-                if not self.opt.keep_probes:
-                    entry.unlink()
-                self._cache.pop(idx, None)
-
-    def _extract_shot(self, idx: int, s0: int, s1: int, path: Path) -> None:
-        start = s0 / self.fps
-        dur = (s1 - s0) / self.fps
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", f"{start:.6f}", "-i", str(self.source), "-t", f"{dur:.6f}"]
-        vf = []
+        Used identically by the probe encode and by the VMAF reference read, so
+        the two are frame-aligned by construction and there is no multi-GB y4m
+        intermediate to cache: at 4K 10-bit a y4m frame is 22MB, and the frames
+        would have to be re-read once per CRF anyway.
+        """
+        args = ["-ss", f"{w0 / self.fps:.6f}", "-t", f"{(w1 - w0) / self.fps:.6f}",
+                "-i", str(self.source)]
+        vf: List[str] = []
+        rate = self._probing_rate()
+        if rate > 1:
+            # sample every nth frame by re-timing to fps/rate. Note: the
+            # select='not(mod(n,N))' filter does NOT reliably drop frames on
+            # ffmpeg master, while fps= cleanly subsamples.
+            vf.append(f"fps={self.fps / rate:g}")
         scale = self._probe_scale()
         if scale:
             vf.append(f"scale={scale}")
-        rate = self._probe_rate_for(s0, s1)
-        if rate > 1:
-            # sample every nth frame by re-timing to fps/rate. Note: the
-            # select='not(mod(n,N))' filter does NOT drop frames when piping
-            # to yuv4mpegpipe on ffmpeg master (1799/1800 frames kept), while
-            # fps= cleanly subsamples (900/1800).
-            vf.append(f"fps={self.fps / rate:g}")
-        if vf:
-            args += ["-vf", ",".join(vf)]
-        args += ["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", str(path)]
-        self._run(args, timeout=1800)
-        if path.exists():
-            size_mb = path.stat().st_size / 1024 / 1024
-            self._mem_log(f"[mem] shot {idx:05d} probe y4m={size_mb:.1f}MB "
-                          f"(frames {s1 - s0}, probe rate {rate})", level="debug")
+        return args, vf
+
+    def _probe_workers(self, n_tasks: int) -> int:
+        """Probe concurrency.
+
+        Probes encode at the source resolution now, so each SVT-AV1 instance
+        holds a frame buffer pool of the same order as the final encode and the
+        limit is RAM, not cores: a 4K probe measured 3.5GB peak RSS, against
+        ~166MB for the old 540p probes.
+        """
+        w = self.opt.probe_workers
+        if not w or w <= 0:
+            w = self._mem_bounded_workers(self._est_probe_gb())
+        return max(1, min(w, n_tasks))
 
     def probe_all(self, shots: List[Shot], grid: List[int]) -> ProbeSamples:
-        workers = self.opt.probe_workers or os.cpu_count() or 1
-        workers = max(1, min(workers, len(shots) * len(grid) or 1))
+        workers = self._probe_workers(len(shots) * len(grid) or 1)
+        self._probe_worker_count = workers
         lp = self._svt_lp(workers)
+        scale = self._probe_scale()
+        if scale:
+            logger.warning(
+                "optimizer: probe_scale={!r} makes the probes encode at a "
+                "different resolution than the final encode, so the CRF picked "
+                "from them does not transfer. Leave it empty unless you are "
+                "trading accuracy for speed on purpose.", scale)
         tasks = [(i, s0, s1, crf) for i, (s0, s1) in enumerate(shots) for crf in grid]
         results: ProbeSamples = {}
         done_shots = 0
@@ -775,35 +902,47 @@ class ShotEncoder:
         return results
 
     def _probe_one(self, idx: int, s0: int, s1: int, crf: int, lp: int) -> Tuple[int, int, float]:
-        entry = self._shot_cache(idx)
-        try:
-            self._check_cancel()
-            with entry.lock:
-                if not entry.path.exists():
-                    self._extract_shot(idx, s0, s1, entry.path)
-            if not entry.path.exists():
-                raise TranscodeError(f"shot {idx} extraction produced no frames")
-            ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
-            args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", str(entry.path), "-c:v", "libsvtav1",
-                    "-preset", str(self._probe_preset()), "-crf", str(crf),
-                    "-svtav1-params", f"lp={lp}",
-                    "-pix_fmt", "yuv420p", "-f", "ivf", str(ivf)]
-            self._run(args, timeout=3600)
-            score = self._score_probe(entry.path, ivf, idx, crf)
-            if not self.opt.keep_probes:
-                try:
-                    ivf.unlink()
-                except OSError:
-                    pass
-            return idx, crf, score
-        finally:
-            self._release_cache(idx)
+        self._check_cancel()
+        w0, w1 = self._probe_window(s0, s1)
+        ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
+        in_args, vf = self._probe_input(w0, w1)
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"] + in_args
+        if vf:
+            args += ["-vf", ",".join(vf)]
+        # the probe must use the same encoder configuration as the final encode
+        # (tune, film grain, keyint, extra params) or it measures a different
+        # rate-distortion curve than the one that gets delivered. Only the
+        # preset differs, for speed.
+        svt = _svt_params_dict(self.video)
+        svt["lp"] = lp
+        args += ["-map", "0:v:0", "-c:v", "libsvtav1",
+                 "-preset", str(self._probe_preset()), "-crf", str(crf)]
+        if self.video.keyint:
+            args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]
+        args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items()),
+                 "-pix_fmt", self._pix_fmt(), "-f", "ivf", str(ivf)]
+        self._run(args, timeout=3600)
+        score = self._score_probe(w0, w1, ivf, idx, crf)
+        if not self.opt.keep_probes:
+            try:
+                ivf.unlink()
+            except OSError:
+                pass
+        return idx, crf, score
 
-    def _score_probe(self, ref: Path, dist: Path, idx: int, crf: int) -> float:
+    def _score_probe(self, w0: int, w1: int, dist: Path, idx: int, crf: int) -> float:
         out_json = self.probe_dir / f"score_{idx:05d}_{crf}.json"
+        # ts_sync_mode=nearest is NOT optional. The reference is read straight
+        # from the source container while the distorted side is an ivf carrying
+        # an exact frame-rate timebase, and matroska stores timestamps in whole
+        # milliseconds: at 23.976fps the rounded mkv PTS drift up to ~1ms either
+        # side of the ivf's, so framesync's default "nearest lower or equal"
+        # picks the PREVIOUS frame about half the time. Measured on a 1080p mkv,
+        # that one-frame slip scores 66.3 where the aligned pair scores 92.4 -
+        # a 26 point error, all of it in the direction of a lower CRF and a
+        # bigger file. Frame periods are ~42ms, so "nearest" cannot mis-pick.
         opts = [f"model={self._model_cfg()}", "log_fmt=json",
-                f"log_path={out_json}"]
+                f"log_path={out_json}", "shortest=1", "ts_sync_mode=nearest"]
         feats = self._vmaf_features()
         if feats:
             # av1an's --probing-vmaf-features uses its own CLI syntax
@@ -823,10 +962,25 @@ class ShotEncoder:
         n_threads = self._vmaf_threads()
         if n_threads:
             opts.append(f"n_threads={n_threads}")
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(ref), "-i", str(dist),
-                "-lavfi", f"[0:v][1:v]libvmaf={':'.join(opts)}",
-                "-f", "null", "-"]
+        # Input 0 is the DISTORTED encode and input 1 the REFERENCE source:
+        # ffmpeg's libvmaf takes #0 as main (distorted) and #1 as reference.
+        # Passing them the other way round makes libvmaf treat the encode as
+        # the reference - the motion feature is then measured on the smoothed
+        # encode and VIF sees detail being *added* rather than lost, which
+        # inflates and flattens the whole CRF curve (measured +5 VMAF at CRF 20
+        # and +18 at CRF 44 on 4K HDR10).
+        ref_args, ref_vf = self._probe_input(w0, w1)
+        scale = self._vmaf_scale_filter()
+        fmt = f"format={self._pix_fmt()}"
+        dist_chain = ",".join(f for f in (scale, fmt) if f)
+        # the reference goes through the same probe-side filters the distorted
+        # copy was encoded with, then both land on the same comparison raster.
+        ref_chain = ",".join(f for f in (*ref_vf, scale, fmt) if f)
+        lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
+                 f"[dist][ref]libvmaf={':'.join(opts)}")
+        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(dist)] + ref_args
+                + ["-lavfi", lavfi, "-f", "null", "-"])
         try:
             self._run(args, timeout=3600)
         except TranscodeError as e:
@@ -847,13 +1001,37 @@ class ShotEncoder:
         return score
 
     # ---------- phase 3: per-shot CRF selection ----------
+    def _crf_floor(self, grid_lo: int) -> float:
+        """Lowest CRF any shot may be assigned. Without min_crf this is just the
+        bottom of the probe grid, which pick_crf falls back to whenever the
+        target is unreachable - and at 4K that is the most expensive setting
+        there is."""
+        return float(max(grid_lo, self.opt.min_crf or 0))
+
     def pick_all_crfs(self, samples: ProbeSamples, grid: List[int]) -> Dict[int, float]:
+        lo, hi = min(grid), max(grid)
+        floor = self._crf_floor(lo)
+        offset = float(self.opt.probe_crf_offset or 0.0)
         chosen: Dict[int, float] = {}
+        unreachable: List[float] = []
         for idx, by_crf in samples.items():
-            pts = [(crf, score) for crf, score in by_crf.items()]
-            crf = pick_crf(pts, self.target)
-            crf = max(min(grid), min(crf, max(grid)))
-            chosen[idx] = crf
+            pts = [(crf, score) for crf, score in by_crf.items() if score is not None]
+            crf = pick_crf(pts, self.target) + offset
+            chosen[idx] = max(floor, min(crf, float(hi)))
+            best = max((s for _, s in pts), default=None)
+            if best is not None and best < self.target:
+                unreachable.append(best)
+        if unreachable:
+            logger.warning(
+                "optimizer: {}/{} shot(s) cannot reach {} {:g} even at CRF {} "
+                "(best probed score {:.1f}-{:.1f}); they fall back to CRF {:g}, "
+                "which is what inflates the output size. Lower target_quality, "
+                "extend probe_crfs downwards, or set optimizer.min_crf.",
+                len(unreachable), len(samples), self.metric, self.target, lo,
+                min(unreachable), max(unreachable), floor,
+            )
+            self._log(f"{len(unreachable)}/{len(samples)} shots below target "
+                      f"{self.metric} {self.target:g} at CRF {lo}")
         return chosen
 
     def smooth_chosen(self, chosen: Dict[int, float]) -> Dict[int, float]:
@@ -865,10 +1043,10 @@ class ShotEncoder:
         ordered_idx = sorted(chosen)
         smoothed = smooth_crfs([chosen[i] for i in ordered_idx], max_delta)
         grid = self._probe_grid()
-        lo, hi = min(grid), max(grid)
+        lo, hi = self._crf_floor(min(grid)), max(grid)
         out = {}
         for i, crf in zip(ordered_idx, smoothed):
-            out[i] = max(lo, min(crf, hi))
+            out[i] = max(lo, min(crf, float(hi)))
         return out
 
     # ---------- phase 4: parallel final encode ----------
@@ -877,6 +1055,8 @@ class ShotEncoder:
         threads = self._encode_threads(workers)
         lp = self._encode_lp(workers)
         ivf_paths: Dict[int, Path] = {}
+        with self._slot_lock:
+            self._slots.clear()
         done_frames = 0
         t0 = time.monotonic()
         self._heaviest_cmd = (0.0, "")
@@ -888,7 +1068,8 @@ class ShotEncoder:
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {
                     ex.submit(self._encode_shot, i, s0, s1,
-                              chosen.get(i, self.video.crf), lp, threads):
+                              chosen.get(i, self.video.crf), lp, threads,
+                              workers):
                     (i, s1 - s0) for i, (s0, s1) in enumerate(shots)}
                 for fut in as_completed(futs):
                     self._check_cancel()
@@ -910,14 +1091,14 @@ class ShotEncoder:
         return [ivf_paths[i] for i in range(len(shots))]
 
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int,
-                     threads: int) -> Path:
+                     threads: int, workers: int = 1) -> Path:
         dst = self.probe_dir / f"enc_{idx:05d}.ivf"
         start = s0 / self.fps
         # encode exactly (s1 - s0) frames: `-t` on input-seeked shots is not
         # frame-exact (off by a frame per shot), and 762 shots x 1 frame drift
         # = seconds of A/V desync once the audio is muxed whole. `-frames:v`
         # guarantees the exact frame count so the concat sums to the source.
-        args = self._affinity_prefix(idx, threads)
+        args = self._affinity_prefix(self._worker_slot(workers), threads)
         args += [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                  "-ss", f"{start:.6f}", "-i", str(self.source),
                  "-frames:v", str(s1 - s0),
@@ -928,7 +1109,7 @@ class ShotEncoder:
         svt = _svt_params_dict(self.video)
         svt["lp"] = lp
         args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items())]
-        args += ["-pix_fmt", self.video.pixel_format, "-f", "ivf", str(dst)]
+        args += ["-pix_fmt", self._pix_fmt(), "-f", "ivf", str(dst)]
         self._run(args, timeout=7200)
         if not dst.exists() or dst.stat().st_size == 0:
             raise TranscodeError(f"shot {idx} produced no output")
@@ -1050,18 +1231,3 @@ class ShotEncoder:
             self._report(100.0, self.total_frames, self.total_frames)
         finally:
             self.close()
-
-
-class _ShotCacheEntry:
-    """Ref-counted per-shot extracted frame file (decoded once per shot)."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.refs = 0
-        self.lock = threading.Lock()
-
-    def unlink(self) -> None:
-        try:
-            self.path.unlink()
-        except OSError:
-            pass

@@ -78,19 +78,19 @@
   </form>
 
   <h2>Shot-based 优化器引擎（engine=optimizer）</h2>
-  <p class="hint">Netflix 风格：PySceneDetect 分镜 → 所有片段<b>并行</b>探测一组 CRF → 插值出精细的每段 CRF → 并行编码 → 拼接。质量指标为 VMAF 或 SSIMULACRA2。探测/编码并行数来自 probe_workers（0=全部核心）。</p>
+  <p class="hint">Netflix 风格：PySceneDetect 分镜 → 所有片段<b>并行</b>探测一组 CRF → 插值出精细的每段 CRF → 并行编码 → 拼接。质量指标为 VMAF 或 SSIMULACRA2。探测在<b>源分辨率</b>下进行（探测分辨率与正式编码不一致会让选出的 CRF 失真），送进 VMAF 前两路统一缩到 vmaf_width。probe_workers=0 时按内存自动。</p>
   <form class="editor open" id="optimizerForm" style="margin-bottom:24px">
     <div class="grid">
       <div class="field">
         <label>probe_crfs（探测 CRF 网格，逗号分隔）</label>
-        <input type="text" id="o-probe_crfs" placeholder="20,24,28,32,36,40,44,48">
+        <input type="text" id="o-probe_crfs" placeholder="20,26,32,38,44">
       </div>
       <div class="field">
         <label>probe_preset（探测编码速度，越快越失真）</label>
         <input type="number" id="o-probe_preset" min="0" max="13">
       </div>
       <div class="field">
-        <label>probe_scale（探测分辨率，如 960x540）</label>
+        <label>probe_scale（留空=源分辨率，建议留空；填了 CRF 映射会失真）</label>
         <input type="text" id="o-probe_scale">
       </div>
       <div class="field">
@@ -98,11 +98,11 @@
         <input type="number" id="o-probing_rate" min="1" max="10">
       </div>
       <div class="field">
-        <label>probe_max_frames（每镜头探测帧数上限，防长镜头 y4m 爆内存）</label>
-        <input type="number" id="o-probe_max_frames" min="60">
+        <label>probe_max_frames（每镜头探测帧数上限，超长镜头取中间一段连续帧）</label>
+        <input type="number" id="o-probe_max_frames" min="24">
       </div>
       <div class="field">
-        <label>probe_workers（并行探测数，0=全部核心）</label>
+        <label>probe_workers（并行探测数，0=按内存自动）</label>
         <input type="number" id="o-probe_workers" min="0" max="256">
       </div>
       <div class="field">
@@ -128,6 +128,18 @@
       <div class="field">
         <label>max_crf_delta（相邻镜头 CRF 差上限，0=关闭平滑）</label>
         <input type="number" id="o-max_crf_delta" min="0" step="0.5">
+      </div>
+      <div class="field">
+        <label>min_crf（CRF 硬下限，0=用 probe_crfs 最小值。目标不可达时兜底防文件变大）</label>
+        <input type="number" id="o-min_crf" min="0" max="63">
+      </div>
+      <div class="field">
+        <label>probe_crf_offset（补偿探测 preset 比正式编码快造成的低估，正值=更省体积）</label>
+        <input type="number" id="o-probe_crf_offset" step="0.5">
+      </div>
+      <div class="field">
+        <label>vmaf_width（送进 VMAF 前缩到的宽度，只缩不放；0=原分辨率。模型按 1080p 训练）</label>
+        <input type="number" id="o-vmaf_width" min="0" max="7680">
       </div>
       <div class="field">
         <label>vmaf_threads（VMAF 计算线程，0=自动）</label>
@@ -467,6 +479,9 @@ async function loadOptimizer() {
     $("o-min_scene_len").value = o.min_scene_len;
     $("o-max_shots").value = o.max_shots;
     $("o-max_crf_delta").value = o.max_crf_delta;
+    $("o-min_crf").value = o.min_crf;
+    $("o-probe_crf_offset").value = o.probe_crf_offset;
+    $("o-vmaf_width").value = o.vmaf_width;
     $("o-vmaf_threads").value = o.vmaf_threads;
     $("o-vmaf_model").value = o.vmaf_model;
     $("o-ssimulacra2_model").value = o.ssimulacra2_model;
@@ -487,7 +502,7 @@ $("optimizerForm").addEventListener("submit", async e => {
       probe_preset: parseInt($("o-probe_preset").value, 10),
       probe_scale: $("o-probe_scale").value.trim(),
       probing_rate: parseInt($("o-probing_rate").value, 10) || 1,
-      probe_max_frames: parseInt($("o-probe_max_frames").value, 10) || 1200,
+      probe_max_frames: parseInt($("o-probe_max_frames").value, 10) || 120,
       probe_workers: parseInt($("o-probe_workers").value, 10) || 0,
       encode_workers: parseInt($("o-encode_workers").value, 10) || 0,
       encode_threads: parseInt($("o-encode_threads").value, 10) || 0,
@@ -495,6 +510,9 @@ $("optimizerForm").addEventListener("submit", async e => {
       min_scene_len: parseInt($("o-min_scene_len").value, 10),
       max_shots: parseInt($("o-max_shots").value, 10),
       max_crf_delta: parseFloat($("o-max_crf_delta").value),
+      min_crf: parseInt($("o-min_crf").value, 10) || 0,
+      probe_crf_offset: parseFloat($("o-probe_crf_offset").value) || 0,
+      vmaf_width: parseInt($("o-vmaf_width").value, 10) || 0,
       vmaf_threads: parseInt($("o-vmaf_threads").value, 10) || 0,
       vmaf_model: $("o-vmaf_model").value.trim(),
       ssimulacra2_model: $("o-ssimulacra2_model").value.trim(),
