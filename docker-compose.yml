@@ -14,6 +14,7 @@ services:
     volumes:
       - ./media/input:/media/input
       - ./media/work:/media/work
+      - ./sample:/media/sample
       - av1data:/data
     environment:
       # Everything below can also be set in config.yaml
@@ -24,10 +25,21 @@ services:
       - MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
       - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       - TZ=Asia/Shanghai
-    # Optional: pass through a real GPU for hardware-accelerated libplacebo.
-    # device_filters: ["/dev/dri/renderD128"]
-    # group_add: ["render"]
-    shm_size: "2gb"
+    # Pass a real GPU through for hardware-accelerated libplacebo (the DV
+    # Profile 5 conversion is the only thing here that uses one; SVT-AV1 and
+    # libvmaf are CPU-only). The image ships Mesa's Intel and AMD Vulkan ICDs;
+    # NVIDIA additionally needs the NVIDIA Container Toolkit.
+    # NB: on a host WITH a GPU, drop the two MESA_/VK_ICD_FILENAMES lines above
+    # - they pin the loader to the software renderer and hide every real device.
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
+    #   - render
+    # /dev/shm holds the optimizer's per-shot Dolby Vision P5 shards
+    # (a lossless 4K shot is ~200MB and several are in flight at once),
+    # which keeps the DV path off disk entirely.
+    shm_size: "4gb"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
       interval: 30s
