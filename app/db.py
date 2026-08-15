@@ -147,8 +147,11 @@ class JobStore:
     def update(self, jid: str, **fields: Any) -> None:
         if not fields:
             return
+        # NB: these must be real column names - anything else is dropped without
+        # a word. "size_bytes" used to sit here in place of "size_before", so
+        # every job stored 0 for its source size and the API reported 0 too.
         allowed = {"status", "progress", "stage", "error", "meta", "params", "rpu_path",
-                   "output_path", "size_bytes", "size_after", "retries", "started_at",
+                   "output_path", "size_before", "size_after", "retries", "started_at",
                    "finished_at", "finalized_at",
                    "progress_fps", "progress_done", "progress_total"}
         f = {k: v for k, v in fields.items() if k in allowed}
