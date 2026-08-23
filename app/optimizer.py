@@ -899,15 +899,27 @@ class ShotEncoder:
         cores = os.cpu_count() or 1
         return max(1, cores // max(1, self._probe_worker_count))
 
+    def _use_4k_model(self) -> bool:
+        """Whether this source should be scored with the 4K VMAF model."""
+        if self.metric != "vmaf" or not self.opt.vmaf_model_4k:
+            return False
+        return (self.info.width or 0) >= int(self.opt.vmaf_4k_min_width or 0) > 0
+
     def _vmaf_scale_filter(self) -> str:
         """scale filter applied to BOTH libvmaf inputs before comparison.
 
-        vmaf_v0.6.1 is trained on 1080p viewed at 3H; scoring a 4K (or a 540p)
-        pair with it is outside the model's domain and compresses the whole
-        CRF range into a couple of VMAF points. Downscale-only and
+        vmaf_v0.6.1 is trained on 1080p viewed at 3H, so scoring a 4K (or a
+        540p) pair with it is outside the model's domain and compresses the
+        whole CRF range into a couple of points. Downscale-only and
         aspect-preserving: upscaling a smaller source would invent detail, and
         forcing an exact WxH would distort non-16:9 sources (e.g. 3840x1920).
+
+        Not applied when the 4K model is in use - that model IS trained for
+        this resolution, and downscaling to reach the 1080p model reads about
+        a point optimistic, which the encoder spends as lost sharpness.
         """
+        if self._use_4k_model():
+            return ""
         w = int(self.opt.vmaf_width or 0)
         if w <= 0:
             return ""
@@ -922,8 +934,12 @@ class ShotEncoder:
         Accepts either a plain file path (wrapped as path=...), or an explicit
         libvmaf model config such as "version=ssimulacra2" or "path=/x.json".
         """
-        raw = (self.opt.ssimulacra2_model if self.metric == "ssimulacra2"
-               else self.opt.vmaf_model)
+        if self.metric == "ssimulacra2":
+            raw = self.opt.ssimulacra2_model
+        elif self._use_4k_model():
+            raw = self.opt.vmaf_model_4k
+        else:
+            raw = self.opt.vmaf_model
         raw = (raw or "").strip()
         if not raw:
             raw = "version=vmaf_v0.6.1"

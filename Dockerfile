@@ -86,7 +86,9 @@ RUN git clone --depth 1 --branch ${VMAF_TAG} \
     cp -a /out/usr/local/lib/*.so* /out/lib/ && \
     cp -a /out/usr/local/lib/pkgconfig/*.pc /out/lib/pkgconfig/ && \
     cp -a /out/usr/local/include/libvmaf /out/include/ && \
-    cp -a /build/vmaf/model/vmaf_v0.6.1.json /out/share/model/ && \
+    # all of them: the 4k model is what a 4K source should be scored with,
+    # and neg is the variant that does not reward enhancement/sharpening
+    cp -a /build/vmaf/model/*.json /out/share/model/ && \
     cp -a /out/usr/local/bin/vmaf /out/bin/ 2>/dev/null; true
 
 # ---------- stage 4: ffmpeg 9.0.1 release (DV support) ----------

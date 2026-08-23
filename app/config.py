@@ -136,6 +136,14 @@ class OptimizerSettings(BaseModel):
     # ssimulacra2 model; a patched libvmaf or a ssimulacra2.json is required
     # for target_metric=ssimulacra2.
     vmaf_model: str = "/usr/share/model/vmaf_v0.6.1.json"
+    # Used instead of vmaf_model when the source is at least vmaf_4k_min_width
+    # wide, and then scored at NATIVE resolution rather than downscaled: the
+    # 0.6.1 model is trained for 1080p at 3H, the 4k model for 4K at 1.5H.
+    # Measured on 4K HDR, scoring downscaled with the 1080p model reads about a
+    # point optimistic against the 4k model and the gap widens with CRF (+0.13
+    # at CRF 26, +0.80 at 32, +1.63 at 38), which quietly costs sharpness.
+    vmaf_model_4k: str = "/usr/share/model/vmaf_4k_v0.6.1.json"
+    vmaf_4k_min_width: int = 2560
     ssimulacra2_model: str = "version=ssimulacra2"
     # Both libvmaf inputs are downscaled to at most this width (aspect
     # preserved, never upscaled) before the comparison. vmaf_v0.6.1 is trained

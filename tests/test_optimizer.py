@@ -833,3 +833,31 @@ def test_non_p5_job_never_builds_a_shard(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     assert enc._acquire_shard(0, 0, 90, []) is None
     enc._release_shard(0)                       # must be a no-op, not a crash
+
+
+# ---- 4K sources get the 4K model, scored at native resolution ----
+def test_4k_source_uses_4k_model_at_native_res(settings, info, plan, tmp_path):
+    """vmaf_v0.6.1 is trained for 1080p at 3H. Downscaling a 4K pair to reach it
+    reads optimistic (+0.80 at CRF 32, +1.63 at 38 measured), and the encoder
+    spends that as lost sharpness."""
+    info.width, info.height = 3840, 1920
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._use_4k_model()
+    assert enc._model_cfg() == "path=/usr/share/model/vmaf_4k_v0.6.1.json"
+    assert enc._vmaf_scale_filter() == ""          # native, no downscale
+
+
+def test_sub_4k_source_keeps_1080p_model_and_downscale(settings, info, plan, tmp_path):
+    info.width, info.height = 1920, 1080
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert not enc._use_4k_model()
+    assert enc._model_cfg() == "path=/usr/share/model/vmaf_v0.6.1.json"
+    assert enc._vmaf_scale_filter().startswith("scale=w='min(iw,1920)'")
+
+
+def test_4k_model_not_used_for_other_metrics(settings, info, plan, tmp_path):
+    info.width, info.height = 3840, 1920
+    plan.params.target_metric = "ssimulacra2"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert not enc._use_4k_model()
+    assert enc._model_cfg() == "version=ssimulacra2"
