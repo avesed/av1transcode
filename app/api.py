@@ -208,8 +208,14 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         _auth(request)
         from app.config import OptimizerSettings
 
+        # Merge onto the current settings rather than validating the body on
+        # its own: model_validate fills anything absent with its DEFAULT, so a
+        # form that posts a subset of the fields silently reset the rest. The
+        # settings page has always posted a subset, and every field added since
+        # was being wiped on each save.
+        merged = {**settings.transcode.optimizer.model_dump(), **(body or {})}
         try:
-            params = OptimizerSettings.model_validate(body)
+            params = OptimizerSettings.model_validate(merged)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(422, f"invalid optimizer settings: {e}")
         # persist (merge keeps workers / delete_source intact)

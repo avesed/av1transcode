@@ -223,3 +223,34 @@ def test_colorpropedit_falls_back_when_display_unparseable(settings, monkeypatch
     joined = " ".join(seen["cmd"])
     assert "chromaticity-coordinates-green-x=0.265" in joined
     assert "max-luminance=1000.0" in joined
+
+
+def test_optimizer_settings_put_merges_partial_body(settings, monkeypatch):
+    """The settings page posts a subset of the optimizer fields. Validating
+    that body on its own fills every absent field with its DEFAULT, so each
+    save silently reset whatever the form did not carry."""
+    from app.config import OptimizerSettings
+
+    current = OptimizerSettings(ssimulacra2_frame_step=8, vmaf_4k_min_width=3000,
+                                probe_preset=6)
+    body = {"probe_preset": 9}                     # what a partial form sends
+    merged = OptimizerSettings.model_validate({**current.model_dump(), **body})
+
+    assert merged.probe_preset == 9                # the posted field is applied
+    assert merged.ssimulacra2_frame_step == 8      # and the rest survives
+    assert merged.vmaf_4k_min_width == 3000
+
+
+def test_settings_page_covers_every_editable_optimizer_field():
+    """Fields the page cannot post are only safe because the API merges; the
+    ones a user is expected to tune should still be on the page."""
+    import re
+    from pathlib import Path
+
+    html = Path("app/static/settings.html").read_text()
+    body = html[html.index("const body = {"):]
+    posted = set(re.findall(r"^\s*(\w+):", body[:body.index("};")], re.M))
+    for field in ("probe_crfs", "min_crf", "probe_crf_offset", "vmaf_width",
+                  "vmaf_model_4k", "vmaf_4k_min_width", "ssimulacra2_frame_step"):
+        assert field in posted, f"{field} missing from the settings form"
+    assert 'value="xpsnr"' in html

@@ -130,6 +130,10 @@
   <tr><td><code>min_crf</code></td><td>0</td><td>CRF 硬下限（0 = 用 <code>probe_crfs</code> 最小值）。目标质量不可达时每个镜头都会回落到网格最低 CRF——这正是文件反而变大的机制；设一个下限可以兜底。<span class="tag core">核心</span></td></tr>
   <tr><td><code>probe_crf_offset</code></td><td>0.0</td><td>加在插值出的 CRF 上。探测用的 preset 比正式编码快，会低估成品质量；正值把这部分偏差换回体积。</td></tr>
   <tr><td><code>vmaf_width</code></td><td>1920</td><td>送进 libvmaf 前把<b>两路</b>都缩到的宽度（只缩不放、保持比例，非 16:9 源不会被压扁）。vmaf_v0.6.1 按 1080p、3H 视距训练，直接拿 4K 或 540p 去测都在模型适用范围之外。0 = 按原分辨率比。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>vmaf_model_4k</code></td><td>vmaf_4k_v0.6.1.json</td><td>源宽 ≥ <code>vmaf_4k_min_width</code> 时改用它，并按<b>原生分辨率</b>打分（不再缩到 <code>vmaf_width</code>）。0.6.1 是 1080p/3H 训练的、4k 模型是 4K/1.5H；实测缩到 1080p 打分偏乐观（CRF32 +0.80、CRF38 +1.63），代价是成品变糊。<span class="tag core">核心</span></td></tr>
+  <tr><td><code>vmaf_4k_min_width</code></td><td>2560</td><td>低于此宽度仍用 1080p 模型 + 降采样。</td></tr>
+  <tr><td><code>ssimulacra2_frame_step</code></td><td>4</td><td>仅 <code>target_metric=ssimulacra2</code>：打分侧每 n 帧取 1。SSIMULACRA2 是逐帧静态图像度量，抽帧在统计上成立——这和 <code>probing_rate</code> 完全不同，后者抽的是<b>编码</b>输入、会歪曲 RD 曲线。4K 实测 2.51fps（libvmaf 约 23fps），不抽帧一集要多花 8.3 小时，每 4 帧取 1 约 2.1 小时。</td></tr>
+  <tr><td><code>vszip_plugin</code> / <code>bestsource_plugin</code></td><td>/usr/local/lib/vapoursynth/…</td><td>支撑 SSIMULACRA2 的 VapourSynth 插件路径（镜像内已预置）。</td></tr>
   <tr><td><code>vmaf_threads</code></td><td>0</td><td>VMAF 计算线程数；0 = 自动（核数/probe_workers）。ffmpeg libvmaf 自身默认单线程，4K 下实测 7.0s vs 8 线程 2.1s（分数一致）。</td></tr>
   <tr><td><code>vmaf_model</code></td><td>/usr/share/model/vmaf_v0.6.1.json</td><td>VMAF 模型。也接受 <code>version=…</code>。</td></tr>
   <tr><td><code>ssimulacra2_model</code></td><td>version=ssimulacra2</td><td>SSIMULACRA2 模型。注意：官方 libvmaf 2.3.1 <b>不含</b> ssimulacra2，需自备兼容模型（<code>path=/x/ssimulacra2.json</code>）或带 ssimulacra2 的 libvmaf。</td></tr>
