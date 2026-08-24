@@ -99,9 +99,19 @@ transcode:
     vmaf_4k_min_width: 2560      # 低于这个宽度仍用 1080p 模型 + 降采样
                                  # 另可选 /usr/share/model/vmaf_v0.6.1neg.json：
                                  # neg 版不给"锐化/对比增强"送分，对判断"糊不糊"更诚实
-    # SSIMULACRA2 需要带 ssimulacra2 的 libvmaf（官方 libvmaf 2.3.1 不带）。
-    # 可填 version=ssimulacra2（libvmaf 已编译进该模型时）或 path=/path/to/ssimulacra2.json
-    ssimulacra2_model: version=ssimulacra2
+    # target_metric 可选 vmaf(默认) / ssimulacra2 / xpsnr：
+    #   vmaf        按分辨率自动选模型(见上)。注意上游至今没有 HDR 模型
+    #   ssimulacra2 经 VapourSynth + vszip 计算，对模糊/色带最敏感。实测 4K 上
+    #               CRF26→38 跨度 15.0 分，而 VMAF 只有 2.9 分(分辨力约 5 倍)，
+    #               但慢约 9 倍，所以按 ssimulacra2_frame_step 抽帧打分。
+    #               量纲不同：90+≈视觉无损、70-80≈高质量，目标值需重新定标
+    #   xpsnr       ffmpeg 内置，ITU 标准化，为 UHD/HDR 设计且很快。单位 dB，
+    #               社区经验 42dB 以上≈视觉无损(内容相关)，目标值同样要重定标
+    ssimulacra2_frame_step: 4    # 打分侧每 n 帧取 1(逐帧度量，抽帧统计上成立；
+                                 # 注意这和 probing_rate 不同——那个会歪曲 RD 曲线)
+    ssimulacra2_model: version=ssimulacra2   # 保留兼容，当前不再经 libvmaf
+    vszip_plugin: /usr/local/lib/vapoursynth/libvszip.so
+    bestsource_plugin: /usr/local/lib/vapoursynth/libbestsource.so
     vmaf_width: 1920             # 送进 libvmaf 前把两路都缩到这个宽度(只缩不放，保持比例)。
                                  # vmaf_v0.6.1 是 1080p 训练的，直接测 4K 超出模型适用范围
     vmaf_threads: 0              # 0 = auto(核数/probe_workers)。libvmaf 自己的默认是单线程，

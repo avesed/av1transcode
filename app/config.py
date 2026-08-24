@@ -60,9 +60,19 @@ class VideoParams(BaseModel):
     #               parallel per-shot encode and concat.
     engine: Literal["av1an", "optimizer"] = "av1an"
     # Quality metric used by the "optimizer" engine's probes.
-    #   vmaf        - Netflix VMAF (0-100, higher is better).
-    #   ssimulacra2 - SSIMULACRA2 via a libvmaf model (0-100, higher is better).
-    target_metric: Literal["vmaf", "ssimulacra2"] = "vmaf"
+    #   vmaf        - Netflix VMAF (0-100). Default. The model is picked from
+    #                 the source resolution, see OptimizerSettings.
+    #   ssimulacra2 - SSIMULACRA2 via VapourSynth + vszip (0-100, ~90+ is
+    #                 excellent). The most artifact-sensitive of the three, and
+    #                 the slowest: measured 2.51fps at 4K against ~23fps for
+    #                 libvmaf, so it scores every ssimulacra2_frame_step'th
+    #                 frame.
+    #   xpsnr       - ITU-standardised perceptually weighted PSNR, in dB, from
+    #                 ffmpeg's xpsnr filter. Designed for UHD/HDR and cheap.
+    #                 Roughly 42dB+ reads as visually lossless, but the
+    #                 threshold is content-dependent, so target_quality has to
+    #                 be recalibrated - it is a dB scale, not 0-100.
+    target_metric: Literal["vmaf", "ssimulacra2", "xpsnr"] = "vmaf"
     # Constant rate factor / quality. Lower = higher quality.
     crf: int = 28
     # SVT-AV1 preset, 0 (slowest/best) - 13 (fastest). 4-6 is a good range.
@@ -144,7 +154,21 @@ class OptimizerSettings(BaseModel):
     # at CRF 26, +0.80 at 32, +1.63 at 38), which quietly costs sharpness.
     vmaf_model_4k: str = "/usr/share/model/vmaf_4k_v0.6.1.json"
     vmaf_4k_min_width: int = 2560
+    # NB there is still no HDR model to select here: upstream vmaf carries nine
+    # models as of v3.2.0 and none of them is HDR, and no community model has
+    # taken hold either. PQ content is scored on its coded signal, which is
+    # self-consistent but not perceptually calibrated for HDR - target_metric
+    # xpsnr is the standardised option that was designed with HDR in mind.
     ssimulacra2_model: str = "version=ssimulacra2"
+    # SSIMULACRA2 is a per-frame still-image metric, so scoring a subset is
+    # statistically sound - unlike subsampling the ENCODE, which distorts the
+    # rate-distortion curve. At 4K it runs 2.51fps against ~23fps for libvmaf;
+    # every 4th frame keeps the metric affordable (measured ~2.1h per 45-minute
+    # episode against 8.3h unsubsampled). 1 = score every frame.
+    ssimulacra2_frame_step: int = 4
+    # VapourSynth plugins backing target_metric=ssimulacra2.
+    vszip_plugin: Path = Path("/usr/local/lib/vapoursynth/libvszip.so")
+    bestsource_plugin: Path = Path("/usr/local/lib/vapoursynth/libbestsource.so")
     # Both libvmaf inputs are downscaled to at most this width (aspect
     # preserved, never upscaled) before the comparison. vmaf_v0.6.1 is trained
     # on 1080p at 3H viewing distance; scoring a 4K pair with it is outside the

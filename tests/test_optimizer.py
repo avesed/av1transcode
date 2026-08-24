@@ -861,3 +861,84 @@ def test_4k_model_not_used_for_other_metrics(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     assert not enc._use_4k_model()
     assert enc._model_cfg() == "version=ssimulacra2"
+
+
+# ---- metric options: ssimulacra2 and xpsnr alongside vmaf ----
+def _metric_encoder(settings, info, plan, tmp_path, metric, cache=None):
+    plan.params.target_metric = metric
+    info.width, info.height = 3840, 1920
+    plan.colorspace, plan.color_trc, plan.color_primaries = "bt2020nc", "smpte2084", "bt2020"
+    if cache is not None:
+        settings.transcode.dovi.p5_cache_dir = cache
+    return make_encoder(settings, info, plan, tmp_path)
+
+
+def test_ssimulacra2_stages_a_reference_shard(settings, info, plan, tmp_path):
+    """bestsource indexes a whole file before serving frames, so the reference
+    must be a staged per-shot file rather than the multi-GB source."""
+    cache = tmp_path / "shm"
+    cache.mkdir()
+    enc = _metric_encoder(settings, info, plan, tmp_path, "ssimulacra2", cache)
+    assert enc._needs_shard()
+    cmds = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        if "ffv1" in args:
+            Path(args[-1]).write_bytes(b"shard")
+            return ""
+        if "app.vsmetrics" in args:
+            return "93.512\n"
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    _, _, score = enc._probe_one(0, 0, 90, 32, lp=4)
+    assert score == pytest.approx(93.512)
+
+    shard_cmd = [c for c in cmds if "ffv1" in c][0]
+    # a non-P5 shard carries no Dolby Vision filter, it is just the window
+    assert "-init_hw_device" not in shard_cmd
+    s2 = [c for c in cmds if "app.vsmetrics" in c][0]
+    assert s2[s2.index("--step") + 1] == "4"          # scoring-side subsample
+    # PQ has to be undone before a linear-light metric, not relabelled
+    assert s2[s2.index("--transfer") + 1] == "st2084"
+    assert s2[s2.index("--matrix") + 1] == "2020ncl"   # zimg spelling, not ffmpeg's
+
+
+def test_xpsnr_parses_weighted_luma(settings, info, plan, tmp_path):
+    enc = _metric_encoder(settings, info, plan, tmp_path, "xpsnr")
+    assert not enc._needs_shard()      # reads the source directly, like vmaf
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if any("xpsnr" in a for a in args):
+            return ("[Parsed_xpsnr_2 @ 0x1] XPSNR  y: 43.6691  u: 49.5918  "
+                    "v: 51.1706  (minimum: 43.6691)\n")
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    _, _, score = enc._probe_one(0, 0, 90, 32, lp=4)
+    assert score == pytest.approx(43.6691)
+
+
+def test_ssimulacra2_error_names_the_missing_plugins(settings, info, plan, tmp_path):
+    cache = tmp_path / "shm"
+    cache.mkdir()
+    enc = _metric_encoder(settings, info, plan, tmp_path, "ssimulacra2", cache)
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if "ffv1" in args:
+            Path(args[-1]).write_bytes(b"shard")
+            return ""
+        if "app.vsmetrics" in args:
+            raise opt.TranscodeError("boom")
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    with pytest.raises(Exception, match="vszip"):
+        enc._probe_one(0, 0, 90, 32, lp=4)

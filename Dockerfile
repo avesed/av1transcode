@@ -196,6 +196,38 @@ RUN git clone --depth 1 --branch ${VS_VERSION} \
     find /out -path "*site-packages*" -name "vapoursynth*" -exec cp -a {} /out/python/ \; 2>/dev/null; \
     cp -a /out/lib/vapoursynth.cpython-311-x86_64-linux-gnu.so /out/python/vapoursynth.cpython-311-x86_64-linux-gnu.so; true
 
+# ---------- stage 4c: VapourSynth plugins for target_metric=ssimulacra2 ----------
+# Prebuilt wheels rather than source builds: vszip is written in Zig (which
+# would mean shipping that toolchain) and bestsource's README only claims
+# FFmpeg 8.x support against the 9.0.1 built above. Both wheels carry a plain
+# plugin .so plus bundled deps, so nothing here links against our ffmpeg or
+# VapourSynth - verified loading into VapourSynth R73, which exposes
+# vszip.SSIMULACRA2(reference, distorted).
+FROM debian:bookworm-slim AS vsplugin-fetcher
+ARG VSZIP_VERSION=22.1.0
+ARG BESTSOURCE_VERSION=21.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates python3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN set -eu; \
+    base=https://files.pythonhosted.org; \
+    for pkg in "vapoursynth-vszip:${VSZIP_VERSION}:manylinux_2_17_x86_64" \
+               "vapoursynth-bestsource:${BESTSOURCE_VERSION}:manylinux_2_28_x86_64"; do \
+      name=${pkg%%:*}; rest=${pkg#*:}; ver=${rest%%:*}; plat=${rest#*:}; \
+      url=$(curl -fsSL "https://pypi.org/pypi/${name}/${ver}/json" \
+            | python3 -c "import json,sys;print(next(f['url'] for f in json.load(sys.stdin)['urls'] if '${plat}' in f['filename']))"); \
+      curl -fsSL -o "${name}.whl" "$url"; \
+      python3 -c "import zipfile;zipfile.ZipFile('${name}.whl').extractall('x')"; \
+    done; \
+    mkdir -p /out/vapoursynth; \
+    find x -name "*.so" -o -name "*.so.*" | while read -r f; do cp -a "$f" /out/vapoursynth/; done; \
+    ls -1 /out/vapoursynth/
+# vszip ships avx2/znver4 variants alongside the baseline; keep the baseline
+# under the plain name so it loads on any x86-64.
+RUN cd /out/vapoursynth && rm -f libvszip.zn4.so && \
+    if [ -f libvszip.avx2.so ]; then rm -f libvszip.avx2.so; fi && \
+    test -f libvszip.so && test -f libbestsource.so
+
 # ---------- stage 5: av1an ----------
 FROM rust:1-bookworm AS av1an-builder
 RUN apt-get update && apt-get install -y --no-install-recommends nasm pkg-config \
@@ -242,7 +274,12 @@ COPY --from=vmaf-builder /out/share/model/ /usr/share/model/
 COPY --from=av1an-builder /usr/local/bin/av1an /usr/local/bin/
 COPY --from=dovi-builder /usr/local/bin/dovi_tool /usr/local/bin/
 COPY --from=vapoursynth-builder /out/python/ /usr/local/lib/python3.11/dist-packages/
-ENV LD_LIBRARY_PATH=/usr/local/lib
+# VapourSynth plugins backing target_metric=ssimulacra2 (see stage 4c)
+COPY --from=vsplugin-fetcher /out/vapoursynth/ /usr/local/lib/vapoursynth/
+# The plugin dir is on the library path too: the bestsource wheel carries
+# its own ffmpeg/lcms/dav1d and has no RPATH, so the loader has to be told
+# where those sit or the plugin fails to load.
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/vapoursynth
 ENV PYTHONPATH=/usr/local/lib/python3.11/dist-packages
 
 # Python scheduler + UI

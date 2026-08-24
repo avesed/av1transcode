@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -842,22 +843,39 @@ class ShotEncoder:
         and re-reading a small shard costs one libplacebo pass and leaves the
         repeat reads in page cache.
         """
-        from app import dovi  # local import avoids a cycle
+        pre: List[str] = []
+        chain: List[str] = list(vf)
+        if self._p5:
+            from app import dovi  # local import avoids a cycle
 
-        pre, chain = dovi.dv_apply_chain(self.settings)
+            pre, dv = dovi.dv_apply_chain(self.settings)
+            chain.append(dv)
         args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
                 "-ss", f"{w0 / self.fps:.6f}", "-t", f"{(w1 - w0) / self.fps:.6f}",
-                "-i", str(self.source), "-map", "0:v:0",
-                "-vf", ",".join([*vf, chain]),
-                "-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
-                "-an", "-sn", "-f", "matroska", str(dest)]
+                "-i", str(self.source), "-map", "0:v:0"]
+        if chain:
+            args += ["-vf", ",".join(chain)]
+        args += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
+                 "-an", "-sn", "-f", "matroska", str(dest)]
         self._run(args, timeout=3600)
         if not dest.exists() or dest.stat().st_size == 0:
             raise TranscodeError(f"DV shard for shot {idx} produced no output")
 
+    def _needs_shard(self) -> bool:
+        """Whether this job stages a per-shot reference file.
+
+        Two reasons, both requiring the same machinery: a Dolby Vision P5 base
+        layer has to have its RPU applied before it means anything, and
+        SSIMULACRA2 reads through bestsource, which indexes a whole file before
+        serving frames - pointing that at a multi-GB source once per probe
+        would be far more expensive than staging the window.
+        """
+        return self._p5 or self.metric == "ssimulacra2"
+
     def _acquire_shard(self, idx: int, w0: int, w1: int, vf: List[str]) -> Optional[Path]:
-        """Ref-counted converted shard for a shot, or None when not a P5 job."""
-        if not self._p5:
+        """Ref-counted staged reference shard for a shot, or None when the job
+        reads its reference straight from the source."""
+        if not self._needs_shard():
             return None
         with self._shard_lock:
             entry = self._shards.get(idx)
@@ -872,7 +890,7 @@ class ShotEncoder:
         return entry.path
 
     def _release_shard(self, idx: int) -> None:
-        if not self._p5:
+        if not self._needs_shard():
             return
         with self._shard_lock:
             entry = self._shards.get(idx)
@@ -1069,6 +1087,86 @@ class ShotEncoder:
 
     def _score_probe(self, w0: int, w1: int, dist: Path, idx: int, crf: int,
                      shard: Optional[Path] = None) -> float:
+        if self.metric == "ssimulacra2":
+            return self._score_ssimulacra2(w0, w1, dist, idx, crf, shard)
+        if self.metric == "xpsnr":
+            return self._score_xpsnr(w0, w1, dist, idx, crf, shard)
+        return self._score_vmaf(w0, w1, dist, idx, crf, shard)
+
+    # ---- colour description of the reference, for metrics that need it ----
+    # ffmpeg's colour names are not zimg's, and a wrong one is not a rounding
+    # error: "2020nc" is simply rejected, and mislabelling PQ as gamma would
+    # linearise with the wrong curve and measure something else entirely.
+    _ZIMG_MATRIX = {"bt709": "709", "bt2020nc": "2020ncl", "bt2020c": "2020cl",
+                    "smpte170m": "170m", "bt470bg": "470bg"}
+    _ZIMG_TRANSFER = {"bt709": "709", "smpte2084": "st2084",
+                      "arib-std-b67": "std-b67", "bt470bg": "470bg"}
+    _ZIMG_PRIMARIES = {"bt709": "709", "bt2020": "2020", "smpte170m": "170m"}
+
+    def _colour_args(self) -> List[str]:
+        """Matrix/transfer/primaries of the signal being compared, in zimg's
+        spelling. SSIMULACRA2 is defined on linear-light RGB, so the coded
+        transfer has to be undone before scoring."""
+        return [
+            "--matrix", self._ZIMG_MATRIX.get(self.plan.colorspace or "", "709"),
+            "--transfer", self._ZIMG_TRANSFER.get(self.plan.color_trc or "", "709"),
+            "--primaries", self._ZIMG_PRIMARIES.get(self.plan.color_primaries or "", "709"),
+            "--range", "full" if self.plan.color_range == "pc" else "limited",
+        ]
+
+    def _score_ssimulacra2(self, w0: int, w1: int, dist: Path, idx: int,
+                           crf: int, shard: Optional[Path]) -> float:
+        if shard is None:
+            raise TranscodeError(
+                "target_metric=ssimulacra2 needs a staged reference shard; "
+                "this is a bug in the probe path")
+        args = [sys.executable, "-m", "app.vsmetrics", str(shard), str(dist),
+                "--step", str(max(1, self.opt.ssimulacra2_frame_step)),
+                "--vszip", str(self.opt.vszip_plugin),
+                "--bestsource", str(self.opt.bestsource_plugin),
+                "--threads", str(self._vmaf_threads()),
+                *self._colour_args()]
+        try:
+            out = self._run(args, timeout=3600)
+        except TranscodeError as e:
+            raise TranscodeError(
+                f"{e}\nHint: target_metric=ssimulacra2 needs the VapourSynth "
+                f"vszip and bestsource plugins ({self.opt.vszip_plugin}, "
+                f"{self.opt.bestsource_plugin}). libvmaf cannot compute "
+                "SSIMULACRA2 itself.") from e
+        try:
+            score = float(out.strip().splitlines()[-1])
+        except (ValueError, IndexError) as e:
+            raise TranscodeError(f"could not parse SSIMULACRA2 output: {out[-300:]}") from e
+        self._log(f"shot {idx:05d} crf {crf} ssimulacra2={score:.3f}")
+        return score
+
+    def _score_xpsnr(self, w0: int, w1: int, dist: Path, idx: int,
+                     crf: int, shard: Optional[Path]) -> float:
+        """ffmpeg's xpsnr filter: a dB scale, not 0-100. Weighted luma is what
+        the ITU work reports, so that is what is returned."""
+        if shard is not None:
+            ref_args, ref_vf = ["-i", str(shard)], []
+        else:
+            ref_args, ref_vf = self._probe_input(w0, w1)
+        fmt = f"format={self._pix_fmt()}"
+        dist_chain = fmt
+        ref_chain = ",".join(f for f in (*ref_vf, fmt) if f)
+        lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
+                 f"[dist][ref]xpsnr=shortest=1")
+        args = ([self.ffmpeg, "-hide_banner", "-y", "-loglevel", "info",
+                 "-i", str(dist)] + ref_args
+                + ["-lavfi", lavfi, "-f", "null", "-"])
+        out = self._run(args, timeout=3600)
+        m = re.findall(r"XPSNR\s+y:\s*([0-9.]+)", out)
+        if not m:
+            raise TranscodeError(f"could not parse XPSNR output: {out[-300:]}")
+        score = float(m[-1])
+        self._log(f"shot {idx:05d} crf {crf} xpsnr={score:.3f}dB")
+        return score
+
+    def _score_vmaf(self, w0: int, w1: int, dist: Path, idx: int, crf: int,
+                    shard: Optional[Path]) -> float:
         out_json = self.probe_dir / f"score_{idx:05d}_{crf}.json"
         # ts_sync_mode=nearest is NOT optional. The reference is read straight
         # from the source container while the distorted side is an ivf carrying
