@@ -85,6 +85,31 @@ def pick_crf(samples: List[Tuple[int, float]], target: float) -> float:
     return float(min(pts, key=lambda p: abs(p[1] - target))[0])
 
 
+def predict_score(samples: List[Tuple[int, float]], crf: float) -> Optional[float]:
+    """The score the probes predict at `crf`, interpolated the way pick_crf
+    inverts. Returns None when there is nothing to interpolate.
+
+    Used to compare what the probe grid promised against what the finished
+    encode actually delivers, which is the only way the probe-side biases
+    (a faster probe preset, a 120-frame probe window, linear interpolation on
+    a curved rate-distortion relationship) become a number rather than a guess.
+    """
+    pts = sorted((c, sc) for c, sc in samples if sc is not None)
+    if not pts:
+        return None
+    if crf <= pts[0][0]:
+        return float(pts[0][1])
+    if crf >= pts[-1][0]:
+        return float(pts[-1][1])
+    for (c_lo, s_lo), (c_hi, s_hi) in zip(pts, pts[1:]):
+        if c_lo <= crf <= c_hi:
+            if c_hi == c_lo:
+                return float(s_lo)
+            t = (crf - c_lo) / (c_hi - c_lo)
+            return float(s_lo + t * (s_hi - s_lo))
+    return float(pts[-1][1])
+
+
 def smooth_crfs(crfs: List[float], max_delta: float, iterations: int = 32) -> List[float]:
     """Bound the CRF jump between adjacent shots to <= max_delta.
 
@@ -935,6 +960,50 @@ class ShotEncoder:
                 pass
         return self.tempdir
 
+    def _seek(self, frame: int) -> str:
+        """-ss value that reliably lands ON `frame`, never past it.
+
+        -ss discards frames whose timestamp is below the one asked for, and
+        containers store those rounded - Matroska keeps whole milliseconds
+        while a 23.976fps frame time is an infinite decimal - so asking for a
+        frame's exact time lands just above its stored timestamp often enough
+        to skip it. Measured against per-frame hashes of a real 16-shot split,
+        6 of 16 shots began one frame late. Half a frame of lead cannot
+        overshoot: the preceding frame is a whole period further back, against
+        at most 0.5ms of rounding (8x the margin even at 119.88fps, 42x at
+        23.976). Measured after the change: 0 of 16 shots slip.
+        """
+        return f"{max(0.0, (frame - 0.5) / self.fps):.6f}"
+
+    def _extract_window(self, w0: int, w1: int, dest: Path, *,
+                        source: Optional[Path] = None,
+                        vf: Optional[List[str]] = None,
+                        apply_dv: bool = False) -> None:
+        """Copy frames [w0, w1) of `source` (default: the encode input) into a
+        lossless file.
+
+        -ss + -frames:v, the same frame-exact pairing the final encode uses; a
+        `-t` duration here is what let windows come out a frame short.
+        """
+        pre: List[str] = []
+        chain: List[str] = list(vf or [])
+        if apply_dv:
+            from app import dovi  # local import avoids a cycle
+
+            pre, dv = dovi.dv_apply_chain(self.settings)
+            chain.append(dv)
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
+                "-ss", self._seek(w0), "-i", str(source or self.source),
+                "-frames:v", str(w1 - w0), "-map", "0:v:0"]
+        if chain:
+            args += ["-vf", ",".join(chain)]
+        args += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
+                 "-an", "-sn", "-f", "matroska", str(dest)]
+        self._run(args, timeout=3600)
+        if not dest.exists() or dest.stat().st_size == 0:
+            raise TranscodeError(
+                f"extracting frames [{w0}, {w1}) produced no output")
+
     def _make_shard(self, idx: int, w0: int, w1: int, vf: List[str], dest: Path) -> None:
         """Apply the DV RPU to frames [w0, w1) and store them losslessly.
 
@@ -943,23 +1012,10 @@ class ShotEncoder:
         and re-reading a small shard costs one libplacebo pass and leaves the
         repeat reads in page cache.
         """
-        pre: List[str] = []
-        chain: List[str] = list(vf)
-        if self._p5:
-            from app import dovi  # local import avoids a cycle
-
-            pre, dv = dovi.dv_apply_chain(self.settings)
-            chain.append(dv)
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
-                "-ss", f"{w0 / self.fps:.6f}", "-t", f"{(w1 - w0) / self.fps:.6f}",
-                "-i", str(self.source), "-map", "0:v:0"]
-        if chain:
-            args += ["-vf", ",".join(chain)]
-        args += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
-                 "-an", "-sn", "-f", "matroska", str(dest)]
-        self._run(args, timeout=3600)
-        if not dest.exists() or dest.stat().st_size == 0:
-            raise TranscodeError(f"DV shard for shot {idx} produced no output")
+        try:
+            self._extract_window(w0, w1, dest, vf=vf, apply_dv=self._p5)
+        except TranscodeError as e:
+            raise TranscodeError(f"DV shard for shot {idx}: {e}") from e
 
     def _needs_shard(self) -> bool:
         """Whether this job stages a per-shot reference file.
@@ -1449,18 +1505,6 @@ class ShotEncoder:
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int,
                      threads: int, workers: int = 1) -> Path:
         dst = self.probe_dir / f"enc_{idx:05d}.ivf"
-        # Seek half a frame EARLY. -ss discards frames whose timestamp is below
-        # the one asked for, and containers store those rounded (Matroska keeps
-        # whole milliseconds), so asking for a frame's exact time lands just
-        # under its stored timestamp about a third of the time and the shot
-        # starts one frame late. Measured against per-frame hashes of a real
-        # 16-shot split at 23.976fps: 6 of the 16 shots began on the wrong
-        # frame. Each slip drops a source frame and shifts everything after it,
-        # which cost 7.3 VMAF over the clip (83.5 -> 90.8 once fixed), and the
-        # last shot has no frame to borrow so the encode also comes up short.
-        # Half a period of slack is unambiguous: the preceding frame is a whole
-        # period further back. Measured after the change: 0 of 16 shots slip.
-        start = max(0.0, (s0 - 0.5) / self.fps)
         # encode exactly (s1 - s0) frames: `-t` on input-seeked shots is not
         # frame-exact (off by a frame per shot), and 762 shots x 1 frame drift
         # = seconds of A/V desync once the audio is muxed whole. `-frames:v`
@@ -1477,7 +1521,7 @@ class ShotEncoder:
             pre, chain = dovi.dv_apply_chain(self.settings)
             args += pre
             vf.append(chain)
-        args += ["-ss", f"{start:.6f}", "-i", str(self.source),
+        args += ["-ss", self._seek(s0), "-i", str(self.source),
                  "-frames:v", str(s1 - s0), "-map", "0:v:0"]
         if vf:
             args += ["-vf", ",".join(vf)]
@@ -1566,6 +1610,133 @@ class ShotEncoder:
         if self.opt.fractional_crf:
             return f"{crf:g}"
         return str(round(crf))
+
+    # ---------- phase 4b: verify what was actually delivered ----------
+    def _verify_sample(self, n_shots: int, want: int) -> List[int]:
+        """Shot indices to re-score: evenly spread across the timeline.
+
+        Spread rather than random, because the faults worth catching are
+        positional. A seek that starts mis-landing partway through, or a shot
+        list that runs out early, reads low on every shot after that point -
+        which a spread sample shows as a cliff and a clustered sample misses.
+        """
+        want = min(max(0, want), n_shots)
+        if want <= 0:
+            return []
+        if want == 1:
+            return [n_shots // 2]
+        return sorted({round(i * (n_shots - 1) / (want - 1)) for i in range(want)})
+
+    def _score_delivered(self, idx: int, w0: int, w1: int, crf: float) -> float:
+        """Score frames [w0, w1) of the FINISHED file against the source.
+
+        Both sides are staged as lossless windows so the comparison is between
+        two files holding exactly these frames - the same footing the probes
+        score on, so a delivered score is directly comparable to the probe's
+        prediction for the same window.
+        """
+        ref = self.probe_dir / f"verify_ref_{idx:05d}.mkv"
+        dist = self.probe_dir / f"verify_out_{idx:05d}.mkv"
+        try:
+            self._extract_window(w0, w1, ref, apply_dv=self._p5)
+            self._extract_window(w0, w1, dist, source=self.output)
+            return self._score_probe(w0, w1, dist, idx, int(round(crf)), shard=ref)
+        finally:
+            for path in (ref, dist):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+    def verify_delivered(self, shots: List[Shot], chosen: Dict[int, float],
+                         samples: ProbeSamples) -> None:
+        """Re-score a sample of shots from the finished file and report.
+
+        Everything before this trusts the probes: a CRF is chosen from a fast
+        probe encode of a 120-frame window and then applied to the delivery,
+        and nothing ever checks that the delivery landed where the probe said
+        it would. That gap is where target_quality stops meaning anything - the
+        probe preset under-reports, the probe window over-reports, and linear
+        interpolation on a curved rate-distortion relationship under-reports
+        again, all uncontrolled and all in different directions.
+
+        This is diagnostic only: a failure to score never fails the job, since
+        an encode that is otherwise fine should not be thrown away because
+        ffprobe or libvmaf had a bad day.
+
+        What it cannot see: a misalignment that both sides reproduce. Reference
+        and delivered windows are both located with _seek, so if _seek were
+        wrong again the source-side window would slip by exactly the amount the
+        encode slipped and the two would still agree. Verified by running this
+        against an output built with the pre-fix seek - every sampled shot came
+        back clean. The seek class is covered by _assert_shot_length and the
+        source-versus-output duration check instead, which is how it surfaced.
+        Scoring each window at offsets -1/0/+1 and reporting which one wins
+        would close the gap at three times the metric cost.
+        """
+        idxs = self._verify_sample(len(shots), int(self.opt.verify_shots or 0))
+        if not idxs:
+            return
+        self._stage("verifying", 0.0)
+        logger.info("optimizer: verifying delivered {} on {} sampled shot(s)",
+                    self.metric, len(idxs))
+        rows: List[Tuple[int, float, Optional[float], float]] = []
+        for done, idx in enumerate(idxs, start=1):
+            s0, s1 = shots[idx]
+            w0, w1 = self._probe_window(s0, s1)
+            crf = float(chosen.get(idx, self.video.crf))
+            try:
+                score = self._score_delivered(idx, w0, w1, crf)
+            except (TranscodeError, OSError) as e:
+                logger.warning("optimizer: could not verify shot {} ({})", idx, e)
+                continue
+            predicted = predict_score(list((samples.get(idx) or {}).items()), crf)
+            rows.append((idx, crf, predicted, score))
+            self._log(f"verify shot {idx:05d} crf {crf:g} "
+                      f"predicted={predicted if predicted is None else round(predicted, 2)} "
+                      f"delivered={score:.2f}")
+            self._report(done / len(idxs) * 100, done, len(idxs))
+        if not rows:
+            logger.warning("optimizer: no shot could be verified")
+            return
+        self._report_verification(rows)
+
+    def _report_verification(
+            self, rows: List[Tuple[int, float, Optional[float], float]]) -> None:
+        scores = sorted(r[3] for r in rows)
+        n = len(scores)
+        median = scores[n // 2] if n % 2 else (scores[n // 2 - 1] + scores[n // 2]) / 2
+        below = [s for s in scores if s < self.target]
+        summary = (f"delivered {self.metric} over {n} sampled shot(s): "
+                   f"min {scores[0]:.2f}, median {median:.2f}, "
+                   f"max {scores[-1]:.2f} (target {self.target:g})")
+        self._mem_log(summary)
+        if below:
+            logger.warning(
+                "optimizer: {}/{} sampled shot(s) delivered below target "
+                "{} {:g} (lowest {:.2f})", len(below), n, self.metric,
+                self.target, scores[0])
+        deltas = [score - pred for _, _, pred, score in rows if pred is not None]
+        if not deltas:
+            return
+        bias = sum(deltas) / len(deltas)
+        self._mem_log(
+            f"probe prediction vs delivered: mean {bias:+.2f} {self.metric} "
+            f"over {len(deltas)} shot(s)")
+        if bias < -5.0:
+            # An encoder-vs-probe difference is a point or two. A gap this size
+            # is the signature of the two sides not holding the same frames.
+            logger.warning(
+                "optimizer: delivered {} is {:.1f} below what the probes "
+                "predicted. A difference that large is usually misalignment - "
+                "the compared windows not holding the same frames - rather "
+                "than an encoder-versus-probe difference.", self.metric, -bias)
+        elif abs(bias) >= 0.5:
+            direction = ("under-reports" if bias > 0 else "over-reports")
+            logger.info(
+                "optimizer: the probes {} the delivered {} by {:.2f} on "
+                "average; transcode.optimizer.probe_crf_offset trades that "
+                "bias back for size.", direction, self.metric, abs(bias))
 
     # ---------- phase 5: concat + mux ----------
     # tx3g only exists in MP4; Matroska cannot carry it, so those have to be
@@ -1703,6 +1874,8 @@ class ShotEncoder:
 
             self.concat_shots(ivf_paths)
             self._report(100.0, self.total_frames, self.total_frames)
+
+            self.verify_delivered(shots, chosen, samples)
         finally:
             self._cleanup_shards()
             self.close()

@@ -703,8 +703,15 @@ def test_run_full_pipeline(settings, info, plan, tmp_path):
     stages = []
     progress = []
 
+    spans = {0: 300, 1: 600, 2: 900}   # the three shots, in frames
+
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
+        # per-shot frame count check (the other ffprobe call reads sub codecs)
+        if "-count_packets" in args:
+            return f"{spans[int(Path(args[-1]).stem.rsplit('_', 1)[1])]},\n"
+        if "ffprobe" in args[0]:
+            return ""
         # shot extraction -> write y4m
         if "yuv4mpegpipe" in args:
             Path(args[-1]).write_bytes(b"YUV4MPEG2 dummy")
@@ -713,15 +720,17 @@ def test_run_full_pipeline(settings, info, plan, tmp_path):
         if "-f" in args and args[args.index("-f") + 1] == "ivf" and "libsvtav1" in args:
             Path(args[-1]).write_bytes(b"ivf-dummy")
             return ""
-        # vmaf score -> write score json (crf parsed from log_path filename)
+        # vmaf score -> write score json (crf parsed from log_path filename).
+        # The verification pass scores at the CHOSEN crf, which is not on the
+        # probe grid, so fall back rather than KeyError.
         if any("libvmaf=" in a for a in args):
             lavfi = args[args.index("-lavfi") + 1]
             log_path = lavfi.split("log_path=")[1].split(":")[0]
             crf = int(Path(log_path).stem.rsplit("_", 1)[1])
             Path(log_path).write_text(json.dumps(
-                {"pooled_metrics": {"vmaf": {"mean": score_at[crf]}}}))
+                {"pooled_metrics": {"vmaf": {"mean": score_at.get(crf, 76.0)}}}))
             return ""
-        # concat + mux -> create output
+        # concat + mux, and the verification window extractions
         Path(args[-1]).write_bytes(b"output-dummy")
         return ""
 
@@ -736,6 +745,7 @@ def test_run_full_pipeline(settings, info, plan, tmp_path):
     assert stages[0] == "scenedetect"
     assert "probing" in stages
     assert "encoding" in stages
+    assert "verifying" in stages, "the delivered encode was never re-scored"
     assert progress[-1][0] == 100.0
     # probing progress reports the SHOT count (3 shots), stage-local pct 0->100
     probing = [s for _, s in progress if s.get("total") == 3]
@@ -1260,3 +1270,136 @@ def test_shot_length_check_skipped_when_ffprobe_cannot_answer(
 
     enc._run = fake_run.__get__(enc)
     enc._encode_shot(0, 0, 90, 30.0, lp=4, threads=32, workers=1)
+
+
+# ---- delivered quality is measured, not assumed ----
+def test_predict_score_interpolates_between_grid_points():
+    pts = [(20, 95.0), (26, 86.0), (32, 77.0)]
+    assert opt.predict_score(pts, 26) == pytest.approx(86.0)
+    assert opt.predict_score(pts, 29) == pytest.approx(81.5)
+    # clamped outside the grid, and pick_crf's inverse on the way back
+    assert opt.predict_score(pts, 10) == pytest.approx(95.0)
+    assert opt.predict_score(pts, 60) == pytest.approx(77.0)
+    assert opt.predict_score([], 30) is None
+
+
+def test_predict_score_inverts_pick_crf():
+    pts = [(20, 95.0), (26, 86.0), (32, 77.0), (38, 68.0)]
+    crf = opt.pick_crf(pts, 80.0)
+    assert opt.predict_score(pts, crf) == pytest.approx(80.0, abs=1e-6)
+
+
+def test_verify_sample_spreads_across_the_timeline(settings, info, plan, tmp_path):
+    """Spread, not clustered: a seek that starts mis-landing partway through
+    reads low on everything after that point, which a clustered sample misses."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._verify_sample(100, 5) == [0, 25, 50, 74, 99]
+    assert enc._verify_sample(3, 10) == [0, 1, 2]      # never more than there are
+    assert enc._verify_sample(100, 1) == [50]
+    assert enc._verify_sample(100, 0) == []
+    assert enc._verify_sample(0, 5) == []
+
+
+def _verifying_encoder(settings, info, plan, tmp_path, delivered):
+    settings.transcode.optimizer.verify_shots = 2
+    enc = make_encoder(settings, info, plan, tmp_path)
+    seen = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if any("libvmaf=" in a for a in args):
+            lavfi = args[args.index("-lavfi") + 1]
+            log = lavfi.split("log_path=")[1].split(":")[0]
+            Path(log).write_text(json.dumps(
+                {"pooled_metrics": {"vmaf": {"mean": delivered}}}))
+            return ""
+        seen.append(args)
+        Path(args[-1]).write_bytes(b"win")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    return enc, seen
+
+
+def test_verify_compares_the_output_against_the_source(settings, info, plan, tmp_path):
+    enc, seen = _verifying_encoder(settings, info, plan, tmp_path, 76.0)
+    shots = [(0, 90), (90, 180), (180, 300)]
+    enc.verify_delivered(shots, {0: 30.0, 1: 30.0, 2: 30.0},
+                         {0: {26: 80.0, 32: 74.0}, 2: {26: 80.0, 32: 74.0}})
+    inputs = [a[a.index("-i") + 1] for a in seen if "-i" in a]
+    assert str(enc.output) in inputs, "the finished file is never read"
+    assert str(enc.source) in inputs, "the source is never read"
+    # both sides are staged frame-exactly, never with a -t duration
+    assert all("-t" not in a for a in seen)
+    assert all("-frames:v" in a for a in seen)
+
+
+def _capture_logs(monkeypatch):
+    """Collect loguru output. loguru does not feed the stdlib logging module,
+    so caplog sees nothing; the rest of this file patches the logger the same
+    way."""
+    lines = []
+
+    def sink(msg, *args, **kwargs):
+        lines.append(" ".join(str(x) for x in (msg, *args)))
+
+    for level in ("info", "warning"):
+        monkeypatch.setattr(opt.logger, level, sink)
+    return lines
+
+
+def test_verify_reports_the_probe_bias(settings, info, plan, tmp_path, monkeypatch):
+    """The probes predict 77 at CRF 30 here and the encode delivers 79, which
+    is the bias probe_crf_offset exists to trade back for size."""
+    enc, _ = _verifying_encoder(settings, info, plan, tmp_path, 79.0)
+    logs = _capture_logs(monkeypatch)
+    samples = {0: {26: 80.0, 32: 74.0}, 1: {26: 80.0, 32: 74.0}}
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0}, samples)
+    text = "\n".join(logs)
+    assert "probe_crf_offset" in text
+    assert "under-reports" in text
+
+
+def test_verify_flags_a_large_gap_as_misalignment(settings, info, plan, tmp_path,
+                                                  monkeypatch):
+    """A one-frame shift scores ~7 below the prediction; an encoder-versus-probe
+    difference is a point or two. Say which one this looks like."""
+    enc, _ = _verifying_encoder(settings, info, plan, tmp_path, 69.0)
+    logs = _capture_logs(monkeypatch)
+    samples = {0: {26: 80.0, 32: 74.0}, 1: {26: 80.0, 32: 74.0}}
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0}, samples)
+    assert "misalignment" in "\n".join(logs)
+
+
+def test_verify_warns_when_shots_land_below_target(settings, info, plan, tmp_path,
+                                                   monkeypatch):
+    enc, _ = _verifying_encoder(settings, info, plan, tmp_path, 60.0)   # target 75
+    logs = _capture_logs(monkeypatch)
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0}, {})
+    assert "below target" in "\n".join(logs)
+
+
+def test_verify_never_fails_the_job(settings, info, plan, tmp_path, monkeypatch):
+    """Diagnostic only: an encode that is otherwise fine must not be thrown
+    away because the scorer had a bad day."""
+    settings.transcode.optimizer.verify_shots = 2
+    enc = make_encoder(settings, info, plan, tmp_path)
+    logs = _capture_logs(monkeypatch)
+
+    def boom(self, args, timeout=None):
+        raise opt.TranscodeError("libvmaf exploded")
+
+    enc._run = boom.__get__(enc)
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0}, {})
+    assert "no shot could be verified" in "\n".join(logs)
+
+
+def test_verify_is_off_when_disabled(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.verify_shots = 0
+    enc = make_encoder(settings, info, plan, tmp_path)
+
+    def boom(self, args, timeout=None):
+        raise AssertionError("verification ran while disabled")
+
+    enc._run = boom.__get__(enc)
+    enc.verify_delivered([(0, 90)], {0: 30.0}, {})

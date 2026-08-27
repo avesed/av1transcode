@@ -129,11 +129,12 @@ const fmt = n => { if (n==null) return "–"; const u=["B","KB","MB","GB","TB"];
   while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
 const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stCls = s => "st-"+esc(s);
-const stageLabel = s => ({encoding:"转码中",cancelling:"取消中…",analyzing:"分析中",scenedetect:"场景检测",probing:"质量探测中"}[s]||s||"");
+const stageLabel = s => ({encoding:"转码中",cancelling:"取消中…",analyzing:"分析中",scenedetect:"场景检测",probing:"质量探测中",verifying:"成品质量校验中"}[s]||s||"");
 function liveStats(j) {
   const total = j.progress_total || 0, done = j.progress_done || 0, fps = j.progress_fps || 0;
   if (j.stage === "scenedetect") return total ? ` · 场景检测 ${done}/${total} 帧` : (done ? ` · 场景检测 ${done} 处` : "");
   if (j.stage === "probing") return total ? ` · 探测 ${done}/${total} 段` : ` · 探测 ${done} 段`;
+  if (j.stage === "verifying") return total ? ` · 校验 ${done}/${total} 段` : "";
   if (j.stage === "encoding") {
     if (!total) return "";
     const base = ` · ${done}/${total} 帧`;

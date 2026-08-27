@@ -238,6 +238,17 @@ class OptimizerSettings(BaseModel):
     # Pass decimal CRF values to SVT-AV1 (finer than integer CRF granularity).
     # SVT-AV1 must accept fractional --crf for this to work.
     fractional_crf: bool = False
+    # After the encode, re-score this many shots from the FINISHED file against
+    # the source with target_metric and log delivered vs target. Everything
+    # before it trusts the probes: a CRF is picked from a fast probe encode of
+    # a 120-frame window and then applied to the delivery, and nothing checks
+    # that the delivery landed where the probe said. Sampled shots are spread
+    # across the timeline, since the faults worth catching (a seek that starts
+    # mis-landing, a shot list running out early) read low on everything after
+    # a point. Diagnostic only - it never fails the job. Costs one lossless
+    # window extraction per side plus one metric run per sampled shot.
+    # 0 = off.
+    verify_shots: int = 10
     # Keep per-shot probe files in the temp dir for debugging.
     keep_probes: bool = False
 

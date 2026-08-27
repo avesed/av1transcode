@@ -252,7 +252,7 @@ def test_settings_page_covers_every_editable_optimizer_field():
     posted = set(re.findall(r"^\s*(\w+):", body[:body.index("};")], re.M))
     for field in ("probe_crfs", "min_crf", "probe_crf_offset", "vmaf_width",
                   "vmaf_model_4k", "vmaf_4k_min_width", "ssimulacra2_frame_step",
-                  "min_shot_frames"):
+                  "min_shot_frames", "verify_shots"):
         assert field in posted, f"{field} missing from the settings form"
     assert 'value="xpsnr"' in html
 
