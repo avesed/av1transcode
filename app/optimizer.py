@@ -1369,6 +1369,32 @@ class ShotEncoder:
         return str(max(0, min(63, round(crf))))
 
     # ---------- phase 5: concat + mux ----------
+    # tx3g only exists in MP4; Matroska cannot carry it, so those have to be
+    # converted. Everything else must be copied - notably the PGS and VobSub
+    # streams a Blu-ray remux carries, which are BITMAP subtitles: asking
+    # ffmpeg to make srt out of them fails the whole job with "Subtitle
+    # encoding currently only possible from text to text or bitmap to bitmap".
+    _SUBS_NEEDING_CONVERSION = {"mov_text"}
+
+    def _subtitle_codec_args(self, source: str) -> List[str]:
+        """Per-stream -c:s arguments for remuxing `source`'s subtitles to mkv."""
+        try:
+            out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
+                             "-select_streams", "s",
+                             "-show_entries", "stream=codec_name",
+                             "-of", "csv=p=0", source], timeout=120)
+        except TranscodeError as e:
+            logger.warning("could not probe subtitle codecs ({}); copying", e)
+            return ["-c:s", "copy"]
+        codecs = [c.strip() for c in out.splitlines() if c.strip()]
+        if not codecs:
+            return ["-c:s", "copy"]
+        args: List[str] = []
+        for i, codec in enumerate(codecs):
+            convert = codec in self._SUBS_NEEDING_CONVERSION
+            args += [f"-c:s:{i}", "srt" if convert else "copy"]
+        return args
+
     def concat_shots(self, ivf_paths: List[Path]) -> None:
         if not ivf_paths:
             raise TranscodeError("no shot encodes to concatenate")
@@ -1382,21 +1408,22 @@ class ShotEncoder:
         self._run(args, timeout=1800)
         # audio + subs from the ORIGINAL source (info.path, not self.source:
         # for Dolby Vision the encode input is a video-only stripped
-        # intermediate, so muxing from it would drop audio). mov_text (tx3g)
-        # subtitles cannot be copied into matroska, so convert them to srt.
+        # intermediate, so muxing from it would drop audio).
         audio_src = str(self.info.path if self.info.path else self.source)
         audio_subs = self.tempdir / "audio_subs.mkv"
         # NB: no -map_metadata -1 here: it strips per-stream LANGUAGE tags
         # from the subtitle/audio streams (Plex then shows every subtitle as
         # English). The source's global "DV.HDR10.PLUS" title is harmless in
         # this intermediate - mkvmerge does not copy it into the final file.
-        self._run(
-            [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
-             "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
-             "-c:a", "copy", "-c:s", "srt",
-             str(audio_subs)],
-            timeout=1800,
-        )
+        base_args = [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
+                     "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
+                     "-c:a", "copy"]
+        try:
+            self._run(base_args + self._subtitle_codec_args(audio_src)
+                      + [str(audio_subs)], timeout=1800)
+        except TranscodeError:
+            logger.warning("subtitle remux failed, retrying with a plain copy")
+            self._run(base_args + ["-c:s", "copy", str(audio_subs)], timeout=1800)
         # Final mux via mkvmerge: ffmpeg's -c copy remux of the concat leaves
         # the shot-boundary structure that Plex's 4K AV1 transcode hangs on
         # (runs for 10-20 min then stops producing HLS segments; verified on

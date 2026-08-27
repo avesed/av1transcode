@@ -942,3 +942,44 @@ def test_ssimulacra2_error_names_the_missing_plugins(settings, info, plan, tmp_p
     enc._run = fake_run.__get__(enc)
     with pytest.raises(Exception, match="vszip"):
         enc._probe_one(0, 0, 90, 32, lp=4)
+
+
+# ---- subtitle codec selection for the mux ----
+def _sub_args(enc, probe_out, fail=False):
+    def fake_run(self, args, timeout=None):
+        if fail:
+            raise opt.TranscodeError("ffprobe exploded")
+        return probe_out
+    enc._run = fake_run.__get__(enc)
+    return enc._subtitle_codec_args("/x/src.mkv")
+
+
+def test_bitmap_subtitles_are_copied_not_converted(settings, info, plan, tmp_path):
+    """A Blu-ray remux carries PGS, which is a BITMAP subtitle. Forcing srt on
+    it fails the entire job: "Subtitle encoding currently only possible from
+    text to text or bitmap to bitmap"."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    args = _sub_args(enc, "hdmv_pgs_subtitle\nhdmv_pgs_subtitle\n")
+    assert args == ["-c:s:0", "copy", "-c:s:1", "copy"]
+    assert "srt" not in args
+
+
+def test_mov_text_is_still_converted(settings, info, plan, tmp_path):
+    """tx3g only exists in MP4 - Matroska cannot carry it, so it must convert."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert _sub_args(enc, "mov_text\n") == ["-c:s:0", "srt"]
+
+
+def test_mixed_subtitle_codecs_are_handled_per_stream(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    args = _sub_args(enc, "mov_text\nhdmv_pgs_subtitle\nsubrip\ndvd_subtitle\n")
+    assert args == ["-c:s:0", "srt", "-c:s:1", "copy",
+                    "-c:s:2", "copy", "-c:s:3", "copy"]
+
+
+def test_subtitle_probe_failure_falls_back_to_copy(settings, info, plan, tmp_path):
+    """Copy is the safe default: it is right for every codec except tx3g,
+    whereas srt is wrong for every bitmap one and kills the job."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert _sub_args(enc, "", fail=True) == ["-c:s", "copy"]
+    assert _sub_args(enc, "\n") == ["-c:s", "copy"]
