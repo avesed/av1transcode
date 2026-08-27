@@ -203,6 +203,19 @@ class OptimizerSettings(BaseModel):
     # (minutes per scene); a downscaled copy (same fps, frame numbers map 1:1)
     # is 5-10x faster. e.g. "-2:540". Empty = detect on the source directly.
     scenedetect_scale: str = "-2:540"
+    # Fold shots shorter than this many frames into a neighbour before probing.
+    # OFF by default, because the size win it was added for did not survive
+    # measurement. Splitting a CONTINUOUS take into short pieces is expensive
+    # (+43.5% at 24-frame pieces, +13.8% at 48, +4.1% at 96, measured at 1080p
+    # preset 4 CRF 32) - but this engine only ever splits at real scene cuts,
+    # where the keyframe is what the encoder would spend anyway. On real
+    # detected boundaries the same clip measured -0.08% at 48, +0.08% at 64 and
+    # +0.26% at 96, with VMAF flat at 90.82 +/- 0.02: no size to recover.
+    # What it does buy is probe time - merging at 48 took that clip from 16
+    # shots to 12, i.e. a quarter fewer probe encodes - at the cost of coarser
+    # per-shot CRF adaptation. Set it if probing is your bottleneck; 96 and
+    # above measurably costs size. 0 = keep every detected shot.
+    min_shot_frames: int = 0
     # Cap on the number of shots; shortest adjacent shots are merged past this.
     max_shots: int = 3000
     # Bound the per-shot CRF jump between neighbouring shots (0 = disable).

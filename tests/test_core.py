@@ -251,6 +251,186 @@ def test_settings_page_covers_every_editable_optimizer_field():
     body = html[html.index("const body = {"):]
     posted = set(re.findall(r"^\s*(\w+):", body[:body.index("};")], re.M))
     for field in ("probe_crfs", "min_crf", "probe_crf_offset", "vmaf_width",
-                  "vmaf_model_4k", "vmaf_4k_min_width", "ssimulacra2_frame_step"):
+                  "vmaf_model_4k", "vmaf_4k_min_width", "ssimulacra2_frame_step",
+                  "min_shot_frames"):
         assert field in posted, f"{field} missing from the settings form"
     assert 'value="xpsnr"' in html
+
+
+# ---- the finished file is checked against the source before it counts as done ----
+def _out_info(path, duration=60.0, audio=2, subs=3, codec="av1"):
+    from app.analyzer import MediaInfo
+
+    i = MediaInfo(path=Path(path))
+    i.duration = duration
+    i.audio_count = audio
+    i.subtitle_count = subs
+    i.video_codec = codec
+    return i
+
+
+def _src_info(tmp_path):
+    return _out_info(tmp_path / "src.mkv", duration=60.0, audio=2, subs=3, codec="hevc")
+
+
+def _verify(settings, monkeypatch, tmp_path, out_info):
+    from app import transcoder
+
+    out = tmp_path / "out.av1.mkv"
+    out.write_bytes(b"x" * 1024)
+    monkeypatch.setattr(transcoder, "analyze", lambda _s, _p: out_info)
+    transcoder._verify_output(settings, _src_info(tmp_path), out)
+
+
+def test_verify_output_accepts_a_matching_encode(settings, monkeypatch, tmp_path):
+    # container timestamp rounding: measured ~1ms of drift on a 46-min encode
+    _verify(settings, monkeypatch, tmp_path, _out_info(tmp_path, duration=60.001))
+
+
+def test_verify_output_rejects_a_truncated_encode(settings, monkeypatch, tmp_path):
+    from app.transcoder import TranscodeError
+
+    with pytest.raises(TranscodeError, match="duration"):
+        _verify(settings, monkeypatch, tmp_path, _out_info(tmp_path, duration=42.0))
+
+
+def test_verify_output_rejects_lost_audio(settings, monkeypatch, tmp_path):
+    """A Dolby Vision job feeds the encoder a video-only intermediate; without
+    a re-mux the output has no audio at all and used to ship as a success."""
+    from app.transcoder import TranscodeError
+
+    with pytest.raises(TranscodeError, match="audio"):
+        _verify(settings, monkeypatch, tmp_path, _out_info(tmp_path, audio=0))
+
+
+def test_verify_output_rejects_lost_subtitles(settings, monkeypatch, tmp_path):
+    from app.transcoder import TranscodeError
+
+    with pytest.raises(TranscodeError, match="subtitle"):
+        _verify(settings, monkeypatch, tmp_path, _out_info(tmp_path, subs=1))
+
+
+def test_verify_output_rejects_an_unprobeable_file(settings, monkeypatch, tmp_path):
+    from app import transcoder
+    from app.transcoder import TranscodeError
+
+    out = tmp_path / "out.av1.mkv"
+    out.write_bytes(b"x" * 1024)
+    monkeypatch.setattr(transcoder, "analyze", lambda _s, _p: None)
+    with pytest.raises(TranscodeError, match="could not probe"):
+        transcoder._verify_output(settings, _src_info(tmp_path), out)
+
+
+def test_verify_output_rejects_an_empty_file(settings, tmp_path):
+    from app import transcoder
+    from app.transcoder import TranscodeError
+
+    out = tmp_path / "out.av1.mkv"
+    out.touch()
+    with pytest.raises(TranscodeError, match="no output file"):
+        transcoder._verify_output(settings, _src_info(tmp_path), out)
+
+
+# ---- temp cleanup has to cope with files, not just directories ----
+def test_cleanup_temp_removes_files_and_dirs(tmp_path):
+    """tmp_files mixes the av1an/optimizer temp trees with plain intermediates
+    (a stripped DV base layer). shutil.rmtree raises NotADirectoryError on a
+    file, which ignore_errors=True swallowed, so those used to be left behind."""
+    from app.transcoder import _cleanup_temp
+
+    d = tmp_path / "tree"
+    (d / "nested").mkdir(parents=True)
+    (d / "nested" / "chunk.ivf").write_bytes(b"x")
+    f = tmp_path / "movie.dv_bl.mkv"
+    f.write_bytes(b"x")
+
+    _cleanup_temp([d, f], keep=False)
+    assert not d.exists() and not f.exists()
+
+
+def test_cleanup_temp_honours_keep_temp(tmp_path):
+    from app.transcoder import _cleanup_temp
+
+    f = tmp_path / "movie.dv_bl.mkv"
+    f.write_bytes(b"x")
+    _cleanup_temp([f], keep=True)
+    assert f.exists()
+
+
+def test_cleanup_temp_tolerates_already_gone(tmp_path):
+    from app.transcoder import _cleanup_temp
+
+    _cleanup_temp([tmp_path / "vanished.mkv", tmp_path / "vanished_dir"], keep=False)
+
+
+# ---- run_full_transcode: temp must go on the failure path too ----
+def _full_transcode_fixture(settings, tmp_path):
+    from app.analyzer import MediaInfo
+    from app.decisions import TranscodePlan
+
+    settings.dirs.work = tmp_path / "work"
+    settings.dirs.work.mkdir(parents=True, exist_ok=True)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"source")
+    info = MediaInfo(path=src)
+    info.duration, info.video_codec = 60.0, "hevc"
+    info.audio_count, info.subtitle_count = 2, 3
+    plan = TranscodePlan()
+    plan.params = settings.transcode.video.model_copy(deep=True)
+    plan.params.engine = "optimizer"
+    plan.params.target_quality = "75"
+    return info, plan, src, tmp_path / "out.av1.mkv"
+
+
+def test_run_full_transcode_cleans_temp_on_failure(settings, monkeypatch, tmp_path):
+    """A job that raises is exactly the job that gets retried twice more, so
+    leaking the temp tree meant three source-sized copies per broken file."""
+    from app import optimizer, transcoder
+    from app.transcoder import TranscodeError
+
+    info, plan, src, out = _full_transcode_fixture(settings, tmp_path)
+
+    def boom(_s, _i, _p, _src, _out, tempdir, **_kw):
+        (tempdir / "enc_00000.ivf").write_bytes(b"partial")
+        raise TranscodeError("encoder died")
+
+    monkeypatch.setattr(optimizer, "run_shot_transcode", boom)
+    with pytest.raises(TranscodeError):
+        transcoder.run_full_transcode(settings, info, plan, src, out)
+    assert list(settings.dirs.work.iterdir()) == []
+
+
+def test_run_full_transcode_drops_an_output_that_fails_verification(
+        settings, monkeypatch, tmp_path):
+    """An unverified file next to the source is what later gets mistaken for a
+    finished archive - and with delete_source the source is already gone."""
+    from app import optimizer, transcoder
+    from app.transcoder import TranscodeError
+
+    info, plan, src, out = _full_transcode_fixture(settings, tmp_path)
+
+    def encode(_s, _i, _p, _src, output, _tempdir, **_kw):
+        Path(output).write_bytes(b"truncated")
+
+    monkeypatch.setattr(optimizer, "run_shot_transcode", encode)
+    monkeypatch.setattr(transcoder, "analyze",
+                        lambda _s, _p: _out_info(out, duration=12.0))
+    with pytest.raises(TranscodeError, match="duration"):
+        transcoder.run_full_transcode(settings, info, plan, src, out)
+    assert not out.exists()
+    assert list(settings.dirs.work.iterdir()) == []
+
+
+def test_run_full_transcode_keeps_a_verified_output(settings, monkeypatch, tmp_path):
+    from app import optimizer, transcoder
+
+    info, plan, src, out = _full_transcode_fixture(settings, tmp_path)
+
+    def encode(_s, _i, _p, _src, output, _tempdir, **_kw):
+        Path(output).write_bytes(b"good output")
+
+    monkeypatch.setattr(optimizer, "run_shot_transcode", encode)
+    monkeypatch.setattr(transcoder, "analyze", lambda _s, _p: _out_info(out))
+    transcoder.run_full_transcode(settings, info, plan, src, out)
+    assert out.exists()
+    assert list(settings.dirs.work.iterdir()) == []

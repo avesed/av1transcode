@@ -12,7 +12,7 @@ from typing import Callable, Dict, List, Optional
 
 from loguru import logger
 
-from app.analyzer import MediaInfo
+from app.analyzer import MediaInfo, analyze
 from app.config import Settings, VideoParams
 from app.decisions import TranscodePlan
 
@@ -497,39 +497,122 @@ def run_full_transcode(
         if progress_cb:
             progress_cb(pct, stats)
 
-    if video.engine == "optimizer":
-        from app.optimizer import run_shot_transcode
+    try:
+        if video.engine == "optimizer":
+            from app.optimizer import run_shot_transcode
 
-        logger.info("Starting optimizer engine (shot-based): {} -> {}", encode_input, output)
-        t0 = time.monotonic()
-        run_shot_transcode(
-            settings, info, plan, encode_input, output, tempdir,
-            log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
-            stage_cb=stage_cb,
-        )
-        logger.info("optimizer finished in {:.1f}s", time.monotonic() - t0)
-    else:
-        cmd = build_av1an_cmd(
-            settings, video, encode_input, output, tempdir, workers=settings.workers.av1an_workers,
-        )
-        logger.info("Starting av1an: {} -> {}", encode_input, output)
-        logger.debug("av1an full command: {}", " ".join(cmd))
-        t0 = time.monotonic()
-        run_av1an(cmd, log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
-                  stage_cb=stage_cb)
-        logger.info("av1an finished in {:.1f}s", time.monotonic() - t0)
+            logger.info("Starting optimizer engine (shot-based): {} -> {}", encode_input, output)
+            t0 = time.monotonic()
+            run_shot_transcode(
+                settings, info, plan, encode_input, output, tempdir,
+                log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
+                stage_cb=stage_cb,
+            )
+            logger.info("optimizer finished in {:.1f}s", time.monotonic() - t0)
+        else:
+            cmd = build_av1an_cmd(
+                settings, video, encode_input, output, tempdir,
+                workers=settings.workers.av1an_workers,
+            )
+            logger.info("Starting av1an: {} -> {}", encode_input, output)
+            logger.debug("av1an full command: {}", " ".join(cmd))
+            t0 = time.monotonic()
+            run_av1an(cmd, log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
+                      stage_cb=stage_cb)
+            logger.info("av1an finished in {:.1f}s", time.monotonic() - t0)
 
+        try:
+            _verify_output(settings, info, output)
+        except TranscodeError:
+            # A file that failed verification must not stay next to the source:
+            # it is the thing that later gets mistaken for a finished archive.
+            # The encode is reproducible and the job log keeps the reason.
+            if output.exists():
+                try:
+                    output.unlink()
+                except OSError:
+                    pass
+            raise
+
+        # --- optional HDR metadata tag on the mkv ---
+        if settings.transcode.hdr.preserve and (info.is_hdr or info.is_hlg or info.dovi.present):
+            _colorpropedit_hdr(settings, output, plan)
+    finally:
+        # NB: a finally, not the tail of the happy path. Every intermediate
+        # here is source-sized or larger (the per-shot encodes under tempdir,
+        # a stripped DV base layer, a lossless P5 convert), and a job that
+        # raises is exactly the job that gets retried twice more - so leaking
+        # on failure meant three copies per file that never encodes.
+        _cleanup_temp(tmp_files, keep=settings.transcode.keep_temp)
+
+
+def _cleanup_temp(tmp_files: List[Path], keep: bool) -> None:
+    """Remove the working files of a finished (or failed) job.
+
+    tmp_files mixes directories (av1an/optimizer temp trees) with plain files
+    (the stripped DV base layer, the lossless P5 convert). shutil.rmtree only
+    handles the former - on a file it raises NotADirectoryError, which
+    ignore_errors=True then swallowed - so every Dolby Vision job used to leave
+    a source-sized intermediate behind in dirs.work.
+    """
+    if keep:
+        return
+    for path in tmp_files:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as e:  # noqa: PERF203
+            logger.warning("could not remove temp {}: {}", path, e)
+
+
+def _verify_output(settings: Settings, info: MediaInfo, output: Path) -> None:
+    """Check the finished file against the source before the job is called done.
+
+    Existence and a non-zero size were the only checks, so a truncated encode -
+    or one that silently lost its audio and subtitle streams - was reported as
+    a success, and with transcode.delete_source that is the point at which the
+    source gets deleted. Everything read here comes from the container header,
+    so this costs one ffprobe rather than a pass over the file.
+    """
     if not output.exists() or output.stat().st_size == 0:
-        raise TranscodeError("av1an produced no output file")
+        raise TranscodeError("the encoder produced no output file")
+    out = analyze(settings, str(output))
+    if out is None:
+        raise TranscodeError(f"could not probe the encoded file {output.name}")
+    if not out.video_codec:
+        raise TranscodeError(f"{output.name} has no video stream")
 
-    # --- optional HDR metadata tag on the mkv ---
-    if settings.transcode.hdr.preserve and (info.is_hdr or info.is_hlg or info.dovi.present):
-        _colorpropedit_hdr(settings, output, plan)
-
-    # --- cleanup ---
-    if not settings.transcode.keep_temp:
-        for t in tmp_files:
-            shutil.rmtree(t, ignore_errors=True)
+    problems: List[str] = []
+    # Duration catches the dropped tail: a shot list that did not reach the end
+    # of the source, or a chunk missing from the concat. The tolerance absorbs
+    # container timestamp rounding (measured ~1ms on a 46-minute encode), not a
+    # missing scene.
+    if info.duration > 0 and out.duration > 0:
+        tolerance = max(1.0, info.duration * 0.005)
+        drift = abs(out.duration - info.duration)
+        if drift > tolerance:
+            problems.append(
+                f"duration {out.duration:.2f}s against the source's "
+                f"{info.duration:.2f}s (off by {drift:.2f}s, tolerated "
+                f"{tolerance:.2f}s)")
+    elif info.duration > 0:
+        problems.append("the output reports no duration")
+    # Stream counts catch the mux going wrong - an encode fed a video-only
+    # intermediate, or a subtitle stream the container silently refused.
+    if out.audio_count != info.audio_count:
+        problems.append(f"{out.audio_count} audio stream(s) against the "
+                        f"source's {info.audio_count}")
+    if out.subtitle_count != info.subtitle_count:
+        problems.append(f"{out.subtitle_count} subtitle stream(s) against the "
+                        f"source's {info.subtitle_count}")
+    if problems:
+        raise TranscodeError(
+            f"output verification failed for {output.name}: " + "; ".join(problems))
+    logger.info(
+        "Verified {}: {:.2f}s, {} audio, {} subtitle stream(s)",
+        output.name, out.duration, out.audio_count, out.subtitle_count)
 
 
 def _md_number(token: str, scale: float, real_limit: float) -> float:

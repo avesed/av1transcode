@@ -120,6 +120,44 @@ def smooth_crfs(crfs: List[float], max_delta: float, iterations: int = 32) -> Li
     return s
 
 
+def merge_short_shots(shots: List[Shot], min_frames: int) -> List[Shot]:
+    """Fold shots shorter than `min_frames` into a neighbour.
+
+    Every shot is encoded standalone, so each one costs a keyframe and cannot
+    predict across its own boundary, and SVT-AV1's mini-GOP is 32 frames - a
+    shot below that cannot even fill one and falls back to a shorter prediction
+    structure. Both are paid per shot, so a run of very short shots is
+    expensive out of proportion to the frames it holds, while a sub-second shot
+    is also the one that gains least from having its own CRF.
+
+    The shortest offender is merged with its shorter neighbour and the scan
+    repeats, so a run of tiny shots coalesces instead of all piling onto one
+    long neighbour. 0 disables. A merged shot still under the bound is merged
+    again, so the result has no shot below `min_frames` unless only one is left.
+    """
+    if min_frames <= 0:
+        return list(shots)
+    shots = list(shots)
+
+    def span(i: int) -> int:
+        return shots[i][1] - shots[i][0]
+
+    while len(shots) > 1:
+        i = min(range(len(shots)), key=span)
+        if span(i) >= min_frames:
+            break
+        if i == 0:
+            j = 1
+        elif i == len(shots) - 1:
+            j = i - 1
+        else:
+            j = i - 1 if span(i - 1) <= span(i + 1) else i + 1
+        lo, hi = min(i, j), max(i, j)
+        shots[lo] = (shots[lo][0], shots[hi][1])
+        del shots[hi]
+    return shots
+
+
 def merge_to_max(shots: List[Shot], max_shots: int) -> List[Shot]:
     """Merge the shortest adjacent shots until the count is <= max_shots."""
     shots = list(shots)
@@ -190,14 +228,22 @@ def parse_score(json_path: Path, metric: str) -> float:
 class _Shard:
     """A converted per-shot clip, shared by every probe of that shot.
 
-    Ref-counted because the probe pool schedules one task per (shot, CRF): the
-    5 tasks of a shot must convert once, not five times, and the shard has to
+    The probe pool schedules one task per (shot, CRF), so the grid's worth of
+    tasks for one shot must convert once, not once each, and the file has to
     survive until the last of them is done.
+
+    `pending` counts the probes still to run for the shot and is fixed up
+    front, rather than counting live acquisitions. An acquire/release refcount
+    hits zero every time a shot momentarily has no probe in flight - which
+    happens whenever the pool runs a shot's tasks back to back rather than
+    concurrently - and each of those zeroes deleted a shard the next task then
+    had to rebuild. Worse, the delete raced that rebuild: the deleting thread
+    could unlink the file the new one had just written.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, pending: int) -> None:
         self.path = path
-        self.refs = 0
+        self.pending = max(1, pending)
         self.lock = threading.Lock()
 
     def unlink(self) -> None:
@@ -297,6 +343,9 @@ class ShotEncoder:
         self._p5 = bool(plan.p5 and settings.transcode.dovi.enabled)
         self._shards: Dict[int, "_Shard"] = {}
         self._shard_lock = threading.Lock()
+        # probes scheduled per shot, i.e. how many releases a shard waits for
+        # before it is deleted. probe_all sets it from the CRF grid.
+        self._probes_per_shot = 1
         # (peak_mb, command) of the heaviest child this phase, for diagnostics
         self._heaviest_cmd: Tuple[float, str] = (0.0, "")
 
@@ -730,8 +779,18 @@ class ShotEncoder:
             shots = [(int(a.frame_num), int(b.frame_num)) for a, b in scenes]
             if not shots:
                 shots = [(0, self.total_frames)]
+            detected = len(shots)
+            shots = merge_short_shots(shots, self.opt.min_shot_frames)
             shots = merge_to_max(shots, max(1, self.opt.max_shots))
-            logger.info("optimizer: {} shot(s) detected", len(shots))
+            self._validate_shots(shots)
+            if len(shots) != detected:
+                logger.info(
+                    "optimizer: {} shot(s) detected -> {} after merging "
+                    "(min_shot_frames={}, max_shots={})",
+                    detected, len(shots), self.opt.min_shot_frames,
+                    self.opt.max_shots)
+            else:
+                logger.info("optimizer: {} shot(s) detected", len(shots))
             return shots
         finally:
             if det_path is not None:
@@ -739,6 +798,47 @@ class ShotEncoder:
                     det_path.unlink()
                 except OSError:
                     pass
+
+    def _validate_shots(self, shots: List[Shot]) -> None:
+        """Check the shot list covers the source exactly once, in order.
+
+        The list decides which frames get encoded at all, and nothing
+        downstream can tell a missing scene from a short one: a gap silently
+        drops those frames from the output, an overlap encodes them twice, and
+        a list that stops early truncates the tail. All three are structural -
+        no source produces them legitimately - so they abort here rather than
+        surfacing as a duration mismatch hours later.
+
+        The tail is a different case. total_frames is int(fps * duration), an
+        ESTIMATE, while the shot list ends at the real frame count of whatever
+        scene detection read. So a disagreement there means the estimate was
+        off, not that the shots are wrong: warn, and take the shot list as
+        authoritative for progress reporting.
+        """
+        if not shots:
+            raise TranscodeError("scene detection produced an empty shot list")
+        if shots[0][0] != 0:
+            raise TranscodeError(
+                f"the shot list starts at frame {shots[0][0]}, not 0: the "
+                f"first {shots[0][0]} frame(s) would never be encoded")
+        for i, (a, b) in enumerate(shots):
+            if b <= a:
+                raise TranscodeError(
+                    f"shot {i} spans frames [{a}, {b}), which is empty")
+        for i, ((_, prev_end), (next_start, _)) in enumerate(zip(shots, shots[1:])):
+            if prev_end != next_start:
+                kind = "gap" if next_start > prev_end else "overlap"
+                raise TranscodeError(
+                    f"{kind} between shot {i} (ends at frame {prev_end}) and "
+                    f"shot {i + 1} (starts at frame {next_start}): the shot "
+                    f"list does not cover the source exactly once")
+        covered = shots[-1][1]
+        if covered != self.total_frames:
+            logger.warning(
+                "optimizer: shots cover {} frames but fps x duration estimated "
+                "{}; trusting the shot list", covered, self.total_frames)
+            self._log(f"total_frames {self.total_frames} -> {covered} (from shots)")
+            self.total_frames = covered
 
     # ---------- probe configuration ----------
     def _probe_grid(self) -> List[int]:
@@ -873,34 +973,53 @@ class ShotEncoder:
         return self._p5 or self.metric == "ssimulacra2"
 
     def _acquire_shard(self, idx: int, w0: int, w1: int, vf: List[str]) -> Optional[Path]:
-        """Ref-counted staged reference shard for a shot, or None when the job
-        reads its reference straight from the source."""
+        """Staged reference shard for a shot, built on first use, or None when
+        the job reads its reference straight from the source."""
         if not self._needs_shard():
             return None
         with self._shard_lock:
             entry = self._shards.get(idx)
             if entry is None:
                 dest = self._shard_dir(w1 - w0) / f"dv_{id(self):x}_{idx:05d}.mkv"
-                entry = _Shard(dest)
+                entry = _Shard(dest, self._probes_per_shot)
                 self._shards[idx] = entry
-            entry.refs += 1
         with entry.lock:
             if not entry.path.exists():
                 self._make_shard(idx, w0, w1, vf, entry.path)
         return entry.path
 
+    def _cleanup_shards(self) -> None:
+        """Drop any shard a failed phase left staged.
+
+        Shards live in transcode.dovi.p5_cache_dir (tmpfs by default), NOT
+        under tempdir, so the caller's rmtree of the temp directory never
+        reaches them. A job that dies mid-probe would otherwise leave multi-GB
+        files sitting in /dev/shm - i.e. holding RAM - until the container is
+        restarted.
+        """
+        with self._shard_lock:
+            shards = list(self._shards.values())
+            self._shards.clear()
+        for shard in shards:
+            shard.unlink()
+
     def _release_shard(self, idx: int) -> None:
+        """Mark one of the shot's probes finished; drop the shard after the last.
+
+        The unlink stays under _shard_lock: releasing it first is what let a
+        thread delete a file another had already rebuilt under the same key.
+        """
         if not self._needs_shard():
             return
         with self._shard_lock:
             entry = self._shards.get(idx)
             if entry is None:
                 return
-            entry.refs -= 1
-            if entry.refs > 0:
+            entry.pending -= 1
+            if entry.pending > 0:
                 return
             self._shards.pop(idx, None)
-        entry.unlink()
+            entry.unlink()
 
     def _vmaf_threads(self) -> int:
         """Threads for the libvmaf calculation.
@@ -1010,6 +1129,7 @@ class ShotEncoder:
     def probe_all(self, shots: List[Shot], grid: List[int]) -> ProbeSamples:
         workers = self._probe_workers(len(shots) * len(grid) or 1)
         self._probe_worker_count = workers
+        self._probes_per_shot = len(grid)
         lp = self._svt_lp(workers)
         scale = self._probe_scale()
         if scale:
@@ -1329,7 +1449,18 @@ class ShotEncoder:
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int,
                      threads: int, workers: int = 1) -> Path:
         dst = self.probe_dir / f"enc_{idx:05d}.ivf"
-        start = s0 / self.fps
+        # Seek half a frame EARLY. -ss discards frames whose timestamp is below
+        # the one asked for, and containers store those rounded (Matroska keeps
+        # whole milliseconds), so asking for a frame's exact time lands just
+        # under its stored timestamp about a third of the time and the shot
+        # starts one frame late. Measured against per-frame hashes of a real
+        # 16-shot split at 23.976fps: 6 of the 16 shots began on the wrong
+        # frame. Each slip drops a source frame and shifts everything after it,
+        # which cost 7.3 VMAF over the clip (83.5 -> 90.8 once fixed), and the
+        # last shot has no frame to borrow so the encode also comes up short.
+        # Half a period of slack is unambiguous: the preceding frame is a whole
+        # period further back. Measured after the change: 0 of 16 shots slip.
+        start = max(0.0, (s0 - 0.5) / self.fps)
         # encode exactly (s1 - s0) frames: `-t` on input-seeked shots is not
         # frame-exact (off by a frame per shot), and 762 shots x 1 frame drift
         # = seconds of A/V desync once the audio is muxed whole. `-frames:v`
@@ -1350,23 +1481,91 @@ class ShotEncoder:
                  "-frames:v", str(s1 - s0), "-map", "0:v:0"]
         if vf:
             args += ["-vf", ",".join(vf)]
-        args += ["-c:v", "libsvtav1",
-                 "-preset", str(self.video.preset), "-crf", self._fmt_crf(crf)]
-        if self.video.keyint:
-            args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]
         svt = _svt_params_dict(self.video)
         svt["lp"] = lp
+        args += ["-c:v", "libsvtav1", "-preset", str(self.video.preset)]
+        args += self._crf_args(crf, svt)
+        if self.video.keyint:
+            args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]
         args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items())]
         args += ["-pix_fmt", self._pix_fmt(), "-f", "ivf", str(dst)]
         self._run(args, timeout=7200)
         if not dst.exists() or dst.stat().st_size == 0:
             raise TranscodeError(f"shot {idx} produced no output")
+        self._assert_shot_length(idx, dst, s1 - s0)
         return dst
 
+    def _assert_shot_length(self, idx: int, dst: Path, expected: int) -> None:
+        """Fail the shot if the encoder did not write exactly `expected` frames.
+
+        The point is to make this class of fault LOUD. A shot that starts on
+        the wrong frame still emits the right count (-frames:v guarantees it),
+        which is how a seek that mis-landed on 6 of 16 shots stayed invisible
+        for months: frame count, duration and A/V sync all still checked out,
+        and only the final shot - with no frame left to borrow - came up short.
+        Counting here catches that at the shot that caused it rather than as a
+        42ms discrepancy at the end of a multi-hour job.
+
+        IVF carries one packet per displayed frame, so this is an index walk on
+        a few-MB file: measured 58ms for a 96-frame 4K shot, i.e. ~29s spread
+        across the encode pool for a 500-shot feature.
+
+        NB: when scene detection finds nothing at all the shot list falls back
+        to a single shot of int(fps * duration), which is an estimate and can
+        overshoot the real frame count by a frame. That path would report a
+        shortfall here; the message says exactly what was seen either way.
+        """
+        written = self._count_frames(dst)
+        if written is None or written == expected:
+            return
+        raise TranscodeError(
+            f"shot {idx} encoded {written} frames but the shot spans "
+            f"{expected}: the source range for this shot did not yield the "
+            f"frames it should have (a seek that landed on the wrong frame, or "
+            f"a shot list running past the end of the source)")
+
+    def _count_frames(self, path: Path) -> Optional[int]:
+        """Frames in a per-shot ivf, or None when ffprobe cannot say."""
+        try:
+            out = self._run(
+                [self.settings.tool_path("ffprobe"), "-v", "error",
+                 "-select_streams", "v:0", "-count_packets",
+                 "-show_entries", "stream=nb_read_packets",
+                 "-of", "csv=p=0", str(path)], timeout=300)
+        except (TranscodeError, FileNotFoundError) as e:
+            logger.warning("could not count frames in {} ({}); "
+                           "skipping the shot length check", path.name, e)
+            return None
+        text = out.strip().splitlines()[-1].strip().rstrip(",") if out.strip() else ""
+        try:
+            return int(text)
+        except ValueError:
+            logger.warning("unexpected ffprobe frame count for {}: {!r}",
+                           path.name, text)
+            return None
+
+    def _crf_args(self, crf: float, svt: Dict[str, object]) -> List[str]:
+        """The chosen CRF as ffmpeg args, written into `svt` when fractional.
+
+        ffmpeg's -crf is an INTEGER AVOption for libsvtav1, so a decimal is
+        truncated on the way in: measured on SVT-AV1 v4.2, "-crf 28.5" produces
+        a byte-identical file to "-crf 28" while "-crf 29" differs. That made
+        fractional_crf a silent no-op and threw away the fine-grained CRF this
+        engine exists to interpolate. SVT-AV1 itself accepts a fractional CRF,
+        and -svtav1-params is handed to the library verbatim, so that is the
+        only route which reaches it (measured: crf=28.5 lands between 28 and 29).
+        """
+        text = self._fmt_crf(crf)
+        if self.opt.fractional_crf:
+            svt["crf"] = text
+            return []
+        return ["-crf", text]
+
     def _fmt_crf(self, crf: float) -> str:
+        crf = max(0.0, min(63.0, crf))
         if self.opt.fractional_crf:
             return f"{crf:g}"
-        return str(max(0, min(63, round(crf))))
+        return str(round(crf))
 
     # ---------- phase 5: concat + mux ----------
     # tx3g only exists in MP4; Matroska cannot carry it, so those have to be
@@ -1505,4 +1704,5 @@ class ShotEncoder:
             self.concat_shots(ivf_paths)
             self._report(100.0, self.total_frames, self.total_frames)
         finally:
+            self._cleanup_shards()
             self.close()

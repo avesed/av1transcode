@@ -598,11 +598,15 @@ def test_detect_shots_reports_frame_progress(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     reports = []
     enc.progress_cb = lambda pct, stats: reports.append((pct, stats))
+    # detection runs against the fps x duration estimate; _validate_shots then
+    # replaces it with what the shots actually cover, so capture it first
+    estimated = enc.total_frames
     shots = enc.detect_shots()
     assert shots == [(0, 100), (100, 200), (200, 400), (400, 800)]
     # scene detection reports frame-level progress (done/total = frames)
-    frame_reports = [s for _, s in reports if s.get("total") == enc.total_frames]
+    frame_reports = [s for _, s in reports if s.get("total") == estimated]
     assert frame_reports, "no frame progress reported during scene detection"
+    assert enc.total_frames == 800, "the shot list is authoritative afterwards"
 
 
 def test_make_detection_copy(settings, info, plan, tmp_path, monkeypatch):
@@ -778,6 +782,7 @@ def test_p5_probe_converts_once_per_shot(settings, info, plan, tmp_path):
 
     enc._run = fake_run.__get__(enc)
     grid = [20, 32, 44]
+    enc._probes_per_shot = len(grid)          # probe_all sets this for real runs
     with __import__("concurrent.futures", fromlist=["x"]).ThreadPoolExecutor(3) as ex:
         list(ex.map(lambda c: enc._probe_one(0, 0, 90, c, 4), grid))
 
@@ -983,3 +988,275 @@ def test_subtitle_probe_failure_falls_back_to_copy(settings, info, plan, tmp_pat
     enc = make_encoder(settings, info, plan, tmp_path)
     assert _sub_args(enc, "", fail=True) == ["-c:s", "copy"]
     assert _sub_args(enc, "\n") == ["-c:s", "copy"]
+
+
+# ---- fractional CRF must reach SVT-AV1, not ffmpeg's integer -crf option ----
+def _encode_cmd(enc, crf):
+    cmds = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc._encode_shot(0, 0, 90, crf, lp=4, threads=32, workers=1)
+    return cmds[0]
+
+
+def test_integer_crf_still_uses_ffmpeg_crf_option(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.fractional_crf = False
+    cmd = _encode_cmd(make_encoder(settings, info, plan, tmp_path), 28.4)
+    assert cmd[cmd.index("-crf") + 1] == "28"
+    assert "crf=" not in cmd[cmd.index("-svtav1-params") + 1]
+
+
+def test_fractional_crf_goes_through_svtav1_params(settings, info, plan, tmp_path):
+    """ffmpeg's -crf is an INTEGER AVOption for libsvtav1: -crf 28.5 encodes
+    byte-identically to -crf 28, so routing a decimal there threw away the
+    interpolation. -svtav1-params reaches the library verbatim (verified
+    against SVT-AV1 v4.2: it reports "CRF / 28.50")."""
+    settings.transcode.optimizer.fractional_crf = True
+    cmd = _encode_cmd(make_encoder(settings, info, plan, tmp_path), 28.5)
+    assert "-crf" not in cmd                       # never both: svt would win anyway
+    assert "crf=28.5" in cmd[cmd.index("-svtav1-params") + 1]
+
+
+def test_fmt_crf_clamps_to_the_valid_range(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    settings.transcode.optimizer.fractional_crf = True
+    assert enc._fmt_crf(-3.0) == "0"
+    assert enc._fmt_crf(70.5) == "63"
+    settings.transcode.optimizer.fractional_crf = False
+    assert enc._fmt_crf(70.5) == "63"
+
+
+# ---- shards live outside tempdir, so a failed job has to drop them itself ----
+def test_cleanup_shards_removes_staged_files(settings, info, plan, tmp_path):
+    enc = _p5_encoder(settings, info, plan, tmp_path, tmp_path)
+    stray = tmp_path / "dv_stray.mkv"
+    stray.write_bytes(b"shard")
+    enc._shards[0] = opt._Shard(stray, 1)
+    enc._cleanup_shards()
+    assert not stray.exists()
+    assert enc._shards == {}
+
+
+def test_run_drops_shards_when_a_phase_fails(settings, info, plan, tmp_path):
+    """p5_cache_dir is tmpfs by default, and it is NOT under tempdir: without
+    this the shards of a job that dies mid-probe hold RAM until restart."""
+    enc = _p5_encoder(settings, info, plan, tmp_path, tmp_path)
+    stray = tmp_path / "dv_held.mkv"
+    stray.write_bytes(b"shard")
+    enc._shards[0] = opt._Shard(stray, 1)
+
+    def boom():
+        raise opt.TranscodeError("scene detection exploded")
+
+    enc.detect_shots = boom
+    with pytest.raises(opt.TranscodeError):
+        enc.run()
+    assert not stray.exists()
+
+
+def test_shard_survives_probes_that_do_not_overlap(settings, info, plan, tmp_path):
+    """The probe pool often runs a shot's CRFs back to back rather than at the
+    same time. An acquire/release refcount hits zero between them, so the shard
+    was deleted and rebuilt once per CRF - and the delete could land on a file
+    the next probe had already written."""
+    cache = tmp_path / "shm"
+    cache.mkdir()
+    enc = _p5_encoder(settings, info, plan, tmp_path, cache)
+    conversions = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if "ffv1" in args:
+            conversions.append(args[-1])
+            Path(args[-1]).write_bytes(b"shard")
+        elif any("libvmaf=" in a for a in args):
+            lavfi = args[args.index("-lavfi") + 1]
+            log = lavfi.split("log_path=")[1].split(":")[0]
+            Path(log).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
+        elif "-f" in args and args[args.index("-f") + 1] == "ivf":
+            Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    grid = [20, 32, 44]
+    enc._probes_per_shot = len(grid)
+    for crf in grid:                          # strictly sequential, no overlap
+        enc._probe_one(0, 0, 90, crf, 4)
+
+    assert len(conversions) == 1, "the shot was converted once per CRF"
+    assert not list(cache.iterdir()), "the shard outlived its last probe"
+
+
+# ---- short shots are expensive per frame and gain least from their own CRF ----
+def test_merge_short_shots_folds_into_the_shorter_neighbour():
+    # the 10-frame shot sits between a 40-frame and a 100-frame shot
+    shots = [(0, 40), (40, 50), (50, 150)]
+    assert opt.merge_short_shots(shots, 24) == [(0, 50), (50, 150)]
+
+
+def test_merge_short_shots_coalesces_a_run_of_tiny_shots():
+    """A run of tiny shots must collapse among themselves rather than all
+    piling onto the one long neighbour next to them."""
+    shots = [(0, 10), (10, 20), (20, 30), (30, 400)]
+    merged = opt.merge_short_shots(shots, 24)
+    assert merged == [(0, 30), (30, 400)]
+
+
+def test_merge_short_shots_leaves_nothing_under_the_bound():
+    shots = [(0, 30), (30, 45), (45, 60), (60, 200), (200, 210)]
+    merged = opt.merge_short_shots(shots, 48)
+    assert all(b - a >= 48 for a, b in merged)
+
+
+def test_merge_short_shots_is_a_noop_when_disabled_or_already_long():
+    shots = [(0, 100), (100, 250)]
+    assert opt.merge_short_shots(shots, 0) == shots
+    assert opt.merge_short_shots([(0, 5), (5, 9)], 0) == [(0, 5), (5, 9)]
+    assert opt.merge_short_shots(shots, 48) == shots
+
+
+def test_merge_short_shots_keeps_full_coverage():
+    shots = [(0, 12), (12, 33), (33, 40), (40, 300), (300, 305)]
+    merged = opt.merge_short_shots(shots, 64)
+    assert merged[0][0] == 0 and merged[-1][1] == 305
+    assert all(a[1] == b[0] for a, b in zip(merged, merged[1:]))
+
+
+def test_merge_short_shots_survives_a_single_short_shot():
+    # nothing to merge with: the shot stands even though it is under the bound
+    assert opt.merge_short_shots([(0, 10)], 48) == [(0, 10)]
+
+
+def test_detect_shots_applies_min_shot_frames(settings, info, plan, tmp_path):
+    # 40 40 40 40 pairs up rather than collapsing onto one neighbour
+    _install_fake_scenedetect([(0, 40), (40, 80), (80, 120), (120, 160)])
+    settings.transcode.optimizer.min_shot_frames = 48
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc.detect_shots() == [(0, 80), (80, 160)]
+    settings.transcode.optimizer.min_shot_frames = 0
+    assert enc.detect_shots() == [(0, 40), (40, 80), (80, 120), (120, 160)]
+
+
+def test_encode_shot_seeks_half_a_frame_early(settings, info, plan, tmp_path):
+    """-ss drops frames below the requested timestamp and containers store
+    those rounded, so asking for a frame's exact time starts the shot one frame
+    late often enough to matter. Measured: the last shot of a real 16-shot
+    split returned 35 frames instead of 36."""
+    enc = make_encoder(settings, info, plan, tmp_path)   # 30fps
+    cmds = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc._encode_shot(3, 300, 390, 30.0, lp=4, threads=32, workers=1)
+    cmd = cmds[0]
+    assert float(cmd[cmd.index("-ss") + 1]) == pytest.approx(299.5 / 30.0, abs=1e-6)
+    assert cmd[cmd.index("-frames:v") + 1] == "90"       # count is still exact
+
+
+def test_encode_shot_never_seeks_before_the_start(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    cmd = _encode_cmd(enc, 30.0)                          # shot 0 starts at frame 0
+    assert float(cmd[cmd.index("-ss") + 1]) == 0.0
+
+
+# ---- the shot list must cover the source exactly once ----
+def _enc_for_shots(settings, info, plan, tmp_path, total=1800):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc.total_frames = total
+    return enc
+
+
+def test_validate_shots_accepts_a_clean_list(settings, info, plan, tmp_path):
+    enc = _enc_for_shots(settings, info, plan, tmp_path, total=400)
+    enc._validate_shots([(0, 100), (100, 250), (250, 400)])
+
+
+def test_validate_shots_rejects_a_gap(settings, info, plan, tmp_path):
+    """A gap silently drops those frames from the output and nothing
+    downstream can tell a missing scene from a short one."""
+    enc = _enc_for_shots(settings, info, plan, tmp_path, total=400)
+    with pytest.raises(opt.TranscodeError, match="gap"):
+        enc._validate_shots([(0, 100), (150, 400)])
+
+
+def test_validate_shots_rejects_an_overlap(settings, info, plan, tmp_path):
+    enc = _enc_for_shots(settings, info, plan, tmp_path, total=400)
+    with pytest.raises(opt.TranscodeError, match="overlap"):
+        enc._validate_shots([(0, 200), (150, 400)])
+
+
+def test_validate_shots_rejects_a_late_start(settings, info, plan, tmp_path):
+    enc = _enc_for_shots(settings, info, plan, tmp_path, total=400)
+    with pytest.raises(opt.TranscodeError, match="starts at frame 12"):
+        enc._validate_shots([(12, 400)])
+
+
+def test_validate_shots_rejects_an_empty_shot(settings, info, plan, tmp_path):
+    enc = _enc_for_shots(settings, info, plan, tmp_path, total=400)
+    with pytest.raises(opt.TranscodeError, match="empty"):
+        enc._validate_shots([(0, 100), (100, 100), (100, 400)])
+    with pytest.raises(opt.TranscodeError, match="empty shot list"):
+        enc._validate_shots([])
+
+
+def test_validate_shots_trusts_the_list_over_the_fps_estimate(
+        settings, info, plan, tmp_path):
+    """total_frames is int(fps * duration) - an estimate - while the shot list
+    ends at the real frame count scene detection read."""
+    enc = _enc_for_shots(settings, info, plan, tmp_path, total=1801)
+    enc._validate_shots([(0, 900), (900, 1800)])
+    assert enc.total_frames == 1800
+
+
+# ---- every shot must encode exactly the frames it spans ----
+def _encoder_writing(enc, frames_written):
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if "ffprobe" in args[0]:
+            return f"{frames_written},\n"
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    return enc
+
+
+def test_shot_length_check_passes_on_an_exact_encode(settings, info, plan, tmp_path):
+    enc = _encoder_writing(make_encoder(settings, info, plan, tmp_path), 90)
+    enc._encode_shot(0, 0, 90, 30.0, lp=4, threads=32, workers=1)
+
+
+def test_shot_length_check_catches_a_short_encode(settings, info, plan, tmp_path):
+    """The failure this exists for: a seek that lands on the wrong frame still
+    emits the right count mid-file, but the final shot has no frame left to
+    borrow and comes up short - which used to reach the muxer unnoticed."""
+    enc = _encoder_writing(make_encoder(settings, info, plan, tmp_path), 89)
+    with pytest.raises(opt.TranscodeError, match="encoded 89 frames"):
+        enc._encode_shot(15, 1404, 1494, 30.0, lp=4, threads=32, workers=1)
+
+
+def test_shot_length_check_skipped_when_ffprobe_cannot_answer(
+        settings, info, plan, tmp_path):
+    """A broken ffprobe must not fail an otherwise good encode."""
+    enc = _encoder_writing(make_encoder(settings, info, plan, tmp_path), 0)
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if "ffprobe" in args[0]:
+            return "N/A\n"
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc._encode_shot(0, 0, 90, 30.0, lp=4, threads=32, workers=1)
