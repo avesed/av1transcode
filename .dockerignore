@@ -1,0 +1,14 @@
+.git
+.gitignore
+media
+sample
+test_footage_1080p
+tests
+data
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.playwright-mcp
+:memory-slack:
+*.log
