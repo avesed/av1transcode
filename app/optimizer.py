@@ -85,6 +85,44 @@ def pick_crf(samples: List[Tuple[int, float]], target: float) -> float:
     return float(min(pts, key=lambda p: abs(p[1] - target))[0])
 
 
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def bracket_for(samples: List[Tuple[int, float]], target: float) -> Optional[Tuple[int, int]]:
+    """The two adjacent probed CRFs the target score falls between.
+
+    None when the target does not fall between any pair - either the best
+    (lowest) CRF probed already scores at or below it, so no bracket can
+    exist and pick_crf clamps, or the worst already beats it and there is
+    nothing to buy by spending more bits. Both cases mean more probing on this
+    shot cannot change the answer.
+    """
+    pts = sorted((c, sc) for c, sc in samples if sc is not None)
+    if len(pts) < 2 or pts[0][1] <= target or pts[-1][1] >= target:
+        return None
+    for (c_lo, s_lo), (c_hi, s_hi) in zip(pts, pts[1:]):
+        if s_lo >= target >= s_hi:
+            return c_lo, c_hi
+    return None
+
+
+def seed_crfs(grid: List[int], count: int = 3) -> List[int]:
+    """The coarse CRFs an adaptive search starts from: both ends plus enough
+    interior points to have something to interpolate, taken from `grid` so the
+    configured search space still decides the range."""
+    if not grid:
+        return []
+    ordered = sorted(set(grid))
+    count = max(2, min(count, len(ordered)))
+    last = len(ordered) - 1
+    return [ordered[j] for j in sorted({round(i * last / (count - 1))
+                                        for i in range(count)})]
+
+
 def predict_score(samples: List[Tuple[int, float]], crf: float) -> Optional[float]:
     """The score the probes predict at `crf`, interpolated the way pick_crf
     inverts. Returns None when there is nothing to interpolate.
@@ -250,34 +288,6 @@ def parse_score(json_path: Path, metric: str) -> float:
     raise TranscodeError(f"could not parse {metric} score from {json_path}")
 
 
-class _Shard:
-    """A converted per-shot clip, shared by every probe of that shot.
-
-    The probe pool schedules one task per (shot, CRF), so the grid's worth of
-    tasks for one shot must convert once, not once each, and the file has to
-    survive until the last of them is done.
-
-    `pending` counts the probes still to run for the shot and is fixed up
-    front, rather than counting live acquisitions. An acquire/release refcount
-    hits zero every time a shot momentarily has no probe in flight - which
-    happens whenever the pool runs a shot's tasks back to back rather than
-    concurrently - and each of those zeroes deleted a shard the next task then
-    had to rebuild. Worse, the delete raced that rebuild: the deleting thread
-    could unlink the file the new one had just written.
-    """
-
-    def __init__(self, path: Path, pending: int) -> None:
-        self.path = path
-        self.pending = max(1, pending)
-        self.lock = threading.Lock()
-
-    def unlink(self) -> None:
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
-
-
 # ---- the engine -----------------------------------------------------------
 
 def run_shot_transcode(
@@ -366,11 +376,8 @@ class ShotEncoder:
         # RPU applied before it means anything. Done per shot rather than once
         # over the whole file - see _acquire_shard.
         self._p5 = bool(plan.p5 and settings.transcode.dovi.enabled)
-        self._shards: Dict[int, "_Shard"] = {}
+        self._shards: Dict[int, Path] = {}
         self._shard_lock = threading.Lock()
-        # probes scheduled per shot, i.e. how many releases a shard waits for
-        # before it is deleted. probe_all sets it from the CRF grid.
-        self._probes_per_shot = 1
         # (peak_mb, command) of the heaviest child this phase, for diagnostics
         self._heaviest_cmd: Tuple[float, str] = (0.0, "")
 
@@ -1029,20 +1036,21 @@ class ShotEncoder:
         return self._p5 or self.metric == "ssimulacra2"
 
     def _acquire_shard(self, idx: int, w0: int, w1: int, vf: List[str]) -> Optional[Path]:
-        """Staged reference shard for a shot, built on first use, or None when
-        the job reads its reference straight from the source."""
+        """Staged reference shard for a shot, or None when the job reads its
+        reference straight from the source.
+
+        One pool task owns a shot for the whole of its probing, so the shard is
+        built, used by every probe of that shot and dropped without ever being
+        shared: no refcount, no per-shard lock. The dict is only kept so a
+        failed phase can find what is still on disk (see _cleanup_shards).
+        """
         if not self._needs_shard():
             return None
+        dest = self._shard_dir(w1 - w0) / f"dv_{id(self):x}_{idx:05d}.mkv"
         with self._shard_lock:
-            entry = self._shards.get(idx)
-            if entry is None:
-                dest = self._shard_dir(w1 - w0) / f"dv_{id(self):x}_{idx:05d}.mkv"
-                entry = _Shard(dest, self._probes_per_shot)
-                self._shards[idx] = entry
-        with entry.lock:
-            if not entry.path.exists():
-                self._make_shard(idx, w0, w1, vf, entry.path)
-        return entry.path
+            self._shards[idx] = dest
+        self._make_shard(idx, w0, w1, vf, dest)
+        return dest
 
     def _cleanup_shards(self) -> None:
         """Drop any shard a failed phase left staged.
@@ -1056,26 +1064,17 @@ class ShotEncoder:
         with self._shard_lock:
             shards = list(self._shards.values())
             self._shards.clear()
-        for shard in shards:
-            shard.unlink()
+        for dest in shards:
+            _unlink(dest)
 
     def _release_shard(self, idx: int) -> None:
-        """Mark one of the shot's probes finished; drop the shard after the last.
-
-        The unlink stays under _shard_lock: releasing it first is what let a
-        thread delete a file another had already rebuilt under the same key.
-        """
+        """Drop the shot's shard once its probing is done."""
         if not self._needs_shard():
             return
         with self._shard_lock:
-            entry = self._shards.get(idx)
-            if entry is None:
-                return
-            entry.pending -= 1
-            if entry.pending > 0:
-                return
-            self._shards.pop(idx, None)
-            entry.unlink()
+            dest = self._shards.pop(idx, None)
+        if dest is not None:
+            _unlink(dest)
 
     def _vmaf_threads(self) -> int:
         """Threads for the libvmaf calculation.
@@ -1183,9 +1182,17 @@ class ShotEncoder:
         return max(1, min(w, n_tasks))
 
     def probe_all(self, shots: List[Shot], grid: List[int]) -> ProbeSamples:
-        workers = self._probe_workers(len(shots) * len(grid) or 1)
+        """Probe every shot, one pool task per shot.
+
+        Per SHOT rather than per (shot, CRF): the CRFs of a shot are now chosen
+        adaptively, so each one depends on the scores before it and they have
+        to run in order. Parallelism comes from the shots, of which there are
+        hundreds - far more than the worker count - so nothing is lost, and
+        the staged reference shard a shot may need is now built, used and
+        dropped inside one task instead of being shared across the pool.
+        """
+        workers = self._probe_workers(len(shots) or 1)
         self._probe_worker_count = workers
-        self._probes_per_shot = len(grid)
         lp = self._svt_lp(workers)
         scale = self._probe_scale()
         if scale:
@@ -1194,24 +1201,23 @@ class ShotEncoder:
                 "different resolution than the final encode, so the CRF picked "
                 "from them does not transfer. Leave it empty unless you are "
                 "trading accuracy for speed on purpose.", scale)
-        tasks = [(i, s0, s1, crf) for i, (s0, s1) in enumerate(shots) for crf in grid]
         results: ProbeSamples = {}
         done_shots = 0
-        per_shot_done = [0] * len(shots)
         self._heaviest_cmd = (0.0, "")
-        self._log(f"probing {len(shots)} shots x {len(grid)} crfs with {workers} workers (svt lp={lp})")
+        width = int(self.opt.probe_bracket_width or 0)
+        plan = (f"adaptive from {seed_crfs(grid)} down to a {width}-wide bracket"
+                if width > 0 else f"the full {len(grid)}-point grid {grid}")
+        self._log(f"probing {len(shots)} shots with {workers} workers "
+                  f"(svt lp={lp}), {plan}")
         stop, peak = self._start_mem_sampler()
         try:
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = [ex.submit(self._probe_one, i, s0, s1, crf, lp)
-                        for i, s0, s1, crf in tasks]
+                futs = {ex.submit(self._probe_shot, i, s0, s1, grid, lp): i
+                        for i, (s0, s1) in enumerate(shots)}
                 for fut in as_completed(futs):
                     self._check_cancel()
-                    i, crf, score = fut.result()
-                    results.setdefault(i, {})[crf] = score
-                    per_shot_done[i] += 1
-                    if per_shot_done[i] == len(grid):
-                        done_shots += 1
+                    results[futs[fut]] = fut.result()
+                    done_shots += 1
                     # stage-local progress: the bar matches done/total shots
                     pct = done_shots / max(len(shots), 1) * 100
                     self._report(pct, done_shots, len(shots))
@@ -1221,17 +1227,61 @@ class ShotEncoder:
             if self._heaviest_cmd[1] else ""
         self._mem_log(f"[mem] probing peak children RSS={peak[0]:.0f}MB "
                       f"(python={self._py_rss_mb():.0f}MB){heavy}")
+        spent = sum(len(v) for v in results.values())
+        if results:
+            self._mem_log(
+                f"probes: {spent} for {len(results)} shot(s), "
+                f"{spent / len(results):.2f} per shot "
+                f"(a full grid would have been {len(grid)})")
         return results
 
-    def _probe_one(self, idx: int, s0: int, s1: int, crf: int, lp: int) -> Tuple[int, int, float]:
+    def _probe_shot(self, idx: int, s0: int, s1: int, grid: List[int],
+                    lp: int) -> Dict[int, float]:
+        """Probe one shot and return {crf: score}.
+
+        With probe_bracket_width set, this is a bisection rather than a sweep:
+        probe a coarse seed, find the two CRFs the target falls between, and
+        halve that interval until it is narrow enough or the budget runs out.
+        A uniform grid spends the same probes everywhere regardless of where
+        the target lands; bisection spends them where the answer is, so the
+        interval that decides the CRF ends up at least as tight as the grid's
+        for fewer probes - and shots whose target is out of reach altogether
+        stop as soon as that is known instead of sweeping to the end.
+        """
         self._check_cancel()
         w0, w1 = self._probe_window(s0, s1)
         _, probe_vf = self._probe_input(w0, w1)
         shard = self._acquire_shard(idx, w0, w1, probe_vf)
+        scores: Dict[int, float] = {}
         try:
-            return self._probe_encode_and_score(idx, w0, w1, crf, lp, shard)
+            width = int(self.opt.probe_bracket_width or 0)
+            budget = self._probe_budget(grid)
+            order = seed_crfs(grid) if width > 0 else sorted(set(grid))
+            for crf in order[:budget]:
+                _, _, scores[crf] = self._probe_encode_and_score(
+                    idx, w0, w1, crf, lp, shard)
+            if width <= 0:
+                return scores
+            while len(scores) < budget:
+                self._check_cancel()
+                span = bracket_for(list(scores.items()), self.target)
+                if span is None or span[1] - span[0] <= width:
+                    break
+                mid = (span[0] + span[1]) // 2
+                if mid in scores:
+                    break
+                _, _, scores[mid] = self._probe_encode_and_score(
+                    idx, w0, w1, mid, lp, shard)
+            return scores
         finally:
             self._release_shard(idx)
+
+    def _probe_budget(self, grid: List[int]) -> int:
+        """Most probes one shot may spend. The grid already carries the
+        video.probes cap (see _probe_grid), so its size is the budget - which
+        also means adaptive probing can never cost more than the sweep it
+        replaces, only less."""
+        return max(2, len(set(grid)))
 
     def _probe_encode_and_score(self, idx: int, w0: int, w1: int, crf: int,
                                 lp: int, shard: Optional[Path]) -> Tuple[int, int, float]:

@@ -490,7 +490,7 @@ def _capture_probe(enc, tmp_path):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    enc._probe_one(0, 0, 90, 28, lp=4)
+    enc._probe_shot(0, 0, 90, [28], lp=4)
     return cmds
 
 
@@ -791,10 +791,8 @@ def test_p5_probe_converts_once_per_shot(settings, info, plan, tmp_path):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    grid = [20, 32, 44]
-    enc._probes_per_shot = len(grid)          # probe_all sets this for real runs
-    with __import__("concurrent.futures", fromlist=["x"]).ThreadPoolExecutor(3) as ex:
-        list(ex.map(lambda c: enc._probe_one(0, 0, 90, c, 4), grid))
+    settings.transcode.optimizer.probe_bracket_width = 0     # sweep the grid
+    enc._probe_shot(0, 0, 90, [20, 32, 44], lp=4)
 
     shard_cmds = [c for c in cmds if "ffv1" in c]
     assert len(shard_cmds) == 1, "the shot was converted more than once"
@@ -909,7 +907,7 @@ def test_ssimulacra2_stages_a_reference_shard(settings, info, plan, tmp_path):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    _, _, score = enc._probe_one(0, 0, 90, 32, lp=4)
+    score = enc._probe_shot(0, 0, 90, [32], lp=4)[32]
     assert score == pytest.approx(93.512)
 
     shard_cmd = [c for c in cmds if "ffv1" in c][0]
@@ -935,7 +933,7 @@ def test_xpsnr_parses_weighted_luma(settings, info, plan, tmp_path):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    _, _, score = enc._probe_one(0, 0, 90, 32, lp=4)
+    score = enc._probe_shot(0, 0, 90, [32], lp=4)[32]
     assert score == pytest.approx(43.6691)
 
 
@@ -956,7 +954,7 @@ def test_ssimulacra2_error_names_the_missing_plugins(settings, info, plan, tmp_p
 
     enc._run = fake_run.__get__(enc)
     with pytest.raises(Exception, match="vszip"):
-        enc._probe_one(0, 0, 90, 32, lp=4)
+        enc._probe_shot(0, 0, 90, [32], lp=4)
 
 
 # ---- subtitle codec selection for the mux ----
@@ -1047,7 +1045,7 @@ def test_cleanup_shards_removes_staged_files(settings, info, plan, tmp_path):
     enc = _p5_encoder(settings, info, plan, tmp_path, tmp_path)
     stray = tmp_path / "dv_stray.mkv"
     stray.write_bytes(b"shard")
-    enc._shards[0] = opt._Shard(stray, 1)
+    enc._shards[0] = stray
     enc._cleanup_shards()
     assert not stray.exists()
     assert enc._shards == {}
@@ -1059,7 +1057,7 @@ def test_run_drops_shards_when_a_phase_fails(settings, info, plan, tmp_path):
     enc = _p5_encoder(settings, info, plan, tmp_path, tmp_path)
     stray = tmp_path / "dv_held.mkv"
     stray.write_bytes(b"shard")
-    enc._shards[0] = opt._Shard(stray, 1)
+    enc._shards[0] = stray
 
     def boom():
         raise opt.TranscodeError("scene detection exploded")
@@ -1070,11 +1068,11 @@ def test_run_drops_shards_when_a_phase_fails(settings, info, plan, tmp_path):
     assert not stray.exists()
 
 
-def test_shard_survives_probes_that_do_not_overlap(settings, info, plan, tmp_path):
-    """The probe pool often runs a shot's CRFs back to back rather than at the
-    same time. An acquire/release refcount hits zero between them, so the shard
-    was deleted and rebuilt once per CRF - and the delete could land on a file
-    the next probe had already written."""
+def test_shard_is_built_once_for_all_of_a_shots_probes(settings, info, plan, tmp_path):
+    """One pool task owns a shot for the whole of its probing, so the shard is
+    built once and dropped at the end. This used to be an acquire/release
+    refcount that hit zero between probes, deleting and rebuilding the shard
+    once per CRF - and racing the rebuild."""
     cache = tmp_path / "shm"
     cache.mkdir()
     enc = _p5_encoder(settings, info, plan, tmp_path, cache)
@@ -1094,10 +1092,8 @@ def test_shard_survives_probes_that_do_not_overlap(settings, info, plan, tmp_pat
         return ""
 
     enc._run = fake_run.__get__(enc)
-    grid = [20, 32, 44]
-    enc._probes_per_shot = len(grid)
-    for crf in grid:                          # strictly sequential, no overlap
-        enc._probe_one(0, 0, 90, crf, 4)
+    settings.transcode.optimizer.probe_bracket_width = 0     # sweep the grid
+    enc._probe_shot(0, 0, 90, [20, 32, 44], lp=4)
 
     assert len(conversions) == 1, "the shot was converted once per CRF"
     assert not list(cache.iterdir()), "the shard outlived its last probe"
@@ -1403,3 +1399,77 @@ def test_verify_is_off_when_disabled(settings, info, plan, tmp_path):
 
     enc._run = boom.__get__(enc)
     enc.verify_delivered([(0, 90)], {0: 30.0}, {})
+
+
+# ---- adaptive probing: spend probes on the interval that decides the CRF ----
+def test_bracket_for_finds_the_pair_the_target_falls_between():
+    pts = [(20, 95.0), (32, 84.0), (44, 70.0)]
+    assert opt.bracket_for(pts, 90.0) == (20, 32)
+    assert opt.bracket_for(pts, 75.0) == (32, 44)
+
+
+def test_bracket_for_is_none_when_more_probing_cannot_help():
+    pts = [(20, 95.0), (32, 84.0), (44, 70.0)]
+    assert opt.bracket_for(pts, 99.0) is None    # unreachable at the best CRF
+    assert opt.bracket_for(pts, 60.0) is None    # already met at the worst
+    assert opt.bracket_for([(20, 95.0)], 90.0) is None   # nothing to bracket
+
+
+def test_seed_crfs_keeps_both_ends():
+    assert opt.seed_crfs([20, 26, 32, 38, 44]) == [20, 32, 44]
+    assert opt.seed_crfs([20, 26, 32, 38, 44], 4) == [20, 26, 38, 44]
+    assert opt.seed_crfs([20, 44]) == [20, 44]
+    assert opt.seed_crfs([]) == []
+
+
+def _linear_curve(crf: float) -> float:
+    """95 VMAF at CRF 20 falling to 59 at 44 - target 75 sits near CRF 35."""
+    return 95.0 - (crf - 20) * 1.5
+
+
+def _adaptive_encoder(settings, info, plan, tmp_path, curve, target="75"):
+    """An encoder whose probes return `curve(crf)`, recording the CRFs tried."""
+    plan.params.target_quality = target
+    enc = make_encoder(settings, info, plan, tmp_path)
+    tried = []
+
+    def fake(self, idx, w0, w1, crf, lp, shard):
+        tried.append(crf)
+        return idx, crf, curve(crf)
+
+    enc._probe_encode_and_score = fake.__get__(enc)
+    return enc, tried
+
+
+def test_adaptive_probing_bisects_towards_the_target(settings, info, plan, tmp_path):
+    enc, tried = _adaptive_encoder(settings, info, plan, tmp_path, _linear_curve)
+    settings.transcode.optimizer.probe_bracket_width = 6
+    scores = enc._probe_shot(0, 0, 90, [20, 26, 32, 38, 44], lp=4)
+    assert tried[:3] == [20, 32, 44], "did not start from the coarse seeds"
+    # target 75 falls between 32 and 44; one bisection at 38 closes it to 6
+    assert tried == [20, 32, 44, 38]
+    assert opt.bracket_for(list(scores.items()), 75.0) == (32, 38)
+
+
+def test_adaptive_probing_stops_early_when_the_target_is_unreachable(
+        settings, info, plan, tmp_path):
+    """Nothing on the grid reaches 99, so the sweep's remaining probes would
+    all be wasted - pick_crf clamps to the best CRF either way."""
+    enc, tried = _adaptive_encoder(settings, info, plan, tmp_path, _linear_curve, target="99")
+    settings.transcode.optimizer.probe_bracket_width = 6
+    enc._probe_shot(0, 0, 90, [20, 26, 32, 38, 44], lp=4)
+    assert tried == [20, 32, 44], "kept probing after the answer was decided"
+
+
+def test_adaptive_probing_never_exceeds_the_grid_budget(settings, info, plan, tmp_path):
+    enc, tried = _adaptive_encoder(settings, info, plan, tmp_path, _linear_curve)
+    settings.transcode.optimizer.probe_bracket_width = 1   # ask for a tight one
+    enc._probe_shot(0, 0, 90, [20, 26, 32, 38, 44], lp=4)
+    assert len(tried) <= 5, "adaptive probing cost more than the sweep it replaces"
+
+
+def test_probe_bracket_width_zero_sweeps_the_whole_grid(settings, info, plan, tmp_path):
+    enc, tried = _adaptive_encoder(settings, info, plan, tmp_path, _linear_curve)
+    settings.transcode.optimizer.probe_bracket_width = 0
+    enc._probe_shot(0, 0, 90, [20, 26, 32, 38, 44], lp=4)
+    assert tried == [20, 26, 32, 38, 44]
