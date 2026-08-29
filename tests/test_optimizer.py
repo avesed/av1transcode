@@ -1812,3 +1812,115 @@ def test_schedule_backs_off_when_real_memory_disagrees(
     # budget still shows 100GB and nothing in the cost model changed
     machine_gb[0] = 3.5
     assert go(8) <= 3
+
+
+def test_video_only_source_skips_the_audio_remux(settings, info, plan, tmp_path,
+                                                 monkeypatch):
+    """A source with no audio and no subtitles must not run the remux pass.
+
+    "-map 0:a? -map 0:s?" against a video-only source maps nothing, and ffmpeg
+    with zero output streams allocates ~8GB before exiting - measured 8.19GB on
+    a 15MB 12-second 4K file and 8.20GB on the 24-second one, so it is a flat
+    allocation rather than buffering. Under a container memory limit that is an
+    OOM kill at the very last step of a finished encode.
+    """
+    enc = make_encoder(settings, info, plan, tmp_path)
+    # force the ffmpeg mux path; every other tool must still resolve
+    monkeypatch.setattr(opt.shutil, "which",
+                        lambda n, *a, **k: None if "mkvmerge" in n else f"/usr/bin/{n}")
+    ran = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "ffprobe" in args[0]:
+            if "stream=codec_type" in args:
+                return "video\n"           # video only: nothing to remux
+            return ""
+        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc.concat_shots([tmp_path / "enc_00000.ivf"])
+
+    muxes = [a for a in ran if "ffprobe" not in a[0]]
+    # the video concat and the final mux, and nothing in between
+    assert len(muxes) == 2
+    assert not any("audio_subs.mkv" in " ".join(a) for a in muxes)
+    # the final mux takes video_only alone, with no second input to map from
+    final = muxes[-1]
+    assert "1:a?" not in final and "1:s?" not in final
+    assert final.count("-i") == 1
+
+
+def test_source_with_audio_still_gets_remuxed(settings, info, plan, tmp_path,
+                                              monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(opt.shutil, "which",
+                        lambda n, *a, **k: None if "mkvmerge" in n else f"/usr/bin/{n}")
+    ran = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "ffprobe" in args[0]:
+            if "stream=codec_type" in args:
+                return "video\naudio\n"    # an audio stream is present
+            return ""                      # ... but no subtitle streams
+        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc.concat_shots([tmp_path / "enc_00000.ivf"])
+
+    muxes = [a for a in ran if "ffprobe" not in a[0]]
+    assert any("audio_subs.mkv" in " ".join(a) for a in muxes)
+    final = muxes[-1]
+    assert "1:a?" in final and "1:s?" in final
+
+
+def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,
+                                            monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    video_only = tmp_path / "video_only.mkv"
+    video_only.touch()
+    seen = {}
+
+    def fake_run(cmd, capture_output=False, text=False, timeout=None):
+        seen["cmd"] = cmd
+        enc.output.write_bytes(b"\x1aE\xdf\xa3")
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(opt.subprocess, "run", fake_run)
+    assert enc._mkvmerge_mux("mkvmerge", video_only, None) is True
+    assert seen["cmd"] == ["mkvmerge", "-o", str(enc.output), str(video_only)]
+
+
+@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="needs a real ffprobe")
+def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path):
+    """Run the probe command for real, not against a stubbed _run.
+
+    The first version of this used "-select_streams a,s", which ffprobe rejects
+    ("Invalid stream specifier") because the specifier takes one type, not a
+    list. Every unit test passed - they stub _run - while the guard silently
+    fell back to "assume there is audio" on every single source. Only a real
+    ffprobe catches that class of mistake.
+    """
+    settings.tools.ffprobe = shutil.which("ffprobe")
+    enc = make_encoder(settings, info, plan, tmp_path)
+    silent = tmp_path / "silent.mkv"
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("needs a real ffmpeg to build the fixtures")
+    import subprocess as sp
+    sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+            "-i", "testsrc=size=64x64:rate=5:duration=1", "-c:v", "libx264",
+            str(silent)], check=True)
+    assert enc._has_audio_or_subs(str(silent)) is False
+
+    noisy = tmp_path / "noisy.mkv"
+    sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+            "-i", "testsrc=size=64x64:rate=5:duration=1", "-f", "lavfi",
+            "-i", "sine=frequency=440:duration=1", "-c:v", "libx264",
+            "-c:a", "aac", str(noisy)], check=True)
+    assert enc._has_audio_or_subs(str(noisy)) is True

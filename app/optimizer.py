@@ -2166,20 +2166,34 @@ class ShotEncoder:
         # for Dolby Vision the encode input is a video-only stripped
         # intermediate, so muxing from it would drop audio).
         audio_src = str(self.info.path if self.info.path else self.source)
-        audio_subs = self.tempdir / "audio_subs.mkv"
-        # NB: no -map_metadata -1 here: it strips per-stream LANGUAGE tags
-        # from the subtitle/audio streams (Plex then shows every subtitle as
-        # English). The source's global "DV.HDR10.PLUS" title is harmless in
-        # this intermediate - mkvmerge does not copy it into the final file.
-        base_args = [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
-                     "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
-                     "-c:a", "copy"]
-        try:
-            self._run(base_args + self._subtitle_codec_args(audio_src)
-                      + [str(audio_subs)], timeout=1800)
-        except TranscodeError:
-            logger.warning("subtitle remux failed, retrying with a plain copy")
-            self._run(base_args + ["-c:s", "copy", str(audio_subs)], timeout=1800)
+        audio_subs: Optional[Path] = self.tempdir / "audio_subs.mkv"
+        if not self._has_audio_or_subs(audio_src):
+            # Nothing to carry over, and asking anyway is actively dangerous:
+            # "-map 0:a? -map 0:s?" against a video-only source maps NOTHING,
+            # and ffmpeg with zero output streams grows to ~8GB before it
+            # exits. Measured on a 15MB, 12-second 4K file: 8.19GB peak, and
+            # 8.20GB for the 24-second version - a flat allocation, unrelated
+            # to the input size. Under a container memory limit that is an
+            # OOM kill at the very last step, after the whole encode is done.
+            logger.info("optimizer: source has no audio or subtitle streams; "
+                        "muxing video only")
+            audio_subs = None
+        else:
+            # NB: no -map_metadata -1 here: it strips per-stream LANGUAGE tags
+            # from the subtitle/audio streams (Plex then shows every subtitle
+            # as English). The source's global "DV.HDR10.PLUS" title is
+            # harmless in this intermediate - mkvmerge does not copy it into
+            # the final file.
+            base_args = [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
+                         "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
+                         "-c:a", "copy"]
+            try:
+                self._run(base_args + self._subtitle_codec_args(audio_src)
+                          + [str(audio_subs)], timeout=1800)
+            except TranscodeError:
+                logger.warning("subtitle remux failed, retrying with a plain copy")
+                self._run(base_args + ["-c:s", "copy", str(audio_subs)],
+                          timeout=1800)
         # Final mux via mkvmerge: ffmpeg's -c copy remux of the concat leaves
         # the shot-boundary structure that Plex's 4K AV1 transcode hangs on
         # (runs for 10-20 min then stops producing HLS segments; verified on
@@ -2195,9 +2209,13 @@ class ShotEncoder:
         # fallback: global metadata comes from the first input (video_only,
         # which has no title), stream language tags ride along with the
         # mapped streams, so no -map_metadata -1 needed here either.
-        base = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only),
-                "-i", audio_subs, "-map", "0:v:0", "-map", "1:a?",
-                "-map", "1:s?", "-c", "copy"]
+        base = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only)]
+        if audio_subs is not None:
+            base += ["-i", str(audio_subs)]
+        base += ["-map", "0:v:0"]
+        if audio_subs is not None:
+            base += ["-map", "1:a?", "-map", "1:s?"]
+        base += ["-c", "copy"]
         try:
             self._run(base + [str(self.output)], timeout=1800)
         except TranscodeError:
@@ -2211,15 +2229,38 @@ class ShotEncoder:
         if not self.output.exists() or self.output.stat().st_size == 0:
             raise TranscodeError("optimizer produced no output file")
 
+    def _has_audio_or_subs(self, source: str) -> bool:
+        """Whether `source` carries anything the final mux needs to copy over.
+
+        Assumed present when ffprobe cannot say: running the remux for nothing
+        wastes a pass, but skipping it wrongly silently drops the audio.
+        """
+        # One probe over every stream's type. NB not "-select_streams a,s":
+        # ffprobe takes a single stream specifier, not a list, and rejects that
+        # with "Invalid stream specifier" - which this method would then treat
+        # as "cannot tell", quietly restoring the behaviour it exists to avoid.
+        try:
+            out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
+                             "-show_entries", "stream=codec_type",
+                             "-of", "csv=p=0", source], timeout=120)
+        except (TranscodeError, FileNotFoundError) as e:
+            logger.warning("could not probe {} for audio/subtitle streams ({}); "
+                           "assuming there are some", Path(source).name, e)
+            return True
+        kinds = {line.strip() for line in out.splitlines()}
+        return bool(kinds & {"audio", "subtitle"})
+
     def _mkvmerge_mux(self, mkvmerge: str, video_only: Path,
-                      audio_subs: Path) -> bool:
+                      audio_subs: Optional[Path]) -> bool:
         """Final mux with mkvmerge. Returns True on a valid output file."""
         try:
             if self.output.exists():
                 self.output.unlink()
+            inputs = [str(video_only)]
+            if audio_subs is not None:
+                inputs.append(str(audio_subs))
             proc = subprocess.run(
-                [mkvmerge, "-o", str(self.output), str(video_only),
-                 str(audio_subs)],
+                [mkvmerge, "-o", str(self.output), *inputs],
                 capture_output=True, text=True, timeout=1800,
             )
             if proc.returncode != 0:
