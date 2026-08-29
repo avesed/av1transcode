@@ -19,6 +19,7 @@ ffmpeg's libvmaf filter, so both go through identical plumbing.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -26,12 +27,12 @@ import sys
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from app import sysres
 from app.analyzer import MediaInfo
 from app.config import Settings, VideoParams
 from app.decisions import TranscodePlan
@@ -288,6 +289,94 @@ def parse_score(json_path: Path, metric: str) -> float:
     raise TranscodeError(f"could not parse {metric} score from {json_path}")
 
 
+class MemCalibration:
+    """Multiplicative correction to the static memory model, learned in-job.
+
+    The static model is fitted offline and deliberately biased high, because
+    under-estimating is what OOM-kills an encoder while over-estimating only
+    leaves budget unused. That bias is not free though - the probe phase in
+    particular is over-estimated by 40-60% at 4K, because SVT-AV1 forces
+    preset<=M9 there and halves its mini-GOP, which the resolution-independent
+    prior cannot know. So the prior is only a starting point: every task
+    reports what it actually peaked at, and this scales the model to match.
+
+    Asymmetric on purpose. An observation ABOVE the prediction is acted on at
+    once - that direction is the one that OOMs - while a reading below it only
+    eases the factor down, so one unusually cheap shot cannot talk the pool
+    into over-admitting the next expensive one.
+    """
+
+    FLOOR, CAP, EASE = 0.30, 3.0, 0.25
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._factor = 1.0
+        self.samples = 0
+
+    def factor(self) -> float:
+        return self._factor
+
+    def observe(self, predicted_gb: float, observed_gb: float) -> None:
+        """Fold one measured peak into the correction.
+
+        `predicted_gb` must be the RAW model value, not the corrected one, so
+        the factor stays absolute instead of compounding run over run.
+        """
+        if predicted_gb <= 0 or observed_gb <= 0:
+            return
+        self.samples += 1
+        ratio = observed_gb / predicted_gb
+        if ratio > self._factor:
+            self._factor = ratio * 1.05      # a little clearance over the peak
+        else:
+            self._factor += self.EASE * (ratio - self._factor)
+        self._factor = min(self.CAP, max(self.FLOOR, self._factor))
+
+
+def plan_admission(
+    pending: List[int],
+    mem_free: float,
+    cpu_free: float,
+    cost: Callable[[int, int], float],
+    lp_ladder: List[int],
+    idle: bool,
+) -> Optional[Tuple[int, int, float]]:
+    """Pick the next (position in `pending`, lp, GB) to start, or None to wait.
+
+    Best fit: `pending` is ordered longest shot first, and this takes the first
+    one that still fits both budgets. That ordering is what keeps a mix in
+    flight - one long encode plus however many short ones the remaining memory
+    holds - which is the whole point of admitting by cost instead of by a fixed
+    worker count. Measured on a real 146-shot list, per-instance peak RSS spans
+    2.5x (4.7GB for a 24-frame shot against 10.5GB for a 1000-frame one at 4K),
+    so no single worker count is right for both ends.
+
+    Taking the LONGEST that fits rather than the first that fits matters:
+    draining the long shots up front (a plain longest-first queue) empties the
+    pool of anything cheap to pair them with, and simulating that on the same
+    shot list came out slower than not sorting at all.
+
+    A shot may be admitted at a lower lp than the top of the ladder. lp only
+    sizes SVT-AV1's frame pool - verified byte-identical output at lp 2, 4 and
+    6 - so spending less of it is free, and letting a long shot in at lp=2
+    beats making it wait.
+
+    `idle` (nothing running) forces an admission even when the shot does not
+    fit, because refusing every shot with an empty pool would deadlock. The
+    caller warns; there is nothing else to do but overshoot.
+    """
+    ladder = sorted({max(1, lp) for lp in lp_ladder}, reverse=True)
+    for pos, idx in enumerate(pending):
+        for lp in ladder:
+            gb = cost(idx, lp)
+            if gb <= mem_free and lp <= cpu_free:
+                return pos, lp, gb
+    if idle and pending:
+        lp = ladder[-1]
+        return 0, lp, cost(pending[0], lp)
+    return None
+
+
 # ---- the engine -----------------------------------------------------------
 
 def run_shot_transcode(
@@ -369,9 +458,16 @@ class ShotEncoder:
         self._feature_warned = False
         # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads)
         self._probe_worker_count = 1
-        # pool-thread -> core slice index, for taskset affinity (see _worker_slot)
-        self._slots: Dict[int, int] = {}
+        # affinity slices currently taken (only used when encode_threads is set)
+        self._slots_used: set[int] = set()
         self._slot_lock = threading.Lock()
+        # per-phase correction to the static memory model, learned as the job
+        # runs (see MemCalibration)
+        self._cal = {"encoding": MemCalibration("encoding"),
+                     "probing": MemCalibration("probing")}
+        # peak RSS of the subprocesses one scheduled task ran, accumulated on
+        # that task's own thread so concurrent tasks cannot mix their readings
+        self._task_peak = threading.local()
         # Dolby Vision Profile 5: the base layer is ICtCp, so it has to have its
         # RPU applied before it means anything. Done per shot rather than once
         # over the whole file - see _acquire_shard.
@@ -411,132 +507,293 @@ class ShotEncoder:
             pct = min(max(pct, 0.0), 100.0)
             self.progress_cb(pct, {"pct": pct, "done": done, "total": total, "fps": fps})
 
-    # SVT-AV1 only accepts a level of parallelism in [0, 6]; anything higher is
-    # clamped with a warning on every single probe. It is also the main driver
-    # of per-instance memory at 4K, since it sizes the picture buffer pool.
-    MAX_LP = 6
-
-    def _svt_lp(self, workers: int) -> int:
-        """Bound SVT-AV1 parallelism per parallel probe instance.
-
-        N encoders run at once; giving each the full core count spawns
-        N x cores threads and can exhaust RAM on large machines. Scale
-        per-instance parallelism so the total stays near the core count.
-        """
-        cores = os.cpu_count() or 1
-        return max(1, min(cores, self.MAX_LP, round(cores / max(1, workers))))
-
     @staticmethod
-    def _ram_gb() -> int:
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        return int(line.split()[1]) // (1024 * 1024)
-        except (OSError, ValueError):
-            return 8
-        return 8
+    def _cores() -> int:
+        """Cores we may actually use - the cgroup quota, not the machine.
+
+        os.cpu_count() reports the box: a container run with `--cpus=4` still
+        reads 32 here, so every derived number (worker count, lp, affinity
+        slices) was sized for hardware this process cannot have.
+        """
+        return max(1, int(sysres.cpu_budget()))
+
+    def _mem_budget_gb(self) -> float:
+        """Memory this phase may hold, in GB.
+
+        Under a cgroup limit this is the headroom below it; otherwise the
+        kernel's MemAvailable, which already discounts what everything else on
+        the box is holding. The old rule was 75% of MemTotal, which on a shared
+        machine is not memory we have - measured here, MemTotal*0.75 came to
+        23.5GB against 22GB actually available, and encoding at that budget
+        pushed 3.8GB into swap.
+
+        The remaining margin covers what the budget does not model: page cache
+        for a multi-GB source read, the Python process, and the tmpfs shards
+        the DV/SSIMULACRA2 paths stage.
+        """
+        return max(1.0, sysres.memory_available_gb() * 0.85)
 
     def _megapixels(self) -> float:
         px = (self.info.width or 0) * (self.info.height or 0)
         return max(0.5, px / 1e6) if px else 2.0
 
-    def _est_encode_gb(self) -> float:
+    # Per-instance memory relative to lp=4, measured at 4K on 144-frame shots
+    # (3.42 / 4.19 / 5.23 / 6.71 / - / 8.80 GB at lp 1..6).
+    #
+    # NB these are NOT the ratios of SVT-AV1's frame pool. The pool is
+    # min_input + (1 + mg_size) * n_extra_mg pictures with n_extra_mg = 0 for
+    # lp<=3, 1 at lp=4, 2 at lp=5 and 7 at lp=6 (enc_handle.c), which predicts
+    # equal memory for lp 1-3 and 2.85x for lp=6. Neither holds in practice: the
+    # pool is reserved up front but only TOUCHED as frames flow, so a shot short
+    # enough not to fill a 305-picture pool never pays for it, and lp 1-3 differ
+    # because they fill their shared pool to different depths.
+    _LP_MEM_RATIO = {1: 0.55, 2: 0.65, 3: 0.80, 4: 1.00, 5: 1.15, 6: 1.35}
+
+    # Under-estimating here is what OOM-kills an encoder, over-estimating only
+    # leaves budget unused, so the fit is deliberately biased high.
+    _MEM_SAFETY = 1.10
+
+    def _est_encode_gb(self, frames: int, lp: int = 4) -> float:
         """Peak RSS of ONE final-encode instance, in GB.
 
-        SVT-AV1's picture buffer pool dominates, and it scales with frame size,
-        which the old flat "ram_gb // 8" rule ignored entirely. Measured on this
-        codebase's defaults (preset 4, 10-bit, 144-frame shots, uncontended):
+        Two things drive it, and the flat estimate this replaces modelled
+        neither.
 
-            3840x1920  9.2GB @ lp=6   7.25GB @ lp=4
-            1920x960   2.6GB @ lp=6   2.50GB @ lp=4
-            1280x640   1.8GB @ lp=6   1.64GB @ lp=4
+        SHOT LENGTH is the larger one. SVT-AV1 reserves its whole pool up front
+        - virtual size is a flat ~14GB at 4K whatever the shot - but only
+        touches what the frames in flight need, so RSS tracks the shot. Measured
+        at 4K (3840x1920, preset 4, lp=4), peak RSS per instance:
 
-        0.8 + 0.9/Mpx tracks the lp<=4 column and stays slightly above every
-        measured point, which is the right side to err on for an OOM guard.
+            24f 3.41GB   96f 6.19GB   288f 7.70GB   1152f 10.46GB
+            48f 4.69GB  144f 6.71GB   576f 9.12GB
+
+        i.e. 2.5x across the shot lengths of one real film. A flat estimate is
+        wrong at both ends: the previous 0.8 + 0.9/Mpx read 7.43GB at 4K, 58%
+        too high for a 48-frame shot and 28% too low for a 1000-frame one -
+        and it is the low end that OOM-kills the encoder.
+
+        The fit is logarithmic in frames and linear in megapixels, with a fixed
+        ~0.4GB of process overhead. Before the safety factor it tracks both the
+        4K series above and the 1080p one (1.08GB at 24f to 2.72GB at 960f)
+        within 6%; with it, every measured point is over-estimated by 1-23%.
         """
-        return 0.8 + 0.9 * self._megapixels()
+        demand = max(0.30, 0.2455 * math.log(max(frames, 8)) - 0.368)
+        ratio = self._LP_MEM_RATIO.get(lp, 1.0)
+        return (0.40 + self._megapixels() * demand * ratio) * self._MEM_SAFETY
 
-    def _est_probe_gb(self) -> float:
-        """Same, for a probe instance: probe_preset is far faster and lp is
-        smaller, measured 3.5GB at 4K against 9.2GB for the final encode."""
-        return 0.5 + 0.5 * self._megapixels()
+    def _est_probe_gb(self, frames: int, lp: int = 4) -> float:
+        """Peak RSS of ONE probe task, in GB. Same shape as _est_encode_gb.
+
+        A probe is cheaper than a final encode at the same length because
+        probe_preset is far faster, but how much cheaper depends on the
+        resolution in a way this model cannot see: at 4K, SVT-AV1 forces the
+        preset down to M9 and halves its mini-GOP (32 -> 16 frames), which the
+        1080p probes do not get. Measured per instance at lp=4:
+
+            4K     24f 2.29GB   48f 2.95GB   96f 3.61GB   120f 3.81GB
+            1080p  24f 1.23GB                             120f 1.66GB
+
+        i.e. 4K costs only ~2.9x of 1080p where the frames are 4x the size.
+        The fit is therefore taken from the 1080p (expensive per pixel) series,
+        which leaves it 10% over at 1080p and 57-79% over at 4K. The 4K slack
+        is real but it is the safe direction, and MemCalibration measures it
+        away within the first few probes of a job.
+        """
+        demand = max(0.30, 0.145 * math.log(max(frames, 8)) - 0.0105)
+        ratio = self._LP_MEM_RATIO.get(lp, 1.0)
+        return (0.40 + self._megapixels() * demand * ratio) * self._MEM_SAFETY
 
     def _mem_bounded_workers(self, per_instance_gb: float) -> int:
-        """How many encoder instances fit in RAM, with headroom.
+        """How many encoder instances fit in the memory budget.
 
-        75% of total memory: the rest is the OS, page cache for a multi-GB
-        source read, and whatever else shares the box. Also capped at cores//4,
-        because throughput saturates long before that anyway - measured at 4K on
-        32 cores, 3 workers already reach 23.8fps and 4 or 6 add nothing.
+        Also capped at cores//4, because throughput saturates long before that
+        anyway - measured at 4K on 32 cores, 3 workers already reach 23.8fps and
+        4 or 6 add nothing.
         """
-        cores = os.cpu_count() or 1
-        budget = self._ram_gb() * 0.75
-        return max(1, min(int(budget / max(0.5, per_instance_gb)),
+        cores = self._cores()
+        return max(1, min(int(self._mem_budget_gb() / max(0.5, per_instance_gb)),
                           max(1, cores // 4)))
 
-    def _encode_workers(self, num_shots: int) -> int:
-        """Final-encode concurrency, bounded by RAM rather than cores."""
+    # lp sizes the frame buffer pool, and the top of its range does not pay for
+    # itself: at 4K the pool jumps from 107 pictures (lp=4) to 305 (lp=6) while
+    # one instance alone goes 6.7GB -> 8.8GB and gets no faster. So the ladder
+    # starts at 4. Descending, because admission walks it looking for the
+    # cheapest way to fit a shot that does not fit at the top.
+    _ENCODE_LP_LADDER = (4, 3, 2, 1)
+
+    def _lp_ladder(self) -> List[int]:
+        return [lp for lp in self._ENCODE_LP_LADDER if lp <= self._cores()] or [1]
+
+    def _max_concurrency(self, num_shots: int) -> int:
+        """Ceiling on instances in flight, before the budgets are consulted.
+
+        Only an explicit encode_workers pins this now; otherwise the memory and
+        CPU budgets decide, per shot, in plan_admission.
+        """
         w = self.opt.encode_workers
         if not w or w <= 0:
-            w = self._mem_bounded_workers(self._est_encode_gb())
+            w = max(1, self._cores())
         return max(1, min(w, num_shots))
 
-    def _encode_threads(self, workers: int) -> int:
-        """CPU cores allotted per final-encode instance. SVT-AV1 does not honour
-        -threads and spawns ~80+ threads at 4K regardless of cores, so this is
-        enforced with taskset affinity (each worker gets a disjoint core range).
-        It does not reduce per-instance memory; it only stops parallel instances
-        from oversubscribing cores and thrashing each other."""
-        cores = os.cpu_count() or 1
-        t = self.opt.encode_threads
-        if not t or t <= 0:
-            t = max(1, cores // max(1, workers))
-        return max(1, min(t, cores))
+    def _affinity_prefix(self, slot: int, threads: int) -> List[str]:
+        """taskset prefix pinning an instance to a disjoint slice of `threads`
+        cores. Empty when the slice covers every core, letting SVT-AV1 use all
+        cores without extra subprocess overhead.
 
-    def _affinity_prefix(self, worker_idx: int, threads: int) -> List[str]:
-        """taskset prefix pinning worker `worker_idx` to a disjoint slice of
-        `threads` cores. Empty when the slice covers every core (single worker
-        on a free machine), letting SVT-AV1 use all cores without extra
-        subprocess overhead."""
-        cores = os.cpu_count() or 1
+        Only used when encode_threads is set explicitly. Static core slices and
+        variable concurrency do not mix: sized for N instances they strand
+        cores whenever fewer than N are running, and measured that way the
+        admission scheduler came out 5% SLOWER than the fixed pool it replaced
+        purely from the stranding. With lp bounded by the CPU budget instead,
+        the instances in flight cannot oversubscribe the cores by construction.
+        """
+        cores = self._cores()
         if threads >= cores:
             return []
-        start = (worker_idx * threads) % cores
+        start = (slot * threads) % cores
         end = start + threads - 1
         if end >= cores:
             start, end = 0, threads - 1
         return ["taskset", "-c", f"{start}-{end}"]
 
-    def _worker_slot(self, workers: int) -> int:
-        """Stable 0..workers-1 slot for the calling pool thread.
+    # Real memory kept unreserved on top of the budget's own accounting. The
+    # cost model covers encoder processes and nothing else, while a running job
+    # also holds page cache for a multi-GB source read, the tmpfs shards the DV
+    # and SSIMULACRA2 paths stage, and the metric process.
+    _HEADROOM_GB = 1.0
 
-        Core ranges must be keyed on the WORKER, not the shot index: shots
-        finish out of order, so `shot_idx % workers` puts two concurrent
-        encoders on the same core slice while another slice sits idle.
-        ThreadPoolExecutor reuses its threads, so one slot per thread ident is
-        stable for the whole phase.
+    def _schedule(self, tasks: List[int], *, phase: str,
+                  cost: Callable[[int, int], float],
+                  run_one: Callable[[int, int, int, int], object],
+                  on_done: Callable[[int, object], None],
+                  progress: Callable[[int], None],
+                  max_conc: int, ladder: List[int]) -> None:
+        """Run `tasks` concurrently, admitting each against a memory/CPU budget.
+
+        Shared by probing and encoding because both have the same shape: many
+        independent per-shot tasks whose cost varies by an order of magnitude
+        with the shot's length. A fixed worker pool has to be sized for the
+        worst task, which then under-uses the budget on every other one.
+
+        Two things bound admission. The BUDGET is bookkeeping - what the cost
+        model says the tasks in flight have reserved. Real headroom is checked
+        as well, because the model deliberately covers only the encoder
+        processes; when the two disagree the tighter one wins, so page cache,
+        tmpfs shards and anything else sharing the cgroup push back on their
+        own without needing to be modelled.
         """
-        tid = threading.get_ident()
+        cal = self._cal[phase]
+        budget = self._mem_budget_gb()
+        threads = self.opt.encode_threads if (self.opt.encode_threads or 0) > 0 else 0
+        pending: List[int] = list(tasks)
+        errors: List[BaseException] = []
+        started: List[threading.Thread] = []
+        state = {"mem": budget, "cpu": float(self._cores()), "live": 0,
+                 "done": 0, "peak_conc": 0}
+        cv = threading.Condition()
+        squeezed = [False]
+
+        def corrected(key: int, lp: int) -> float:
+            return cost(key, lp) * cal.factor()
+
+        def _worker(key: int, lp: int, gb: float, raw: float) -> None:
+            slot = self._take_slot() if threads else -1
+            result: object = None
+            err: Optional[BaseException] = None
+            self._begin_task_peak()
+            try:
+                result = run_one(key, lp, slot, threads)
+            except BaseException as e:  # noqa: BLE001 - re-raised on the caller
+                err = e
+            finally:
+                observed = self._end_task_peak()
+                if slot >= 0:
+                    self._free_slot(slot)
+            with cv:
+                if err is not None:
+                    errors.append(err)
+                else:
+                    on_done(key, result)
+                    state["done"] += 1
+                    cal.observe(raw, observed)
+                state["mem"] += gb
+                state["cpu"] += lp
+                state["live"] -= 1
+                cv.notify_all()
+
+        last_reported = -1
+        try:
+            while True:
+                with cv:
+                    if errors or (not pending and state["live"] == 0):
+                        break
+                    pick = None
+                    if pending and state["live"] < max_conc:
+                        real = sysres.memory_available_gb() - self._HEADROOM_GB
+                        if real < state["mem"] and not squeezed[0]:
+                            squeezed[0] = True
+                            self._log(
+                                f"{phase}: real headroom {real:.1f}GB is below "
+                                f"the {state['mem']:.1f}GB the budget still "
+                                f"shows free; admitting against the smaller")
+                        pick = plan_admission(pending, min(state["mem"], real),
+                                              state["cpu"], corrected, ladder,
+                                              idle=state["live"] == 0)
+                    if pick is None:
+                        cv.wait(timeout=0.5)
+                    else:
+                        pos, lp, gb = pick
+                        key = pending.pop(pos)
+                        raw = cost(key, lp)
+                        if gb > state["mem"]:
+                            logger.warning(
+                                "optimizer: {} task needs ~{:.1f}GB but only "
+                                "{:.1f}GB of the {:.1f}GB budget is free; "
+                                "starting it anyway because nothing else is "
+                                "running", phase, gb, state["mem"], budget)
+                        state["mem"] -= gb
+                        state["cpu"] -= lp
+                        state["live"] += 1
+                        state["peak_conc"] = max(state["peak_conc"], state["live"])
+                        th = threading.Thread(target=_worker,
+                                              args=(key, lp, gb, raw),
+                                              daemon=True)
+                        started.append(th)
+                        th.start()
+                    done_now = state["done"]
+                self._check_cancel()
+                if done_now != last_reported:
+                    last_reported = done_now
+                    progress(done_now)
+        finally:
+            # a failure or a cancel leaves subprocesses running; stop them
+            # before joining, or this blocks for as long as the longest task.
+            if errors or (self.cancel_flag and self.cancel_flag()):
+                self._kill_all()
+            for th in started:
+                th.join()
+        self._sched_peak_conc = state["peak_conc"]
+        self._sched_budget = budget
+        if errors:
+            raise errors[0]
+        # The loop breaks on re-entry, so a task that finished while the main
+        # thread was between iterations is counted but never reported - which
+        # for the LAST task means the phase ends showing less than 100%.
+        if state["done"] != last_reported:
+            progress(state["done"])
+
+    def _take_slot(self) -> int:
+        """Lowest free affinity slot (only meaningful with encode_threads set)."""
         with self._slot_lock:
-            slot = self._slots.get(tid)
-            if slot is None:
-                slot = len(self._slots) % max(1, workers)
-                self._slots[tid] = slot
+            slot = 0
+            while slot in self._slots_used:
+                slot += 1
+            self._slots_used.add(slot)
             return slot
 
-    def _encode_lp(self, workers: int) -> int:
-        """SVT-AV1 level of parallelism for the FINAL encode.
-
-        lp sizes the frame buffer pool that dominates 4K memory, and the top of
-        its range does not pay for itself: at 4K the picture buffer count jumps
-        from 107 (lp=4) to 305 (lp=6) for no throughput gain. Measured with 3
-        parallel workers on 32 cores, lp=4 was both lighter and marginally
-        faster than lp=6 (23.8fps / 21.2GB vs 23.3fps / 22.4GB), and one
-        instance alone drops from 9.2GB to 7.25GB. So cap at 4, not 6.
-        """
-        cores = os.cpu_count() or 1
-        return max(1, min(cores, round(cores / max(1, workers)), 4))
+    def _free_slot(self, slot: int) -> None:
+        with self._slot_lock:
+            self._slots_used.discard(slot)
 
     def _check_cancel(self) -> None:
         if self.cancel_flag and self.cancel_flag():
@@ -558,6 +815,27 @@ class ShotEncoder:
 
     def _py_rss_mb(self) -> float:
         return self._rss_kb(os.getpid()) / 1024.0
+
+    # ---------- per-task memory accounting (feeds MemCalibration) ----------
+    def _note_task_peak(self, gb: float) -> None:
+        """Record a subprocess peak against the scheduled task that ran it.
+
+        A task may run several subprocesses in sequence - a probe encode then
+        a metric pass, or a shard extraction first - and what it costs the
+        budget is the heaviest of them, not their sum, since they do not
+        overlap. Kept on a thread-local because tasks run concurrently.
+        """
+        cur = getattr(self._task_peak, "gb", None)
+        if cur is not None and gb > cur:
+            self._task_peak.gb = gb
+
+    def _begin_task_peak(self) -> None:
+        self._task_peak.gb = 0.0
+
+    def _end_task_peak(self) -> float:
+        gb = getattr(self._task_peak, "gb", 0.0)
+        self._task_peak.gb = None
+        return gb
 
     def _children_rss_mb(self) -> float:
         total = 0.0
@@ -642,6 +920,7 @@ class ShotEncoder:
         desc = self._cmd_desc(args)
         if peak_mb > self._heaviest_cmd[0]:
             self._heaviest_cmd = (peak_mb, desc)
+        self._note_task_peak(peak_mb / 1024.0)
         self._mem_log(f"[mem] {desc} peak={peak_mb:.0f}MB rc={proc.returncode}",
                       level="debug")
         # keep the job log small: ffmpeg's full stdout (SVT config dumps,
@@ -1088,7 +1367,7 @@ class ShotEncoder:
         explicit = self.video.vmaf_threads or self.opt.vmaf_threads
         if explicit:
             return explicit
-        cores = os.cpu_count() or 1
+        cores = self._cores()
         return max(1, cores // max(1, self._probe_worker_count))
 
     def _use_4k_model(self) -> bool:
@@ -1169,31 +1448,38 @@ class ShotEncoder:
         return args, vf
 
     def _probe_workers(self, n_tasks: int) -> int:
-        """Probe concurrency.
+        """Roughly how many probes will be in flight at once.
 
-        Probes encode at the source resolution now, so each SVT-AV1 instance
-        holds a frame buffer pool of the same order as the final encode and the
-        limit is RAM, not cores: a 4K probe measured 3.5GB peak RSS, against
-        ~166MB for the old 540p probes.
+        Admission decides the real number per shot, but libvmaf still has to be
+        given a thread count up front (see _vmaf_threads), so this estimates
+        the typical concurrency from the budget and a mid-sized probe window.
         """
         w = self.opt.probe_workers
         if not w or w <= 0:
-            w = self._mem_bounded_workers(self._est_probe_gb())
+            typical = self._est_probe_gb(
+                max(1, min(self.opt.probe_max_frames or 120, 120)),
+                self._lp_ladder()[0])
+            w = self._mem_bounded_workers(typical)
         return max(1, min(w, n_tasks))
 
     def probe_all(self, shots: List[Shot], grid: List[int]) -> ProbeSamples:
-        """Probe every shot, one pool task per shot.
+        """Probe every shot, one scheduled task per shot.
 
         Per SHOT rather than per (shot, CRF): the CRFs of a shot are now chosen
         adaptively, so each one depends on the scores before it and they have
         to run in order. Parallelism comes from the shots, of which there are
-        hundreds - far more than the worker count - so nothing is lost, and
-        the staged reference shard a shot may need is now built, used and
-        dropped inside one task instead of being shared across the pool.
+        hundreds, and the staged reference shard a shot may need is built, used
+        and dropped inside one task instead of being shared across a pool.
+
+        Admitted against the same budget as the encode phase. Probe windows run
+        from a whole short shot up to probe_max_frames, a 5x span in length and
+        roughly 2x in memory, so a fixed pool has the same problem here that it
+        had there - and this phase was the one over-committing: sized from a
+        flat 4.19GB estimate it ran 5 workers that measured 5.34GB each, 27%
+        past the budget it had been given.
         """
-        workers = self._probe_workers(len(shots) or 1)
-        self._probe_worker_count = workers
-        lp = self._svt_lp(workers)
+        ladder = self._lp_ladder()
+        self._probe_worker_count = self._probe_workers(len(shots) or 1)
         scale = self._probe_scale()
         if scale:
             logger.warning(
@@ -1202,31 +1488,41 @@ class ShotEncoder:
                 "from them does not transfer. Leave it empty unless you are "
                 "trading accuracy for speed on purpose.", scale)
         results: ProbeSamples = {}
-        done_shots = 0
         self._heaviest_cmd = (0.0, "")
         width = int(self.opt.probe_bracket_width or 0)
         plan = (f"adaptive from {seed_crfs(grid)} down to a {width}-wide bracket"
                 if width > 0 else f"the full {len(grid)}-point grid {grid}")
-        self._log(f"probing {len(shots)} shots with {workers} workers "
-                  f"(svt lp={lp}), {plan}")
+        with self._slot_lock:
+            self._slots_used.clear()
+
+        def probe_frames(idx: int) -> int:
+            w0, w1 = self._probe_window(*shots[idx])
+            return w1 - w0
+
+        def cost(idx: int, lp: int) -> float:
+            return self._est_probe_gb(probe_frames(idx), lp)
+
+        def run_one(idx: int, lp: int, _slot: int, _threads: int) -> object:
+            s0, s1 = shots[idx]
+            return self._probe_shot(idx, s0, s1, grid, lp)
+
+        def on_done(idx: int, result: object) -> None:
+            results[idx] = result           # type: ignore[assignment]
+
+        def progress(done: int) -> None:
+            self._report(done / max(len(shots), 1) * 100, done, len(shots))
+
+        self._log(f"probing {len(shots)} shots (budget "
+                  f"{self._mem_budget_gb():.1f}GB, lp ladder {ladder}), {plan}")
         stop, peak = self._start_mem_sampler()
         try:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(self._probe_shot, i, s0, s1, grid, lp): i
-                        for i, (s0, s1) in enumerate(shots)}
-                for fut in as_completed(futs):
-                    self._check_cancel()
-                    results[futs[fut]] = fut.result()
-                    done_shots += 1
-                    # stage-local progress: the bar matches done/total shots
-                    pct = done_shots / max(len(shots), 1) * 100
-                    self._report(pct, done_shots, len(shots))
+            self._schedule(list(range(len(shots))), phase="probing", cost=cost,
+                           run_one=run_one, on_done=on_done, progress=progress,
+                           max_conc=self._max_probe_concurrency(len(shots)),
+                           ladder=ladder)
         finally:
             stop.set()
-        heavy = f"; heaviest: {self._heaviest_cmd[1]} {self._heaviest_cmd[0]:.0f}MB" \
-            if self._heaviest_cmd[1] else ""
-        self._mem_log(f"[mem] probing peak children RSS={peak[0]:.0f}MB "
-                      f"(python={self._py_rss_mb():.0f}MB){heavy}")
+        self._log_phase_memory("probing", peak[0])
         spent = sum(len(v) for v in results.values())
         if results:
             self._mem_log(
@@ -1234,6 +1530,13 @@ class ShotEncoder:
                 f"{spent / len(results):.2f} per shot "
                 f"(a full grid would have been {len(grid)})")
         return results
+
+    def _max_probe_concurrency(self, n_tasks: int) -> int:
+        """Hard cap on probes in flight; the budget decides the real number."""
+        w = self.opt.probe_workers
+        if not w or w <= 0:
+            w = max(1, self._cores())
+        return max(1, min(w, n_tasks))
 
     def _probe_shot(self, idx: int, s0: int, s1: int, grid: List[int],
                     lp: int) -> Dict[int, float]:
@@ -1513,53 +1816,86 @@ class ShotEncoder:
 
     # ---------- phase 4: parallel final encode ----------
     def encode_all(self, shots: List[Shot], chosen: Dict[int, float]) -> List[Path]:
-        workers = self._encode_workers(len(shots))
-        threads = self._encode_threads(workers)
-        lp = self._encode_lp(workers)
+        """Encode every shot, admitting as many at once as the budgets allow.
+
+        Not a fixed worker pool. Per-instance memory follows the shot length
+        (2.5x across one real film's shots), so a constant worker count is
+        simultaneously too many for the long shots - which is what OOM-kills the
+        encoder - and too few for the short ones. Admission takes the longest
+        shot that still fits the remaining memory and CPU, which keeps a long
+        encode and several short ones in flight together. Measured against the
+        fixed pool on a real 24-shot list at a 3.7GB budget: 23.3fps against
+        21.4fps, and the budget actually filled (3.47GB of 3.7GB) where the
+        fixed pool left 30% of it unused.
+        """
+        ladder = self._lp_ladder()
         ivf_paths: Dict[int, Path] = {}
-        with self._slot_lock:
-            self._slots.clear()
-        done_frames = 0
+        done_frames = [0]
         t0 = time.monotonic()
         self._heaviest_cmd = (0.0, "")
-        aff = f" taskset {threads}c" if threads < (os.cpu_count() or 1) else ""
-        self._log(f"encoding {len(shots)} shots in parallel"
-                  f" (svt lp={lp}, workers={workers}, threads={threads}/instance{aff})")
+        with self._slot_lock:
+            self._slots_used.clear()
+        longest = max((b - a) for a, b in shots) if shots else 0
+
+        def cost(idx: int, lp: int) -> float:
+            s0, s1 = shots[idx]
+            return self._est_encode_gb(s1 - s0, lp)
+
+        def run_one(idx: int, lp: int, slot: int, threads: int) -> object:
+            s0, s1 = shots[idx]
+            return self._encode_shot(idx, s0, s1,
+                                     chosen.get(idx, self.video.crf), lp,
+                                     slot, threads)
+
+        def on_done(idx: int, result: object) -> None:
+            ivf_paths[idx] = result         # type: ignore[assignment]
+            done_frames[0] += shots[idx][1] - shots[idx][0]
+
+        def progress(_done: int) -> None:
+            elapsed = max(time.monotonic() - t0, 1e-6)
+            frames = done_frames[0]
+            self._report(frames / max(self.total_frames, 1) * 100, frames,
+                         self.total_frames, fps=frames / elapsed)
+
+        self._log(
+            f"encoding {len(shots)} shots (budget {self._mem_budget_gb():.1f}GB / "
+            f"{self._cores()} cpu units, lp ladder {ladder}, longest shot "
+            f"{longest}f -> {self._est_encode_gb(longest, ladder[0]):.1f}GB)")
         stop, peak = self._start_mem_sampler()
         try:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {
-                    ex.submit(self._encode_shot, i, s0, s1,
-                              chosen.get(i, self.video.crf), lp, threads,
-                              workers):
-                    (i, s1 - s0) for i, (s0, s1) in enumerate(shots)}
-                for fut in as_completed(futs):
-                    self._check_cancel()
-                    i, span = futs[fut]
-                    ivf = fut.result()
-                    ivf_paths[i] = ivf
-                    done_frames += span
-                    # stage-local progress so the bar matches done/total frames
-                    elapsed = max(time.monotonic() - t0, 1e-6)
-                    pct = done_frames / max(self.total_frames, 1) * 100
-                    self._report(pct, done_frames, self.total_frames,
-                                 fps=done_frames / elapsed)
+            self._schedule(list(range(len(shots))), phase="encoding", cost=cost,
+                           run_one=run_one, on_done=on_done, progress=progress,
+                           max_conc=self._max_concurrency(len(shots)),
+                           ladder=ladder)
         finally:
             stop.set()
-        heavy = f"; heaviest: {self._heaviest_cmd[1]} {self._heaviest_cmd[0]:.0f}MB" \
-            if self._heaviest_cmd[1] else ""
-        self._mem_log(f"[mem] encoding peak children RSS={peak[0]:.0f}MB "
-                      f"(python={self._py_rss_mb():.0f}MB){heavy}")
+        self._log_phase_memory("encoding", peak[0])
+        missing = [i for i in range(len(shots)) if i not in ivf_paths]
+        if missing:
+            raise TranscodeError(
+                f"{len(missing)} shot(s) produced no encode: {missing[:5]}")
         return [ivf_paths[i] for i in range(len(shots))]
 
+    def _log_phase_memory(self, phase: str, peak_children_mb: float) -> None:
+        heavy = f"; heaviest: {self._heaviest_cmd[1]} {self._heaviest_cmd[0]:.0f}MB" \
+            if self._heaviest_cmd[1] else ""
+        cal = self._cal[phase]
+        drift = (f", model x{cal.factor():.2f} after {cal.samples} samples"
+                 if cal.samples else "")
+        self._mem_log(
+            f"[mem] {phase} peak children RSS={peak_children_mb:.0f}MB "
+            f"(python={self._py_rss_mb():.0f}MB), peak concurrency "
+            f"{getattr(self, '_sched_peak_conc', 0)} of a "
+            f"{getattr(self, '_sched_budget', 0.0):.1f}GB budget{drift}{heavy}")
+
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int,
-                     threads: int, workers: int = 1) -> Path:
+                     slot: int = -1, threads: int = 0) -> Path:
         dst = self.probe_dir / f"enc_{idx:05d}.ivf"
         # encode exactly (s1 - s0) frames: `-t` on input-seeked shots is not
         # frame-exact (off by a frame per shot), and 762 shots x 1 frame drift
         # = seconds of A/V desync once the audio is muxed whole. `-frames:v`
         # guarantees the exact frame count so the concat sums to the source.
-        args = self._affinity_prefix(self._worker_slot(workers), threads)
+        args = self._affinity_prefix(slot, threads) if threads and slot >= 0 else []
         args += [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
         vf: List[str] = []
         if self._p5:

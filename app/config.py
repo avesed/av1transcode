@@ -197,19 +197,22 @@ class OptimizerSettings(BaseModel):
     vmaf_threads: int = 0
     # Parallel probe workers across shots. Probes now encode at source
     # resolution, so each instance holds a multi-GB frame pool at 4K just like
-    # the final encode (measured 3.5GB at 4K). 0 = auto (total_mem / 8).
+    # the final encode (measured 3.5GB at 4K). 0 = auto, from the memory
+    # available to THIS cgroup rather than the machine's total.
     probe_workers: int = 0
-    # Parallel FINAL ENCODE instances. Separate from probe_workers because a
-    # single SVT-AV1 encode of 4K uses several GB regardless of thread count
-    # (measured ~8GB at preset 6 / lp=6); too many parallel instances OOM the
-    # machine. 0 = auto (total_mem / 8, so total encode memory stays under
-    # ~half of RAM).
+    # Hard cap on parallel FINAL ENCODE instances. 0 (recommended) = no cap:
+    # the encode phase admits shots against a memory and CPU budget instead,
+    # so concurrency floats with what each shot actually costs. That matters
+    # because per-instance peak RSS follows the SHOT LENGTH - measured at 4K,
+    # 3.4GB for a 24-frame shot against 10.5GB for a 1150-frame one - and any
+    # single worker count is therefore too many for the long shots (which is
+    # what OOM-kills the encoder) and too few for the short ones.
     encode_workers: int = 0
-    # CPU cores allotted to each final-encode instance (0 = auto:
-    # cores / encode_workers). Enforced with taskset affinity per instance.
-    # This does NOT reduce per-instance memory (SVT-AV1 spawns 80+ threads at
-    # 4K regardless); it only prevents thread oversubscription between
-    # parallel instances so they do not thrash each other.
+    # CPU cores pinned to each final-encode instance with taskset.
+    # 0 (recommended) = no pinning: the admission budget already bounds total
+    # SVT-AV1 parallelism, and a static core slice sized for N instances
+    # strands cores whenever fewer than N are running (measured 5% slower).
+    # Set it only when this container must not touch cores it was not given.
     encode_threads: int = 0
     # PySceneDetect ContentDetector threshold (higher = fewer/split less).
     scenedetect_threshold: float = 27.0
