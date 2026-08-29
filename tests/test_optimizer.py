@@ -1,6 +1,7 @@
 import json
 import shutil
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -305,15 +306,67 @@ def test_vmaf_threads_auto_sized_to_probe_pool(settings, info, plan, tmp_path, m
     assert enc._vmaf_threads() == 3
 
 
-def test_probe_workers_ram_aware(settings, info, plan, tmp_path, monkeypatch):
-    monkeypatch.setattr(opt.ShotEncoder, "_ram_gb", staticmethod(lambda: 31))
-    monkeypatch.setattr(opt.os, "cpu_count", lambda: 32)
-    info.width, info.height = 3840, 1920      # a 4K probe measured ~3.5GB
+def test_probe_cost_never_under_reports(settings, info, plan, tmp_path, monkeypatch):
+    """The probe prior has to bound BOTH resolutions from above.
+
+    A probe costs far less per pixel at 4K than at 1080p, because SVT-AV1
+    forces the preset to M9 there and halves its mini-GOP. A model fitted to
+    the 4K series would therefore under-estimate 1080p by ~30%, so the prior is
+    taken from the 1080p series and the 4K slack is measured away at runtime.
+    """
+    monkeypatch.setattr(opt.sysres, "memory_available_gb", lambda: 26.0)
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
+    info.width, info.height = 3840, 1920
     enc = make_encoder(settings, info, plan, tmp_path)
-    assert enc._probe_workers(100) == 5
-    assert enc._probe_workers(2) == 2         # never more workers than tasks
+    for frames, measured in ((24, 2.29), (48, 2.95), (96, 3.61), (120, 3.81)):
+        assert enc._est_probe_gb(frames, 4) >= measured
+    for lp, measured in ((6, 4.92), (4, 3.70), (3, 3.08), (2, 2.50)):
+        assert enc._est_probe_gb(120, lp) >= measured
+    # a probe is cheaper than the final encode of the same window
+    assert enc._est_probe_gb(120, 4) < enc._est_encode_gb(120, 4)
+
+    info.width, info.height = 1920, 960
+    enc1080 = make_encoder(settings, info, plan, tmp_path)
+    for frames, measured in ((24, 1.23), (120, 1.66)):
+        assert enc1080._est_probe_gb(frames, 4) >= measured
+
+    # concurrency is a hard cap now, not the plan: the budget decides per shot
+    assert enc._max_probe_concurrency(100) == 32
+    assert enc._max_probe_concurrency(2) == 2
     settings.transcode.optimizer.probe_workers = 12
-    assert enc._probe_workers(100) == 12      # explicit setting wins
+    assert enc._max_probe_concurrency(100) == 12    # explicit setting wins
+
+
+def test_probe_lp_no_longer_starts_at_six(settings, info, plan, tmp_path,
+                                          monkeypatch):
+    """Probes used to run at lp=6, the most expensive pool SVT-AV1 has.
+
+    Measured at 4K on a 120-frame window, lp=6 cost 4.92GB and 7.7s against
+    3.70GB and 6.2s at lp=4 - more memory AND slower - for byte-identical
+    output, since lp only sizes the frame pool.
+    """
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert max(enc._lp_ladder()) == 4
+    assert not hasattr(enc, "_svt_lp")
+
+
+def test_budgets_come_from_the_cgroup_not_the_machine(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A container limited to part of the box must size itself to that part.
+
+    os.cpu_count() and MemTotal answer for the whole machine, so a job under
+    `docker run --cpus=4 --memory=8g` used to plan for 32 cores and 23GB.
+    """
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 4.0)
+    monkeypatch.setattr(opt.sysres, "memory_available_gb", lambda: 8.0)
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._cores() == 4
+    assert enc._mem_budget_gb() == pytest.approx(6.8)
+    # lp above the core count is meaningless, so the ladder stops there
+    assert enc._lp_ladder() == [4, 3, 2, 1]
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 2.0)
+    assert enc._lp_ladder() == [2, 1]
 
 
 def test_vmaf_scale_filter(settings, info, plan, tmp_path):
@@ -324,68 +377,99 @@ def test_vmaf_scale_filter(settings, info, plan, tmp_path):
     assert enc._vmaf_scale_filter() == ""
 
 
-def test_encode_workers_ram_aware(settings, info, plan, tmp_path, monkeypatch):
-    """Per-instance memory tracks frame size, so the worker count has to as
-    well: a 4K instance measured 7.25GB against 2.5GB at 1080p. The old flat
-    ram//8 rule gave 4 workers for both - too many to fit at 4K (it OOM-killed
-    encodes) and needlessly few at 1080p."""
-    monkeypatch.setattr(opt.ShotEncoder, "_ram_gb", staticmethod(lambda: 31))
-    monkeypatch.setattr(opt.os, "cpu_count", lambda: 32)
+def test_encode_cost_tracks_shot_length(settings, info, plan, tmp_path, monkeypatch):
+    """Per-instance memory follows the SHOT, not just the frame size.
 
+    SVT-AV1 reserves its frame pool up front but only touches what the frames
+    in flight need, so a 24-frame shot peaks at 3.4GB where a 1152-frame one
+    peaks at 10.5GB on the same 4K source. A single per-instance number is
+    58% too high at one end and 28% too low at the other, and the low end is
+    what OOM-kills the encoder.
+    """
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
     info.width, info.height = 3840, 1920
     enc = make_encoder(settings, info, plan, tmp_path)
-    assert enc._encode_workers(11) == 3       # 3 x 7.4GB fits in 31GB * 0.75
-    assert enc._encode_workers(1) == 1        # fewer shots than workers
 
-    info.width, info.height = 1920, 1080
+    # every point below is a measured peak RSS; the model must never sit under
+    # one, or the budget it feeds will over-admit
+    for frames, measured in ((24, 3.41), (48, 4.69), (96, 6.19), (144, 6.71),
+                             (288, 7.70), (576, 9.12), (1152, 10.46)):
+        assert enc._est_encode_gb(frames, 4) >= measured
+    assert enc._est_encode_gb(24, 4) < enc._est_encode_gb(1152, 4)
+
+    # lp only sizes the pool - output is byte-identical - so it is a pure
+    # memory knob and a lower one must cost strictly less
+    assert enc._est_encode_gb(144, 2) < enc._est_encode_gb(144, 4)
+    assert enc._est_encode_gb(144, 4) < enc._est_encode_gb(144, 6)
+    assert enc._est_encode_gb(144, 6) >= 8.80        # measured at lp=6
+
+    # ... and at 1080p, where the same shots cost about a third as much
+    gb_4k_144 = enc._est_encode_gb(144, 4)
+    info.width, info.height = 1920, 960
+    enc1080 = make_encoder(settings, info, plan, tmp_path)
+    for frames, measured in ((24, 1.08), (144, 1.96), (960, 2.72)):
+        assert enc1080._est_encode_gb(frames, 4) >= measured
+    assert enc1080._est_encode_gb(144, 4) < gb_4k_144 / 2
+
+
+def test_max_concurrency_defers_to_the_budget(settings, info, plan, tmp_path,
+                                              monkeypatch):
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
     enc = make_encoder(settings, info, plan, tmp_path)
-    assert enc._encode_workers(99) == 8       # cheap instances -> cores // 4
-
+    assert enc._max_concurrency(500) == 32    # budgets decide, not this cap
+    assert enc._max_concurrency(2) == 2       # never more than there are shots
     settings.transcode.optimizer.encode_workers = 6
-    assert enc._encode_workers(11) == 6       # explicit setting wins
-
-    # lp sizes the picture buffer pool and buys nothing above 4 (measured
-    # 23.8fps/21.2GB at lp=4 vs 23.3fps/22.4GB at lp=6, 3 workers on 32 cores)
-    assert enc._encode_lp(1) == 4
-    assert enc._encode_lp(2) == 4
-    assert enc._encode_lp(16) == 2
-    # the probe path must respect SVT-AV1's own [0, 6] range, or every probe
-    # gets clamped with a warning
-    assert enc._svt_lp(1) == 6
+    assert enc._max_concurrency(500) == 6     # explicit setting still pins it
 
 
-def test_encode_threads_affinity(settings, info, plan, tmp_path, monkeypatch):
+def test_affinity_slices_are_recycled(settings, info, plan, tmp_path, monkeypatch):
+    """taskset is opt-in now, and slices are taken and returned per encode.
+
+    Concurrency varies shot by shot, so a slice sized for N instances strands
+    cores whenever fewer than N run - measured, that stranding made the
+    admission scheduler 5% slower than the fixed pool it replaces. Slots are
+    therefore held only while an encode is live.
+    """
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
     enc = make_encoder(settings, info, plan, tmp_path)
-    monkeypatch.setattr(opt.os, "cpu_count", lambda: 32)
-    # auto: cores / workers
-    assert enc._encode_threads(4) == 8
-    assert enc._encode_threads(1) == 32
-    # explicit setting wins and is clamped to cores
-    settings.transcode.optimizer.encode_threads = 16
-    assert enc._encode_threads(4) == 16
-    settings.transcode.optimizer.encode_threads = 99
-    assert enc._encode_threads(1) == 32
-    settings.transcode.optimizer.encode_threads = 0
-    # single worker spanning all cores -> no taskset wrapper
+    # a slice covering every core is no constraint, so no wrapper is added
     assert enc._affinity_prefix(0, 32) == []
-    # core slices are keyed on the worker slot, not the shot index: shots
-    # finish out of order, so shot_idx % workers double-books a slice
-    import concurrent.futures as cf
-    import threading as th
-    barrier = th.Barrier(4)  # hold all 4 pool threads live at once
-
-    def slot(_):
-        barrier.wait(timeout=5)
-        return enc._worker_slot(4)
-
-    with cf.ThreadPoolExecutor(max_workers=4) as ex:
-        slots = list(ex.map(slot, range(4)))
-    assert sorted(slots) == [0, 1, 2, 3]   # concurrent workers never collide
-    assert enc._worker_slot(4) == enc._worker_slot(4)  # stable per thread
-    # workers get disjoint, wrapping core ranges
+    # slices are disjoint and wrap
     assert enc._affinity_prefix(0, 8) == ["taskset", "-c", "0-7"]
     assert enc._affinity_prefix(3, 8) == ["taskset", "-c", "24-31"]
-    assert enc._affinity_prefix(4, 8) == ["taskset", "-c", "0-7"]  # wraps
+    assert enc._affinity_prefix(4, 8) == ["taskset", "-c", "0-7"]
+    # slots are handed out lowest-free-first and returned on release
+    a, b, c = enc._take_slot(), enc._take_slot(), enc._take_slot()
+    assert (a, b, c) == (0, 1, 2)
+    enc._free_slot(b)
+    assert enc._take_slot() == 1               # the freed slice is reused
+    for held in (a, c, 1):
+        enc._free_slot(held)
+    assert enc._take_slot() == 0
+
+
+def test_plan_admission_packs_long_and_short_together():
+    """Best fit: the longest shot that still fits, so a long encode and the
+    short ones that fill the rest of the budget run together."""
+    # shot 0 is long/expensive, 1 and 2 are short/cheap
+    gb = {0: 6.0, 1: 2.0, 2: 2.0}
+    cost = lambda idx, lp: gb[idx] * (0.65 if lp == 2 else 1.0)  # noqa: E731
+    pending = [0, 1, 2]                       # already longest-first
+
+    # a full budget takes the long one first
+    assert opt.plan_admission(pending, 10.0, 32, cost, [4, 2], False) == (0, 4, 6.0)
+    # with it running, the remainder still admits the short ones
+    assert opt.plan_admission([1, 2], 4.0, 28, cost, [4, 2], False) == (0, 4, 2.0)
+    # a long shot that does not fit at lp=4 is admitted at lp=2 rather than
+    # made to wait - lp is byte-identical output, so spending less is free
+    assert opt.plan_admission([0], 4.5, 32, cost, [4, 2], False) == pytest.approx((0, 2, 3.9))
+    # nothing fits and something is running -> wait
+    assert opt.plan_admission([0], 1.0, 32, cost, [4, 2], False) is None
+    # nothing fits and nothing is running -> go anyway, or the phase deadlocks
+    assert opt.plan_admission([0], 1.0, 32, cost, [4, 2], True) == pytest.approx((0, 2, 3.9))
+    # the CPU budget binds independently of memory
+    assert opt.plan_admission([1], 99.0, 3, cost, [4, 2], False) == pytest.approx((0, 2, 1.3))
+    assert opt.plan_admission([1], 99.0, 1, cost, [4, 2], False) is None
 
 
 def test_mkvmerge_mux_success(settings, info, plan, tmp_path, monkeypatch):
@@ -834,7 +918,7 @@ def test_p5_final_encode_applies_rpu_inline(settings, info, plan, tmp_path):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    enc._encode_shot(0, 0, 90, 30.0, lp=4, threads=32, workers=1)
+    enc._encode_shot(0, 0, 90, 30.0, lp=4)
     cmd = cmds[0]
     assert "-init_hw_device" in cmd
     assert "apply_dolbyvision=1" in cmd[cmd.index("-vf") + 1]
@@ -1009,7 +1093,7 @@ def _encode_cmd(enc, crf):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    enc._encode_shot(0, 0, 90, crf, lp=4, threads=32, workers=1)
+    enc._encode_shot(0, 0, 90, crf, lp=4)
     return cmds[0]
 
 
@@ -1164,7 +1248,7 @@ def test_encode_shot_seeks_half_a_frame_early(settings, info, plan, tmp_path):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    enc._encode_shot(3, 300, 390, 30.0, lp=4, threads=32, workers=1)
+    enc._encode_shot(3, 300, 390, 30.0, lp=4)
     cmd = cmds[0]
     assert float(cmd[cmd.index("-ss") + 1]) == pytest.approx(299.5 / 30.0, abs=1e-6)
     assert cmd[cmd.index("-frames:v") + 1] == "90"       # count is still exact
@@ -1240,7 +1324,7 @@ def _encoder_writing(enc, frames_written):
 
 def test_shot_length_check_passes_on_an_exact_encode(settings, info, plan, tmp_path):
     enc = _encoder_writing(make_encoder(settings, info, plan, tmp_path), 90)
-    enc._encode_shot(0, 0, 90, 30.0, lp=4, threads=32, workers=1)
+    enc._encode_shot(0, 0, 90, 30.0, lp=4)
 
 
 def test_shot_length_check_catches_a_short_encode(settings, info, plan, tmp_path):
@@ -1249,7 +1333,7 @@ def test_shot_length_check_catches_a_short_encode(settings, info, plan, tmp_path
     borrow and comes up short - which used to reach the muxer unnoticed."""
     enc = _encoder_writing(make_encoder(settings, info, plan, tmp_path), 89)
     with pytest.raises(opt.TranscodeError, match="encoded 89 frames"):
-        enc._encode_shot(15, 1404, 1494, 30.0, lp=4, threads=32, workers=1)
+        enc._encode_shot(15, 1404, 1494, 30.0, lp=4)
 
 
 def test_shot_length_check_skipped_when_ffprobe_cannot_answer(
@@ -1265,7 +1349,7 @@ def test_shot_length_check_skipped_when_ffprobe_cannot_answer(
         return ""
 
     enc._run = fake_run.__get__(enc)
-    enc._encode_shot(0, 0, 90, 30.0, lp=4, threads=32, workers=1)
+    enc._encode_shot(0, 0, 90, 30.0, lp=4)
 
 
 # ---- delivered quality is measured, not assumed ----
@@ -1473,3 +1557,258 @@ def test_probe_bracket_width_zero_sweeps_the_whole_grid(settings, info, plan, tm
     settings.transcode.optimizer.probe_bracket_width = 0
     enc._probe_shot(0, 0, 90, [20, 26, 32, 38, 44], lp=4)
     assert tried == [20, 26, 32, 38, 44]
+
+
+def _admission_encoder(settings, info, plan, tmp_path, budget=10.0):
+    """Encoder whose costs are fixed so the tests exercise the SCHEDULER.
+
+    The cost model itself is covered by test_encode_cost_tracks_shot_length.
+    """
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._mem_budget_gb = lambda: budget
+    enc._cores = lambda: 32
+    enc._est_encode_gb = lambda frames, lp=4: (6.0 if frames >= 100 else 2.0)
+    return enc
+
+
+def test_encode_all_fills_the_budget_without_exceeding_it(
+        settings, info, plan, tmp_path):
+    """One long encode plus the short ones that fit alongside it.
+
+    A fixed worker pool sized for the long shots would run 1 at a time here and
+    leave 4GB of the 10GB budget idle; admitting by cost runs 3.
+    """
+    enc = _admission_encoder(settings, info, plan, tmp_path)
+    # 2 long (6GB) and 6 short (2GB) shots, interleaved in the timeline
+    shots = [(0, 200), (200, 250), (250, 300), (300, 500),
+             (500, 550), (550, 600), (600, 650), (650, 700)]
+    enc.total_frames = shots[-1][1]
+    in_flight, peak_gb, lock = 0.0, 0.0, threading.Lock()
+
+    def fake_encode(idx, s0, s1, crf, lp, slot=-1, threads=0):
+        nonlocal in_flight, peak_gb
+        gb = enc._est_encode_gb(s1 - s0, lp)
+        with lock:
+            in_flight += gb
+            peak_gb = max(peak_gb, in_flight)
+        time.sleep(0.1)
+        with lock:
+            in_flight -= gb
+        dst = enc.probe_dir / f"enc_{idx:05d}.ivf"
+        dst.write_bytes(b"ivf")
+        return dst
+
+    enc._encode_shot = fake_encode
+    paths = enc.encode_all(shots, {i: 30.0 for i in range(len(shots))})
+
+    # every shot encoded, and returned in timeline order regardless of the
+    # order they were admitted in
+    assert len(paths) == len(shots)
+    assert [p.name for p in paths] == [f"enc_{i:05d}.ivf" for i in range(len(shots))]
+    # the invariant that matters: admission never oversubscribes the budget
+    assert peak_gb <= 10.0
+    # ... and it does pack, rather than serialising on the expensive shots: a
+    # pool sized for the 6GB shots would run one at a time
+    assert peak_gb > 6.0
+
+
+def test_encode_all_admits_a_shot_too_big_for_the_budget(
+        settings, info, plan, tmp_path):
+    """A shot that cannot fit still has to run, or the phase deadlocks."""
+    enc = _admission_encoder(settings, info, plan, tmp_path, budget=3.0)
+    shots = [(0, 200), (200, 250)]
+    enc.total_frames = 250
+    seen = []
+
+    def fake_encode(idx, s0, s1, crf, lp, slot=-1, threads=0):
+        seen.append(idx)
+        dst = enc.probe_dir / f"enc_{idx:05d}.ivf"
+        dst.write_bytes(b"ivf")
+        return dst
+
+    enc._encode_shot = fake_encode
+    paths = enc.encode_all(shots, {0: 30.0, 1: 30.0})
+    assert sorted(seen) == [0, 1]
+    assert len(paths) == 2
+
+
+def test_encode_all_propagates_a_failure_without_hanging(
+        settings, info, plan, tmp_path):
+    enc = _admission_encoder(settings, info, plan, tmp_path)
+    shots = [(0, 50), (50, 100), (100, 150)]
+    enc.total_frames = 150
+
+    def fake_encode(idx, s0, s1, crf, lp, slot=-1, threads=0):
+        if idx == 1:
+            raise opt.TranscodeError("shot 1 exploded")
+        dst = enc.probe_dir / f"enc_{idx:05d}.ivf"
+        dst.write_bytes(b"ivf")
+        return dst
+
+    enc._encode_shot = fake_encode
+    with pytest.raises(opt.TranscodeError, match="shot 1 exploded"):
+        enc.encode_all(shots, {i: 30.0 for i in range(3)})
+
+
+def test_encode_all_honours_cancel(settings, info, plan, tmp_path):
+    enc = _admission_encoder(settings, info, plan, tmp_path)
+    cancelled = {"v": False}
+    enc.cancel_flag = lambda: cancelled["v"]
+    shots = [(i * 50, i * 50 + 50) for i in range(8)]
+    enc.total_frames = 400
+
+    def fake_encode(idx, s0, s1, crf, lp, slot=-1, threads=0):
+        cancelled["v"] = True          # first shot trips the cancel flag
+        time.sleep(0.02)
+        dst = enc.probe_dir / f"enc_{idx:05d}.ivf"
+        dst.write_bytes(b"ivf")
+        return dst
+
+    enc._encode_shot = fake_encode
+    with pytest.raises(opt.TranscodeError, match="cancelled"):
+        enc.encode_all(shots, {i: 30.0 for i in range(8)})
+
+
+def test_encode_all_respects_an_explicit_worker_cap(settings, info, plan, tmp_path):
+    """encode_workers still pins concurrency for anyone who set it."""
+    enc = _admission_encoder(settings, info, plan, tmp_path, budget=100.0)
+    settings.transcode.optimizer.encode_workers = 2
+    shots = [(i * 50, i * 50 + 50) for i in range(6)]
+    enc.total_frames = 300
+    live, peak_live, lock = 0, 0, threading.Lock()
+
+    def fake_encode(idx, s0, s1, crf, lp, slot=-1, threads=0):
+        nonlocal live, peak_live
+        with lock:
+            live += 1
+            peak_live = max(peak_live, live)
+        time.sleep(0.1)
+        with lock:
+            live -= 1
+        dst = enc.probe_dir / f"enc_{idx:05d}.ivf"
+        dst.write_bytes(b"ivf")
+        return dst
+
+    enc._encode_shot = fake_encode
+    enc.encode_all(shots, {i: 30.0 for i in range(6)})
+    assert peak_live == 2
+
+
+def test_calibration_jumps_up_and_eases_down():
+    """Asymmetric on purpose: over-shooting the budget is what OOMs."""
+    cal = opt.MemCalibration("encoding")
+    assert cal.factor() == 1.0
+
+    # an observation ABOVE the prediction is acted on immediately, with a
+    # little clearance so the next task of that size is not admitted flush
+    cal.observe(predicted_gb=4.0, observed_gb=6.0)
+    assert cal.factor() > 1.5
+
+    # ... and a cheaper reading only eases it back, so one light task cannot
+    # talk the pool into over-admitting the next heavy one
+    before = cal.factor()
+    cal.observe(predicted_gb=4.0, observed_gb=2.0)
+    assert 0.5 < cal.factor() < before
+
+    # repeated agreement converges on the truth
+    for _ in range(40):
+        cal.observe(predicted_gb=4.0, observed_gb=2.0)
+    assert cal.factor() == pytest.approx(0.5, abs=0.02)
+    assert cal.samples == 42
+
+    # and it is bounded either way, so a bad reading cannot run away
+    for _ in range(50):
+        cal.observe(predicted_gb=4.0, observed_gb=0.001)
+    assert cal.factor() >= opt.MemCalibration.FLOOR
+    cal.observe(predicted_gb=0.1, observed_gb=99.0)
+    assert cal.factor() <= opt.MemCalibration.CAP
+    # a missing or zero reading is ignored rather than treated as "free"
+    was = cal.factor()
+    cal.observe(predicted_gb=4.0, observed_gb=0.0)
+    assert cal.factor() == was
+
+
+def test_schedule_learns_the_real_cost_and_admits_more(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The prior is deliberately high; measurement is what reclaims the slack.
+
+    Here every task really costs 1GB while the model claims 4GB, so a static
+    budget of 8GB would never run more than 2 at once. The calibration should
+    discover the truth and open the pool up.
+    """
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
+    monkeypatch.setattr(opt.sysres, "memory_available_gb", lambda: 1000.0)
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._mem_budget_gb = lambda: 8.0
+    enc._cores = lambda: 32
+    live, peak_live, lock = 0, 0, threading.Lock()
+
+    def run_one(key, lp, slot, threads):
+        nonlocal live, peak_live
+        with lock:
+            live += 1
+            peak_live = max(peak_live, live)
+        enc._note_task_peak(1.0)          # what the task ACTUALLY peaked at
+        time.sleep(0.02)
+        with lock:
+            live -= 1
+        return key
+
+    seen = []
+    enc._schedule(list(range(40)), phase="encoding",
+                  cost=lambda key, lp: 4.0, run_one=run_one,
+                  on_done=lambda key, result: seen.append(result),
+                  progress=lambda done: None, max_conc=32, ladder=[4])
+    assert sorted(seen) == list(range(40))
+    # 8GB / 4GB claimed = 2; 8GB / 1GB measured = 8
+    assert peak_live > 2
+    assert enc._cal["encoding"].factor() < 0.5
+
+
+def test_schedule_backs_off_when_real_memory_disagrees(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Budget accounting is not the only limit.
+
+    The cost model covers encoder processes and nothing else, so page cache,
+    tmpfs shards and other tenants can eat the headroom without the budget
+    noticing. Admission takes the smaller of the two.
+    """
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
+    live, peak_live, lock = 0, 0, threading.Lock()
+    machine_gb = [100.0]
+
+    # real free memory shrinks as instances start, the way it does on a box;
+    # the book-keeping budget below stays generous throughout
+    monkeypatch.setattr(opt.sysres, "memory_available_gb",
+                        lambda: machine_gb[0] - live)
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._mem_budget_gb = lambda: 100.0
+    enc._cores = lambda: 32
+
+    def run_one(key, lp, slot, threads):
+        nonlocal live, peak_live
+        with lock:
+            live += 1
+            peak_live = max(peak_live, live)
+        time.sleep(0.05)
+        with lock:
+            live -= 1
+        return key
+
+    def go(tasks):
+        nonlocal peak_live
+        peak_live = 0
+        done = []
+        enc._schedule(list(range(tasks)), phase="encoding",
+                      cost=lambda key, lp: 1.0, run_one=run_one,
+                      on_done=lambda key, result: done.append(key),
+                      progress=lambda d: None, max_conc=32, ladder=[4])
+        assert sorted(done) == list(range(tasks))
+        return peak_live
+
+    # plenty of real memory: the budget is the only limit, so it packs
+    assert go(8) >= 4
+    # now only ~3.5GB is really free; admission has to notice, even though the
+    # budget still shows 100GB and nothing in the cost model changed
+    machine_gb[0] = 3.5
+    assert go(8) <= 3
