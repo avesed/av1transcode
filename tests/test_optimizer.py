@@ -460,14 +460,19 @@ def test_plan_admission_packs_long_and_short_together():
     assert opt.plan_admission(pending, 10.0, 32, cost, [4, 2], False) == (0, 4, 6.0)
     # with it running, the remainder still admits the short ones
     assert opt.plan_admission([1, 2], 4.0, 28, cost, [4, 2], False) == (0, 4, 2.0)
-    # a long shot that does not fit at lp=4 is admitted at lp=2 rather than
-    # made to wait - lp is byte-identical output, so spending less is free
-    assert opt.plan_admission([0], 4.5, 32, cost, [4, 2], False) == pytest.approx((0, 2, 3.9))
-    # nothing fits and something is running -> wait
+    # a shot that does not fit at the top of the ladder WAITS rather than
+    # taking a lower lp. Trading lp for concurrency looks free because the
+    # bitstream is unchanged, but the demoted instance runs 1.2-4.3x slower and
+    # the extra concurrency does not pay for that: simulated over a real
+    # 146-shot list, descending here ran 3338s against 1575s for waiting.
+    assert opt.plan_admission([0], 4.5, 32, cost, [4, 2], False) is None
     assert opt.plan_admission([0], 1.0, 32, cost, [4, 2], False) is None
-    # nothing fits and nothing is running -> go anyway, or the phase deadlocks
+    # ... unless nothing at all is running, which is the case the ladder exists
+    # for: a shot too big for the whole budget still has to run at some lp
+    assert opt.plan_admission([0], 4.5, 32, cost, [4, 2], True) == pytest.approx((0, 2, 3.9))
+    # and when no rung fits either, it goes anyway rather than deadlocking
     assert opt.plan_admission([0], 1.0, 32, cost, [4, 2], True) == pytest.approx((0, 2, 3.9))
-    # the CPU budget binds independently of memory
+    # the CPU budget picks the rung, independently of memory
     assert opt.plan_admission([1], 99.0, 3, cost, [4, 2], False) == pytest.approx((0, 2, 1.3))
     assert opt.plan_admission([1], 99.0, 1, cost, [4, 2], False) is None
 
