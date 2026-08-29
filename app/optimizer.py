@@ -356,22 +356,37 @@ def plan_admission(
     pool of anything cheap to pair them with, and simulating that on the same
     shot list came out slower than not sorting at all.
 
-    A shot may be admitted at a lower lp than the top of the ladder. lp only
-    sizes SVT-AV1's frame pool - verified byte-identical output at lp 2, 4 and
-    6 - so spending less of it is free, and letting a long shot in at lp=2
-    beats making it wait.
+    The CPU budget picks the lp; memory only decides admit-or-wait. Trading lp
+    away to fit one more instance in memory looks free - lp does not change the
+    bitstream - but it is not, because a lower lp makes that instance slower:
+    measured at 4K on a 144-frame shot, 22.5s at lp=4 against 27.6s at lp=3,
+    41.0s at lp=2 and 97.3s at lp=1. Taking that trade greedily costs far more
+    than the extra concurrency returns. Simulated over a real 146-shot list
+    with the measured contention curve, descending the ladder for memory ran
+    3338s against 1575s for waiting instead - and the same 2x at every budget
+    from 8GB up.
 
-    `idle` (nothing running) forces an admission even when the shot does not
-    fit, because refusing every shot with an empty pool would deadlock. The
-    caller warns; there is nothing else to do but overshoot.
+    So the ladder is a fallback, not a routine choice: it is walked only when
+    NOTHING is running and the shot does not fit even so, which is the case it
+    was added for - a shot too big for the whole budget has to run at some lp
+    or the phase deadlocks. On the same list at an 8GB budget that path takes
+    10 shots of 146; the other 136 still run at the top of the ladder.
+
+    `idle` also forces an admission when no rung fits at all. The caller warns;
+    there is nothing else to do but overshoot.
     """
     ladder = sorted({max(1, lp) for lp in lp_ladder}, reverse=True)
-    for pos, idx in enumerate(pending):
-        for lp in ladder:
-            gb = cost(idx, lp)
-            if gb <= mem_free and lp <= cpu_free:
-                return pos, lp, gb
+    top = next((lp for lp in ladder if lp <= cpu_free), None)
+    if top is not None:
+        for pos, idx in enumerate(pending):
+            gb = cost(idx, top)
+            if gb <= mem_free:
+                return pos, top, gb
     if idle and pending:
+        for lp in ladder:
+            gb = cost(pending[0], lp)
+            if gb <= mem_free and lp <= cpu_free:
+                return 0, lp, gb
         lp = ladder[-1]
         return 0, lp, cost(pending[0], lp)
     return None
