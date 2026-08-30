@@ -628,7 +628,14 @@ class _FrameNum:
         self.frame_num = n
 
 
-def _install_fake_scenedetect(scene_frames):
+def _install_fake_scenedetect(scene_frames, monkeypatch):
+    """Stub scenedetect for tests that only care about detect_shots' plumbing.
+
+    Installed with setitem so it is REMOVED afterwards: left in sys.modules it
+    shadows the real package for the rest of the session, and anything later
+    that imports a submodule (app.detectstream needs scenedetect.frame_timecode)
+    fails with "not a package" and quietly skips instead of running.
+    """
     mod = types.ModuleType("scenedetect")
     mod.ContentDetector = type("ContentDetector", (), {"__init__": lambda self, **k: None})
     mod.SceneManager = type("SceneManager", (), {
@@ -638,30 +645,31 @@ def _install_fake_scenedetect(scene_frames):
         "get_scene_list": lambda self: [(_FrameNum(a), _FrameNum(b)) for a, b in scene_frames],
     })
     mod.open_video = lambda path: object()
-    sys.modules["scenedetect"] = mod
+    monkeypatch.setitem(sys.modules, "scenedetect", mod)
 
 
-def test_detect_shots(settings, info, plan, tmp_path):
-    _install_fake_scenedetect([(0, 100), (100, 300), (300, 800)])
+def test_detect_shots(settings, info, plan, tmp_path, monkeypatch):
+    _install_fake_scenedetect([(0, 100), (100, 300), (300, 800)], monkeypatch)
     enc = make_encoder(settings, info, plan, tmp_path)
     shots = enc.detect_shots()
     assert shots == [(0, 100), (100, 300), (300, 800)]
 
 
-def test_detect_shots_merges_past_max(settings, info, plan, tmp_path):
-    _install_fake_scenedetect([(0, 100), (100, 200), (200, 300)])
+def test_detect_shots_merges_past_max(settings, info, plan, tmp_path, monkeypatch):
+    _install_fake_scenedetect([(0, 100), (100, 200), (200, 300)], monkeypatch)
     settings.transcode.optimizer.max_shots = 2
     enc = make_encoder(settings, info, plan, tmp_path)
     assert len(enc.detect_shots()) == 2
 
 
-def test_detect_shots_falls_back_to_single_shot(settings, info, plan, tmp_path):
-    _install_fake_scenedetect([])
+def test_detect_shots_falls_back_to_single_shot(settings, info, plan, tmp_path, monkeypatch):
+    _install_fake_scenedetect([], monkeypatch)
     enc = make_encoder(settings, info, plan, tmp_path)
     assert enc.detect_shots() == [(0, enc.total_frames)]
 
 
-def test_detect_shots_reports_frame_progress(settings, info, plan, tmp_path):
+def test_detect_shots_reports_frame_progress(settings, info, plan, tmp_path,
+                                            monkeypatch):
     mod = types.ModuleType("scenedetect")
     mod.ContentDetector = type("ContentDetector", (), {"__init__": lambda self, **k: None})
 
@@ -683,7 +691,7 @@ def test_detect_shots_reports_frame_progress(settings, info, plan, tmp_path):
 
     mod.SceneManager = _SM
     mod.open_video = lambda path: _V()
-    sys.modules["scenedetect"] = mod
+    monkeypatch.setitem(sys.modules, "scenedetect", mod)
     enc = make_encoder(settings, info, plan, tmp_path)
     reports = []
     enc.progress_cb = lambda pct, stats: reports.append((pct, stats))
@@ -782,8 +790,8 @@ def test_feature_warning_logged_once(settings, info, plan, tmp_path, monkeypatch
 
 
 # ---- full pipeline with a fake ffmpeg ----
-def test_run_full_pipeline(settings, info, plan, tmp_path):
-    _install_fake_scenedetect([(0, 300), (300, 900), (900, 1800)])
+def test_run_full_pipeline(settings, info, plan, tmp_path, monkeypatch):
+    _install_fake_scenedetect([(0, 300), (300, 900), (900, 1800)], monkeypatch)
     plan.params.probes = 0
     enc = make_encoder(settings, info, plan, tmp_path)
     enc.fps = 30.0
@@ -1228,9 +1236,9 @@ def test_merge_short_shots_survives_a_single_short_shot():
     assert opt.merge_short_shots([(0, 10)], 48) == [(0, 10)]
 
 
-def test_detect_shots_applies_min_shot_frames(settings, info, plan, tmp_path):
+def test_detect_shots_applies_min_shot_frames(settings, info, plan, tmp_path, monkeypatch):
     # 40 40 40 40 pairs up rather than collapsing onto one neighbour
-    _install_fake_scenedetect([(0, 40), (40, 80), (80, 120), (120, 160)])
+    _install_fake_scenedetect([(0, 40), (40, 80), (80, 120), (120, 160)], monkeypatch)
     settings.transcode.optimizer.min_shot_frames = 48
     enc = make_encoder(settings, info, plan, tmp_path)
     assert enc.detect_shots() == [(0, 80), (80, 160)]
@@ -1901,8 +1909,8 @@ def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,
     assert seen["cmd"] == ["mkvmerge", "-o", str(enc.output), str(video_only)]
 
 
-@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="needs a real ffprobe")
-def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path):
+def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path,
+                                                 monkeypatch):
     """Run the probe command for real, not against a stubbed _run.
 
     The first version of this used "-select_streams a,s", which ffprobe rejects
@@ -1911,12 +1919,15 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
     fell back to "assume there is audio" on every single source. Only a real
     ffprobe catches that class of mistake.
     """
-    settings.tools.ffprobe = shutil.which("ffprobe")
+    # ... and the `settings` fixture stubs shutil.which, so without this the
+    # test would reach for /usr/bin/fake-ffprobe and prove nothing.
+    monkeypatch.undo()
+    ffprobe, ffmpeg = shutil.which("ffprobe"), shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg:
+        pytest.skip("needs a real ffmpeg and ffprobe")
+    settings.tools.ffprobe = ffprobe
     enc = make_encoder(settings, info, plan, tmp_path)
     silent = tmp_path / "silent.mkv"
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        pytest.skip("needs a real ffmpeg to build the fixtures")
     import subprocess as sp
     sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
             "-i", "testsrc=size=64x64:rate=5:duration=1", "-c:v", "libx264",
@@ -1929,3 +1940,58 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
             "-i", "sine=frequency=440:duration=1", "-c:v", "libx264",
             "-c:a", "aac", str(noisy)], check=True)
     assert enc._has_audio_or_subs(str(noisy)) is True
+
+
+def test_scaled_size_derives_the_pipe_frame_size():
+    """Reading fixed-size frames off a rawvideo pipe needs an exact size, and a
+    wrong one shears every frame instead of failing - so anything that cannot
+    be derived returns None and the caller stages a copy instead."""
+    ds = pytest.importorskip("app.detectstream")
+    assert ds.scaled_size("-2:540", 3840, 1920) == (1080, 540)   # 2:1 source
+    assert ds.scaled_size("-2:540", 1920, 1080) == (960, 540)
+    assert ds.scaled_size("-1:540", 1920, 1080) == (960, 540)
+    assert ds.scaled_size("960:540", 3840, 1920) == (960, 540)
+    assert ds.scaled_size("-2:270", 1920, 1080) == (480, 270)
+    # widths are rounded to the multiple the spec asks for
+    w, h = ds.scaled_size("-2:540", 1998, 1080)
+    assert h == 540 and w % 2 == 0
+    # not a plain W:H, or no source dimensions -> caller must fall back
+    assert ds.scaled_size("w='min(iw,1920)':h=-2", 3840, 1920) is None
+    assert ds.scaled_size("-2:540", 0, 0) is None
+    assert ds.scaled_size("", 3840, 1920) is None
+
+
+def test_detection_pipe_declines_what_it_cannot_size(settings, info, plan,
+                                                     tmp_path, monkeypatch):
+    pytest.importorskip("app.detectstream")
+    info.width, info.height = 3840, 1920
+    enc = make_encoder(settings, info, plan, tmp_path)
+    settings.transcode.optimizer.scenedetect_scale = "w='min(iw,1920)':h=-2"
+    assert enc._open_detection_pipe() is None
+    settings.transcode.optimizer.scenedetect_scale = ""      # detect on source
+    assert enc._open_detection_pipe() is None
+
+
+def test_detection_pipe_failure_is_loud(settings, info, plan, tmp_path):
+    """A dead decoder must not read as "the video ended".
+
+    read() signals end-of-video with a short read, so ffmpeg dying halfway
+    looks identical to a video that simply finished - and _validate_shots
+    would then take the truncated list as authoritative and encode a fraction
+    of the film.
+    """
+    ds = pytest.importorskip("app.detectstream")
+    missing = tmp_path / "nope.mkv"
+    stream = ds.PipedFrames(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-i", str(missing), "-vf", "scale=-2:540", "-pix_fmt", "bgr24",
+         "-f", "rawvideo", "-"],
+        960, 540, 24.0, 100, str(missing))
+    try:
+        assert stream.read() is False          # nothing decoded
+        failure = stream.check_ok()
+        assert failure and "exited" in failure
+    finally:
+        stream.close()
+    # a stream we closed ourselves is not a failure
+    assert stream.check_ok() is None
