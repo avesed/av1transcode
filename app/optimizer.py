@@ -1075,9 +1075,12 @@ class ShotEncoder:
                 "pip install scenedetect (and opencv-python-headless)."
             ) from e
         total = max(self.total_frames, 1)
-        det_path = self._make_detection_copy()
-        try:
+        det_path: Optional[Path] = None
+        video = self._open_detection_pipe()
+        if video is None:
+            det_path = self._make_detection_copy()
             video = open_video(str(det_path) if det_path else str(self.source))
+        try:
             sm = SceneManager()
             sm.add_detector(ContentDetector(
                 threshold=self.opt.scenedetect_threshold,
@@ -1101,6 +1104,12 @@ class ShotEncoder:
                 self._report(min(cur / total * 100, 100.0), cur, total)
                 thread.join(timeout=0.5)
             thread.join()
+            check = getattr(video, "check_ok", None)
+            failure = check() if check is not None else None
+            if failure:
+                raise TranscodeError(
+                    f"scene detection could not read {self.source.name}: "
+                    f"{failure}")
             scenes = sm.get_scene_list()
             shots = [(int(a.frame_num), int(b.frame_num)) for a, b in scenes]
             if not shots:
@@ -1119,11 +1128,50 @@ class ShotEncoder:
                 logger.info("optimizer: {} shot(s) detected", len(shots))
             return shots
         finally:
+            closer = getattr(video, "close", None)
+            if closer is not None:
+                closer()
             if det_path is not None:
                 try:
                     det_path.unlink()
                 except OSError:
                     pass
+
+    def _open_detection_pipe(self):
+        """Frames for scene detection, decoded by ffmpeg straight into here.
+
+        Returns None when the frame size cannot be known up front - an
+        elaborate scenedetect_scale, or a source ffprobe gave no dimensions for
+        - in which case the caller falls back to staging a downscaled copy.
+        Reading fixed-size frames off a rawvideo pipe needs an exact size, and
+        guessing it wrong would shear every frame rather than fail.
+        """
+        scale = (self.opt.scenedetect_scale or "").strip()
+        if not scale:
+            return None
+        try:
+            from app.detectstream import PipedFrames, scaled_size
+        except ImportError as e:  # pragma: no cover - numpy/scenedetect missing
+            logger.debug("optimizer: detection pipe unavailable ({})", e)
+            return None
+        size = scaled_size(scale, self.info.width or 0, self.info.height or 0)
+        if size is None:
+            logger.info("optimizer: scenedetect_scale={!r} is not a plain W:H, "
+                        "staging a downscaled copy instead", scale)
+            return None
+        width, height = size
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-i", str(self.source), "-map", "0:v:0",
+                "-vf", f"scale={scale}", "-pix_fmt", "bgr24",
+                "-f", "rawvideo", "-"]
+        self._log("$ " + " ".join(args))
+        try:
+            return PipedFrames(args, width, height, self.fps,
+                               self.total_frames, str(self.source))
+        except (OSError, ValueError) as e:
+            logger.warning("optimizer: could not start the detection pipe ({}); "
+                           "staging a downscaled copy instead", e)
+            return None
 
     def _validate_shots(self, shots: List[Shot]) -> None:
         """Check the shot list covers the source exactly once, in order.

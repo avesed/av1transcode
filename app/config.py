@@ -218,10 +218,17 @@ class OptimizerSettings(BaseModel):
     scenedetect_threshold: float = 27.0
     # Minimum shot length in frames (shorter segments are merged).
     min_scene_len: int = 24
-    # ffmpeg scale filter used to make a small detection copy before running
-    # PySceneDetect. OpenCV decodes frame-by-frame and 4K HEVC is unusably slow
-    # (minutes per scene); a downscaled copy (same fps, frame numbers map 1:1)
-    # is 5-10x faster. e.g. "-2:540". Empty = detect on the source directly.
+    # ffmpeg scale filter applied before PySceneDetect sees a frame. OpenCV
+    # decodes frame-by-frame and 4K HEVC is unusably slow that way, so frames
+    # are downscaled first (same fps, so cut frame numbers map 1:1 back).
+    # A plain "W:H" (with -1/-2 for "derive") is piped straight from ffmpeg
+    # into the detector, so detection overlaps decoding and nothing is staged;
+    # anything more elaborate cannot be sized up front and falls back to
+    # writing a downscaled copy first. Empty = detect on the source directly.
+    # Measured on an 8-minute 4K window: 132.8s staged against 85.5s piped, and
+    # detection at 540p / 360p / 270p all agree with native-resolution
+    # detection equally well, so lower is safe but buys nothing - the cost is
+    # the 4K decode (81.3s of the 85.7s), not the scale.
     scenedetect_scale: str = "-2:540"
     # Fold shots shorter than this many frames into a neighbour before probing.
     # OFF by default, because the size win it was added for did not survive

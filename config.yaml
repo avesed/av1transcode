@@ -127,7 +127,12 @@ transcode:
                                  # (实测慢 5%)；总并行度已由准入预算约束
     scenedetect_threshold: 27.0  # PySceneDetect ContentDetector sensitivity
     min_scene_len: 24            # minimum shot length in frames
-    scenedetect_scale: "-2:540"  # 4K 分镜前先用 ffmpeg 降采样(帧号1:1)，避免 OpenCV 逐帧解 4K 卡死
+    scenedetect_scale: "-2:540"  # 分镜前先用 ffmpeg 降采样(帧号1:1)，避免 OpenCV 逐帧解 4K 卡死。
+                                 # 纯 "W:H" 形式(-1/-2 表示按比例推导)会直接从 ffmpeg 管道喂给
+                                 # 检测器，检测与解码重叠、不落中间文件(8分钟 4K 实测 132.8s→85.5s)；
+                                 # 更复杂的表达式无法预知帧尺寸，会退回先写降采样副本。
+                                 # 540p/360p/270p 与原生分辨率检测的一致性相同，调低没有额外收益——
+                                 # 开销在 4K 解码本身(85.7s 里占 81.3s)，不在缩放
     max_shots: 3000              # cap; shortest shots merged past this
     max_crf_delta: 4.0           # 相邻镜头 CRF 差上限(0=关闭)，避免质量跳变
     min_crf: 0                   # CRF 硬下限(0=用 probe_crfs 最小值)。目标不可达时每个镜头都会
