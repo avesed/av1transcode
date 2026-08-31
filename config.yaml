@@ -127,6 +127,18 @@ transcode:
                                  # (实测慢 5%)；总并行度已由准入预算约束
     scenedetect_threshold: 27.0  # PySceneDetect ContentDetector sensitivity
     min_scene_len: 24            # minimum shot length in frames
+    scenedetect_engine: scdet    # 用哪个检测器找镜头边界:
+                                 #   scdet         ffmpeg 的场景变化滤镜，对源跑一趟就完事。
+                                 #                 不落盘，也不需要 PySceneDetect / OpenCV。
+                                 #                 三个 4K 源实测(阈值 2.0): 一个边界完全一致、
+                                 #                 另两个各多 1 个。整个阶段 44.7s/255s CPU
+                                 #                 → 12.2s/8s CPU
+                                 #   pyscenedetect 旧路径: 先写降采样副本，再用 OpenCV 逐帧读
+    scdet_threshold: 2.0         # scdet 判定切点的分数门限(0-100)。注意 ffmpeg 自己的默认值 10
+                                 # 对影视素材太高——4K 样本上 21 个切点只找到 1 个。
+                                 # 2.0 和旧检测器几乎一致；0.8-1.5 会多抓一些较软的转场
+                                 # (单帧幅度 1.5-4.5)；低于 0.5 抓到的多是宽 4-5 帧、幅度 0.5
+                                 # 的镜头运动/光线变化，而且会把本来正确的边界推偏
     scenedetect_hwaccel: auto    # 分镜降采样是否用 GPU 解码(auto/off)。auto 先试 Intel QSV，
                                  # 没有可用设备、卡不支持该编码(B580 解 AV1 会返回 0 但不写输出)、
                                  # 或 scenedetect_scale 不是纯 W:H 时自动退回软件。

@@ -1164,6 +1164,163 @@ class ShotEncoder:
                 return 0
 
     def detect_shots(self) -> List[Shot]:
+        """Shot boundaries, then the merging every engine shares.
+
+        scdet reads the source through ffmpeg in one pass and stages nothing;
+        pyscenedetect writes a downscaled copy and reads it back with OpenCV.
+        See _detect_shots_scdet for what the two measured against each other.
+        """
+        engine = (self.opt.scenedetect_engine or "scdet").lower()
+        if engine == "scdet":
+            shots = self._detect_shots_scdet()
+        else:
+            shots = self._detect_shots_pyscenedetect()
+        if not shots:
+            shots = [(0, self.total_frames)]
+        detected = len(shots)
+        shots = merge_short_shots(shots, self.opt.min_shot_frames)
+        shots = merge_to_max(shots, max(1, self.opt.max_shots))
+        self._validate_shots(shots)
+        if len(shots) != detected:
+            logger.info(
+                "optimizer: {} shot(s) detected -> {} after merging "
+                "(min_shot_frames={}, max_shots={})",
+                detected, len(shots), self.opt.min_shot_frames,
+                self.opt.max_shots)
+        else:
+            logger.info("optimizer: {} shot(s) detected ({})", len(shots), engine)
+        return shots
+
+    # "frame:123 pts:... " and "lavfi.scd.score=1.234" from metadata=print
+    _SCD_FRAME = re.compile(r"^frame:(\d+)")
+    _SCD_SCORE = re.compile(r"^lavfi\.scd\.score=([\d.]+)")
+
+    def _scdet_cmds(self) -> List[Tuple[str, List[str]]]:
+        """(label, ffmpeg args) to try for a scdet pass over the source.
+
+        One pass, no staged copy: scdet is a filter, so the frames never leave
+        ffmpeg and nothing is written to disk. Downscaling first is purely for
+        speed - measured, detection at 540p and at full resolution pick the same
+        cuts at the same threshold.
+        """
+        scale = (self.opt.scenedetect_scale or "").strip()
+        size = self._scaled_size(scale) if scale else None
+        chain_sw = ([f"scale={scale}"] if scale else []) + [
+            "scdet=threshold=100", "metadata=print:file=-"]
+        sw = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+              "-i", str(self.source), "-map", "0:v:0",
+              "-vf", ",".join(chain_sw), "-f", "null", "-"]
+        cmds: List[Tuple[str, List[str]]] = []
+        if (self.opt.scenedetect_hwaccel or "auto").lower() != "off" and size:
+            w, h = size
+            cmds.append(("qsv", [
+                self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
+                "-i", str(self.source), "-map", "0:v:0",
+                "-vf", f"scale_qsv=w={w}:h={h}:format=nv12,hwdownload,"
+                       f"format=nv12,scdet=threshold=100,metadata=print:file=-",
+                "-f", "null", "-"]))
+        cmds.append(("software", sw))
+        return cmds
+
+    def _run_scdet(self, args: List[str]) -> List[float]:
+        """Per-frame scene-change scores from one ffmpeg pass.
+
+        scdet is run wide open (threshold=100, which never fires) and the score
+        is thresholded here instead, so the knob can be changed without another
+        pass over the source.
+        """
+        self._log("$ " + " ".join(args))
+        self._check_cancel()
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True,
+                                    errors="replace", start_new_session=True)
+        except FileNotFoundError:
+            raise TranscodeError(f"command not found: {args[0]}")
+        with self._proc_lock:
+            self._procs.add(proc)
+        scores: List[float] = []
+        total = max(self.total_frames, 1)
+        last_pct = -1.0
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                m = self._SCD_SCORE.match(line)
+                if m:
+                    scores.append(float(m.group(1)))
+                    continue
+                m = self._SCD_FRAME.match(line)
+                if m:
+                    n = int(m.group(1))
+                    pct = min(n / total * 100, 100.0)
+                    if pct > last_pct + 0.5:
+                        last_pct = pct
+                        self._report(pct, n, total)
+                    if n % 500 == 0:
+                        self._check_cancel()
+        finally:
+            with self._proc_lock:
+                self._procs.discard(proc)
+            rc = proc.wait(timeout=60)
+        if rc != 0:
+            raise TranscodeError(f"scdet pass failed (rc={rc})")
+        return scores
+
+    def _cuts_from_scores(self, scores: List[float]) -> List[int]:
+        """Frames whose score clears the threshold, min_scene_len apart."""
+        th = float(self.opt.scdet_threshold)
+        gap = max(1, int(self.opt.min_scene_len))
+        cuts: List[int] = []
+        last = -gap
+        for i, v in enumerate(scores):
+            if i > 0 and v >= th and i - last >= gap:
+                cuts.append(i)
+                last = i
+        return cuts
+
+    def _detect_shots_scdet(self) -> List[Shot]:
+        """Shot boundaries from ffmpeg's scdet, without staging a copy.
+
+        Measured against the PySceneDetect path on three 4K sources at
+        threshold 2.0: 29/29 boundaries identical on one, 28 of 29 with one
+        extra on another, 13 of 13 with one extra on the third. Where the two
+        disagreed at the frame level, scdet was reading ~0.0 - no pixels had
+        changed - which is what led to the keyframe artefact fixed separately.
+
+        The whole detection phase drops from 44.7s and 255s of CPU to 12.2s and
+        8s on a 2160p source, and writes nothing to disk.
+
+        Threshold: 2.0 tracks the old detector closely. 0.8-1.5 picks up softer
+        transitions (measured peak 1.5-4.5 over a single frame). Below ~0.5 the
+        extra hits are broad and shallow - peak ~0.5 spread over 4-5 frames,
+        which is camera motion or a lighting change rather than a cut - and
+        they also start displacing correct boundaries, because min_scene_len
+        merging takes the first candidate it sees rather than the strongest.
+        """
+        scores: List[float] = []
+        cmds = self._scdet_cmds()
+        for i, (label, args) in enumerate(cmds):
+            last = i == len(cmds) - 1
+            try:
+                scores = self._run_scdet(args)
+                if scores:
+                    break
+                reason = "produced no frames"
+            except TranscodeError as e:
+                reason = str(e).splitlines()[0]
+            if last:
+                raise TranscodeError(f"scene detection failed ({label}): {reason}")
+            logger.info("optimizer: {} scene detection unavailable ({}); "
+                        "falling back", label, reason)
+        if len(scores) != self.total_frames:
+            self._log(f"scdet saw {len(scores)} frames, "
+                      f"fps x duration estimated {self.total_frames}")
+        cuts = self._cuts_from_scores(scores)
+        bounds = [0] + cuts + [len(scores)]
+        return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
+
+    def _detect_shots_pyscenedetect(self) -> List[Shot]:
         try:
             from scenedetect import ContentDetector, open_video, SceneManager
         except ImportError as e:  # pragma: no cover
@@ -1199,22 +1356,7 @@ class ShotEncoder:
                 thread.join(timeout=0.5)
             thread.join()
             scenes = sm.get_scene_list()
-            shots = [(int(a.frame_num), int(b.frame_num)) for a, b in scenes]
-            if not shots:
-                shots = [(0, self.total_frames)]
-            detected = len(shots)
-            shots = merge_short_shots(shots, self.opt.min_shot_frames)
-            shots = merge_to_max(shots, max(1, self.opt.max_shots))
-            self._validate_shots(shots)
-            if len(shots) != detected:
-                logger.info(
-                    "optimizer: {} shot(s) detected -> {} after merging "
-                    "(min_shot_frames={}, max_shots={})",
-                    detected, len(shots), self.opt.min_shot_frames,
-                    self.opt.max_shots)
-            else:
-                logger.info("optimizer: {} shot(s) detected", len(shots))
-            return shots
+            return [(int(a.frame_num), int(b.frame_num)) for a, b in scenes]
         finally:
             if det_path is not None:
                 try:

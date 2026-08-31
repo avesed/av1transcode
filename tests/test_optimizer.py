@@ -628,7 +628,7 @@ class _FrameNum:
         self.frame_num = n
 
 
-def _install_fake_scenedetect(scene_frames, monkeypatch):
+def _install_fake_scenedetect(scene_frames, monkeypatch, settings=None):
     """Stub scenedetect for tests that only care about detect_shots' plumbing.
 
     Installed with setitem so it is REMOVED afterwards: left in sys.modules it
@@ -646,24 +646,26 @@ def _install_fake_scenedetect(scene_frames, monkeypatch):
     })
     mod.open_video = lambda path: object()
     monkeypatch.setitem(sys.modules, "scenedetect", mod)
+    if settings is not None:
+        settings.transcode.optimizer.scenedetect_engine = "pyscenedetect"
 
 
 def test_detect_shots(settings, info, plan, tmp_path, monkeypatch):
-    _install_fake_scenedetect([(0, 100), (100, 300), (300, 800)], monkeypatch)
+    _install_fake_scenedetect([(0, 100), (100, 300), (300, 800)], monkeypatch, settings)
     enc = make_encoder(settings, info, plan, tmp_path)
     shots = enc.detect_shots()
     assert shots == [(0, 100), (100, 300), (300, 800)]
 
 
 def test_detect_shots_merges_past_max(settings, info, plan, tmp_path, monkeypatch):
-    _install_fake_scenedetect([(0, 100), (100, 200), (200, 300)], monkeypatch)
+    _install_fake_scenedetect([(0, 100), (100, 200), (200, 300)], monkeypatch, settings)
     settings.transcode.optimizer.max_shots = 2
     enc = make_encoder(settings, info, plan, tmp_path)
     assert len(enc.detect_shots()) == 2
 
 
 def test_detect_shots_falls_back_to_single_shot(settings, info, plan, tmp_path, monkeypatch):
-    _install_fake_scenedetect([], monkeypatch)
+    _install_fake_scenedetect([], monkeypatch, settings)
     enc = make_encoder(settings, info, plan, tmp_path)
     assert enc.detect_shots() == [(0, enc.total_frames)]
 
@@ -692,6 +694,7 @@ def test_detect_shots_reports_frame_progress(settings, info, plan, tmp_path,
     mod.SceneManager = _SM
     mod.open_video = lambda path: _V()
     monkeypatch.setitem(sys.modules, "scenedetect", mod)
+    settings.transcode.optimizer.scenedetect_engine = "pyscenedetect"
     enc = make_encoder(settings, info, plan, tmp_path)
     reports = []
     enc.progress_cb = lambda pct, stats: reports.append((pct, stats))
@@ -791,7 +794,7 @@ def test_feature_warning_logged_once(settings, info, plan, tmp_path, monkeypatch
 
 # ---- full pipeline with a fake ffmpeg ----
 def test_run_full_pipeline(settings, info, plan, tmp_path, monkeypatch):
-    _install_fake_scenedetect([(0, 300), (300, 900), (900, 1800)], monkeypatch)
+    _install_fake_scenedetect([(0, 300), (300, 900), (900, 1800)], monkeypatch, settings)
     plan.params.probes = 0
     enc = make_encoder(settings, info, plan, tmp_path)
     enc.fps = 30.0
@@ -1238,7 +1241,7 @@ def test_merge_short_shots_survives_a_single_short_shot():
 
 def test_detect_shots_applies_min_shot_frames(settings, info, plan, tmp_path, monkeypatch):
     # 40 40 40 40 pairs up rather than collapsing onto one neighbour
-    _install_fake_scenedetect([(0, 40), (40, 80), (80, 120), (120, 160)], monkeypatch)
+    _install_fake_scenedetect([(0, 40), (40, 80), (80, 120), (120, 160)], monkeypatch, settings)
     settings.transcode.optimizer.min_shot_frames = 48
     enc = make_encoder(settings, info, plan, tmp_path)
     assert enc.detect_shots() == [(0, 80), (80, 160)]
@@ -2050,3 +2053,94 @@ def test_detection_copy_disables_periodic_keyframes(settings, info, plan, tmp_pa
     for _, args in enc._detection_copy_cmds(tmp_path / "out.mkv", "-2:540"):
         assert "-g" in args, args
         assert int(args[args.index("-g") + 1]) >= 1000
+
+
+# ---- scdet detection ----
+def test_cuts_from_scores_honours_threshold_and_min_scene_len(
+        settings, info, plan, tmp_path):
+    settings.transcode.optimizer.scdet_threshold = 2.0
+    settings.transcode.optimizer.min_scene_len = 5
+    enc = make_encoder(settings, info, plan, tmp_path)
+    # frame 0 can never be a cut - it is where the first shot starts
+    scores = [9.0] + [0.1] * 9
+    assert enc._cuts_from_scores(scores) == []
+    # two spikes closer together than min_scene_len: the second is swallowed
+    scores = [0.0] * 20
+    scores[6] = 5.0
+    scores[9] = 5.0
+    scores[14] = 5.0
+    assert enc._cuts_from_scores(scores) == [6, 14]
+    # below the threshold is not a cut
+    settings.transcode.optimizer.scdet_threshold = 6.0
+    assert enc._cuts_from_scores(scores) == []
+
+
+def test_scdet_builds_shots_covering_every_frame(settings, info, plan, tmp_path,
+                                                 monkeypatch):
+    settings.transcode.optimizer.scdet_threshold = 2.0
+    settings.transcode.optimizer.min_scene_len = 5
+    enc = make_encoder(settings, info, plan, tmp_path)
+    scores = [0.0] * 100
+    scores[30] = 9.0
+    scores[70] = 9.0
+    monkeypatch.setattr(enc, "_run_scdet", lambda args: scores)
+    shots = enc._detect_shots_scdet()
+    assert shots == [(0, 30), (30, 70), (70, 100)]
+    # the list has to tile the source exactly, which _validate_shots enforces
+    assert shots[0][0] == 0 and shots[-1][1] == len(scores)
+    assert all(a[1] == b[0] for a, b in zip(shots, shots[1:]))
+
+
+def test_scdet_pass_stages_nothing(settings, info, plan, tmp_path):
+    """The point of this engine: one pass over the source, no copy on disk."""
+    info.width, info.height = 3840, 2160
+    settings.transcode.optimizer.scenedetect_scale = "-2:540"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    cmds = enc._scdet_cmds()
+    assert [label for label, _ in cmds] == ["qsv", "software"]
+    for _, args in cmds:
+        joined = " ".join(args)
+        assert "scdet=threshold=100" in joined    # thresholded in Python instead
+        assert "metadata=print:file=-" in joined
+        assert args[-2:] == ["-f", "null"] + [] or args[-3:] == ["-f", "null", "-"]
+        assert "libx264" not in joined            # nothing is encoded
+    settings.transcode.optimizer.scenedetect_hwaccel = "off"
+    assert [label for label, _ in enc._scdet_cmds()] == ["software"]
+
+
+def test_scdet_falls_back_then_gives_up(settings, info, plan, tmp_path, monkeypatch):
+    info.width, info.height = 3840, 2160
+    settings.transcode.optimizer.scenedetect_scale = "-2:540"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    tried = []
+
+    def fake(args):
+        tried.append("qsv" if "-hwaccel" in args else "software")
+        if "-hwaccel" in args:
+            return []                       # decodes nothing, like AV1 on a B580
+        return [0.0] * 50 + [9.0] + [0.0] * 49
+
+    monkeypatch.setattr(enc, "_run_scdet", fake)
+    shots = enc._detect_shots_scdet()
+    assert tried == ["qsv", "software"]
+    assert shots == [(0, 50), (50, 100)]
+
+    monkeypatch.setattr(enc, "_run_scdet", lambda args: [])
+    with pytest.raises(opt.TranscodeError, match="software"):
+        enc._detect_shots_scdet()
+
+
+def test_detect_shots_dispatches_on_the_configured_engine(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    called = []
+    monkeypatch.setattr(enc, "_detect_shots_scdet",
+                        lambda: called.append("scdet") or [(0, 400), (400, 900)])
+    monkeypatch.setattr(enc, "_detect_shots_pyscenedetect",
+                        lambda: called.append("pysd") or [(0, 900)])
+    enc.total_frames = 900
+    settings.transcode.optimizer.scenedetect_engine = "scdet"
+    assert enc.detect_shots() == [(0, 400), (400, 900)]
+    settings.transcode.optimizer.scenedetect_engine = "pyscenedetect"
+    assert enc.detect_shots() == [(0, 900)]
+    assert called == ["scdet", "pysd"]

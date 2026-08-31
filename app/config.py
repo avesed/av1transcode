@@ -214,7 +214,27 @@ class OptimizerSettings(BaseModel):
     # strands cores whenever fewer than N are running (measured 5% slower).
     # Set it only when this container must not touch cores it was not given.
     encode_threads: int = 0
+    # Which detector finds the shot boundaries.
+    #   scdet         - ffmpeg's scene-change filter, run as one pass over the
+    #                   source. Stages nothing and needs neither PySceneDetect
+    #                   nor OpenCV. Measured against the other on three 4K
+    #                   sources at scdet_threshold 2.0: boundaries identical on
+    #                   one, one extra on each of the others. The whole phase
+    #                   goes from 44.7s and 255s of CPU to 12.2s and 8s.
+    #   pyscenedetect - the previous path: write a downscaled copy, then read it
+    #                   back frame by frame with OpenCV.
+    scenedetect_engine: Literal["scdet", "pyscenedetect"] = "scdet"
+    # scdet score a frame must reach to count as a cut (0-100). NB ffmpeg's own
+    # default of 10 is far too high for film and TV - it found 1 of 21 cuts on
+    # a 4K sample. 2.0 tracks the PySceneDetect path closely. 0.8-1.5 also picks
+    # up softer transitions (a single frame peaking 1.5-4.5). Below ~0.5 the
+    # extra hits are broad and shallow - peak ~0.5 spread over 4-5 frames, i.e.
+    # camera motion or a lighting change rather than a cut - and they start
+    # displacing correct boundaries too, because the min_scene_len merge takes
+    # the first candidate rather than the strongest.
+    scdet_threshold: float = 2.0
     # PySceneDetect ContentDetector threshold (higher = fewer/split less).
+    # Only used by scenedetect_engine=pyscenedetect.
     scenedetect_threshold: float = 27.0
     # Minimum shot length in frames (shorter segments are merged).
     min_scene_len: int = 24
