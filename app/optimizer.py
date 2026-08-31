@@ -978,6 +978,85 @@ class ShotEncoder:
             self._log_handle = None
 
     # ---------- phase 1: scene detection ----------
+    # A plain "W:H" scale spec, with -1/-2 meaning "derive from the other side
+    # and round to that multiple". Anything more elaborate is left alone.
+    _SCALE_WH = re.compile(r"^\s*(-?\d+)\s*:\s*(-?\d+)\s*$")
+
+    def _scaled_size(self, spec: str) -> Optional[Tuple[int, int]]:
+        """Explicit (w, h) that a `W:H` scale spec produces, or None.
+
+        The hardware path has to be told the size outright: scale_qsv's own
+        `w=-1` rounds to its surface alignment rather than to the value the
+        software `scale` filter would pick, and a detection copy of a different
+        size is a different copy - which for a detector reading it frame by
+        frame means different cuts.
+        """
+        m = self._SCALE_WH.match(spec or "")
+        sw, sh = (self.info.width or 0), (self.info.height or 0)
+        if not m or sw <= 0 or sh <= 0:
+            return None
+        w, h = int(m.group(1)), int(m.group(2))
+        if w > 0 and h > 0:
+            return w, h
+        if w > 0:
+            mult = abs(h) if h < 0 else 1
+            return w, max(mult, round(sh * w / sw / mult) * mult)
+        if h > 0:
+            mult = abs(w) if w < 0 else 1
+            return max(mult, round(sw * h / sh / mult) * mult), h
+        return None
+
+    def _detection_copy_cmds(self, out: Path, scale: str) -> List[Tuple[str, List[str]]]:
+        """(label, ffmpeg args) to try in order for the detection copy.
+
+        The hardware variant decodes and scales on the GPU but still encodes
+        with x264. Encoding on the GPU too is barely faster and its artefacts
+        move more cuts, so the encoder stays put.
+
+        NB this does NOT reproduce the software copy exactly. Only the scaler
+        can be kept, not both: on a discrete card the frames have to come back
+        over PCIe, and reading them at full 4K to scale with swscale costs more
+        than decoding them on the CPU did - measured 53.6s against software's
+        23.0s. Scaling on the GPU keeps the readback small and is the only
+        variant that actually wins, and its scaler is not swscale, so borderline
+        cuts can land differently. Measured end to end on 90-second clips:
+
+            hevc 3840x2160 SDR   46.4s -> 17.2s   22 shots, identical
+            hevc 3840x2160 HDR   29.5s -> 20.1s   33 -> 34 shots
+            hevc 3840x1606 HDR   19.3s -> 25.2s   13 shots, identical
+
+        One shot in 33 is the same order as the 540p downscale this pass already
+        does (2 cuts of 59 against detecting at native resolution), so it is
+        within what the detection copy already costs - but it is a change, and
+        scenedetect_hwaccel=off turns it off.
+
+        The last row is the other half of the trade: below 2160p the decode is
+        cheap enough that the x264 pass dominates and the wall clock gets worse,
+        though the CPU cost still drops about fivefold.
+        """
+        sw = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+              "-i", str(self.source), "-vf", f"scale={scale}",
+              "-c:v", "libx264", "-preset", "ultrafast", "-an", "-sn",
+              "-f", "matroska", str(out)]
+        cmds: List[Tuple[str, List[str]]] = []
+        size = self._scaled_size(scale)
+        if (self.opt.scenedetect_hwaccel or "auto").lower() != "off" and size:
+            w, h = size
+            # No -qsv_device: with one render node passed into the container
+            # ffmpeg picks it, and naming a fixed /dev/dri/renderDNN here would
+            # be wrong on any other host.
+            cmds.append(("qsv", [
+                self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
+                "-i", str(self.source),
+                "-vf", f"scale_qsv=w={w}:h={h}:format=p010le,"
+                       f"hwdownload,format=p010le",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p10le", "-an", "-sn",
+                "-f", "matroska", str(out)]))
+        cmds.append(("software", sw))
+        return cmds
+
     def _make_detection_copy(self) -> Optional[Path]:
         """Downscale the source so PySceneDetect/OpenCV isn't decoding 4K
         frame-by-frame (that is unusably slow on a 4K HEVC source). The copy
@@ -988,15 +1067,26 @@ class ShotEncoder:
             return None
         out = self.probe_dir / "detect_copy.mkv"
         total_sec = max(self.info.duration, 1.0)
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(self.source), "-vf", f"scale={scale}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-an", "-sn",
-                "-f", "matroska", str(out)]
-        self._run_with_progress(args, timeout=7200, total_seconds=total_sec,
-                                tag="downscale for detection")
-        if not out.exists() or out.stat().st_size == 0:
-            raise TranscodeError("scene detection downscale produced no output")
-        return out
+        cmds = self._detection_copy_cmds(out, scale)
+        for i, (label, args) in enumerate(cmds):
+            last = i == len(cmds) - 1
+            try:
+                self._run_with_progress(args, timeout=7200,
+                                        total_seconds=total_sec,
+                                        tag=f"downscale for detection ({label})")
+                if out.exists() and out.stat().st_size > 0:
+                    return out
+                # ffmpeg can exit 0 having written nothing - a QSV decode the
+                # card cannot do (AV1 on this one) ends exactly that way.
+                reason = "produced no output"
+            except TranscodeError as e:
+                reason = str(e).splitlines()[0]
+            if last:
+                raise TranscodeError(
+                    f"scene detection downscale failed ({label}): {reason}")
+            logger.info("optimizer: {} detection downscale unavailable ({}); "
+                        "falling back", label, reason)
+        return None
 
     def _run_with_progress(self, args: List[str], timeout: int,
                            total_seconds: float, tag: str) -> None:

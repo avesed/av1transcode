@@ -717,7 +717,7 @@ def test_make_detection_copy(settings, info, plan, tmp_path, monkeypatch):
     p = enc._make_detection_copy()
     assert p is not None and p.exists()
     assert "-2:540" in " ".join(calls["args"])
-    assert calls["tag"] == "downscale for detection"
+    assert calls["tag"] == "downscale for detection (software)"
     assert calls["total_seconds"] == pytest.approx(info.duration)
 
 
@@ -1937,3 +1937,100 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
             "-i", "sine=frequency=440:duration=1", "-c:v", "libx264",
             "-c:a", "aac", str(noisy)], check=True)
     assert enc._has_audio_or_subs(str(noisy)) is True
+
+
+def test_scaled_size_derives_the_hw_scale_target(settings, info, plan, tmp_path):
+    """scale_qsv has to be told the size outright.
+
+    Its own w=-1 rounds to the card's surface alignment, not to what the
+    software `scale` filter picks - measured on a 3840x1606 source, -2:540 gives
+    1292x540 in software and something 360 pixels smaller through QSV. A
+    detection copy of a different size is a different copy, and for a detector
+    reading it frame by frame that means different cuts.
+    """
+    enc = make_encoder(settings, info, plan, tmp_path)
+    info.width, info.height = 3840, 1606
+    assert enc._scaled_size("-2:540") == (1292, 540)
+    info.width, info.height = 3840, 2160
+    assert enc._scaled_size("-2:540") == (960, 540)
+    assert enc._scaled_size("-1:540") == (960, 540)
+    assert enc._scaled_size("960:540") == (960, 540)
+    # not a plain W:H, or no source dimensions -> no hardware path
+    assert enc._scaled_size("w='min(iw,1920)':h=-2") is None
+    info.width, info.height = 0, 0
+    assert enc._scaled_size("-2:540") is None
+
+
+def test_detection_copy_tries_the_gpu_first(settings, info, plan, tmp_path):
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    cmds = enc._detection_copy_cmds(tmp_path / "out.mkv", "-2:540")
+    assert [label for label, _ in cmds] == ["qsv", "software"]
+    qsv = " ".join(cmds[0][1])
+    # explicit size, and no -qsv_device: the container is given one render node
+    # and naming a fixed /dev/dri/renderDNN would be wrong on any other host
+    assert "scale_qsv=w=960:h=540" in qsv and "-qsv_device" not in qsv
+    # still encoded with x264: encoding on the GPU as well is barely faster and
+    # its artefacts move more cuts than the scaler alone does
+    assert "libx264" in qsv and "hevc_qsv" not in qsv
+
+    settings.transcode.optimizer.scenedetect_hwaccel = "off"
+    assert [label for label, _ in enc._detection_copy_cmds(tmp_path / "o.mkv", "-2:540")] \
+        == ["software"]
+    # an unparseable scale spec has no derivable size, so no hardware path
+    settings.transcode.optimizer.scenedetect_hwaccel = "auto"
+    assert [label for label, _ in enc._detection_copy_cmds(tmp_path / "o.mkv", "iw/2:-2")] \
+        == ["software"]
+
+
+def test_detection_copy_falls_back_when_the_gpu_writes_nothing(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A QSV decode the card cannot do exits 0 having written nothing.
+
+    That is how AV1 fails on a B580, so a zero-length output has to count as
+    failure rather than as a finished copy.
+    """
+    info.width, info.height = 3840, 2160
+    settings.transcode.optimizer.scenedetect_scale = "-2:540"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    tags = []
+
+    def fake(args, timeout, total_seconds, tag):
+        tags.append(tag)
+        if "qsv" in tag:
+            return                       # exits cleanly, writes nothing
+        (enc.probe_dir / "detect_copy.mkv").write_bytes(b"x")
+
+    monkeypatch.setattr(enc, "_run_with_progress", fake)
+    out = enc._make_detection_copy()
+    assert out is not None and out.exists()
+    assert tags == ["downscale for detection (qsv)",
+                    "downscale for detection (software)"]
+
+
+def test_detection_copy_falls_back_when_the_gpu_errors(
+        settings, info, plan, tmp_path, monkeypatch):
+    info.width, info.height = 3840, 2160
+    settings.transcode.optimizer.scenedetect_scale = "-2:540"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    tags = []
+
+    def fake(args, timeout, total_seconds, tag):
+        tags.append(tag)
+        if "qsv" in tag:
+            raise opt.TranscodeError("Device creation failed: -542398533.")
+        (enc.probe_dir / "detect_copy.mkv").write_bytes(b"x")
+
+    monkeypatch.setattr(enc, "_run_with_progress", fake)
+    assert enc._make_detection_copy() is not None
+    assert len(tags) == 2
+
+
+def test_detection_copy_raises_when_software_also_fails(
+        settings, info, plan, tmp_path, monkeypatch):
+    settings.transcode.optimizer.scenedetect_scale = "-2:540"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(enc, "_run_with_progress",
+                        lambda args, timeout, total_seconds, tag: None)
+    with pytest.raises(opt.TranscodeError, match="software"):
+        enc._make_detection_copy()

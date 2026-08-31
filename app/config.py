@@ -223,6 +223,21 @@ class OptimizerSettings(BaseModel):
     # (minutes per scene); a downscaled copy (same fps, frame numbers map 1:1)
     # is 5-10x faster. e.g. "-2:540". Empty = detect on the source directly.
     scenedetect_scale: str = "-2:540"
+    # Decode the source on a GPU for that downscale pass ("auto") or never
+    # ("off"). Auto tries Intel QSV first and falls back to software when there
+    # is no usable device, when the codec is one the card cannot decode (AV1 on
+    # a B580 exits 0 having written nothing), or when scenedetect_scale is not
+    # a plain W:H that a fixed size can be derived from.
+    #
+    # The decode and the scale move to the GPU; the copy is still encoded with
+    # x264. This does not reproduce the software copy exactly - the GPU scaler
+    # is not swscale - so borderline cuts can land differently. Measured end to
+    # end on three 90-second 4K clips: 46.4s -> 17.2s and 29.5s -> 20.1s on
+    # 2160p, shot lists identical on two of them and 33 -> 34 on the third.
+    # That is the same order as the 540p downscale this pass already does (2
+    # cuts of 59 against native resolution). Below 2160p the x264 pass
+    # dominates and the wall clock gets worse, though CPU still drops ~5x.
+    scenedetect_hwaccel: Literal["auto", "off"] = "auto"
     # Fold shots shorter than this many frames into a neighbour before probing.
     # OFF by default, because the size win it was added for did not survive
     # measurement. Splitting a CONTINUOUS take into short pieces is expensive
