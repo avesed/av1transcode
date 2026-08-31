@@ -9,7 +9,7 @@
 # =====================================================================
 
 # ---------- stage 1: SVT-AV1 v4.2 ----------
-FROM debian:bookworm-slim AS svt-builder
+FROM ubuntu:24.04 AS svt-builder
 ARG SVT_AV1_TAG=v4.2.0
 ARG JOBS=8
 WORKDIR /build
@@ -29,7 +29,7 @@ RUN mkdir -p /out/lib /out/bin /out/include /out/lib/pkgconfig && \
     cp -r /usr/local/include/svt-av1 /out/include/ 2>/dev/null; true
 
 # ---------- stage 2: libplacebo v7 (ffmpeg master needs >= 7.351.0) ----------
-FROM debian:bookworm-slim AS libplacebo-builder
+FROM ubuntu:24.04 AS libplacebo-builder
 ARG PLACEBO_TAG=v7.360.1
 ARG JOBS=8
 WORKDIR /build
@@ -56,7 +56,7 @@ RUN git clone --recursive --depth 1 --branch ${PLACEBO_TAG} \
     cp -a /out/usr/local/include/* /out/include/
 
 # ---------- stage 3: Vulkan headers bumped for ffmpeg master (needs >= 1.3.277) ----------
-FROM debian:bookworm-slim AS vulkan-headers-builder
+FROM ubuntu:24.04 AS vulkan-headers-builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates && rm -rf /var/lib/apt/lists/* && \
@@ -68,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     printf 'prefix=/usr\nincludedir=${prefix}/include\nName: vulkan\nDescription: Vulkan loader\nVersion: 1.4.350\nCflags: -I${includedir}\nLibs: -lvulkan\n' > /out/vulkan.pc
 
 # ---------- stage 3b: libvmaf v2.3.1 (not packaged in bookworm) ----------
-FROM debian:bookworm-slim AS vmaf-builder
+FROM ubuntu:24.04 AS vmaf-builder
 ARG VMAF_TAG=v2.3.1
 ARG JOBS=8
 WORKDIR /build
@@ -92,7 +92,7 @@ RUN git clone --depth 1 --branch ${VMAF_TAG} \
     cp -a /out/usr/local/bin/vmaf /out/bin/ 2>/dev/null; true
 
 # ---------- stage 4: ffmpeg 9.0.1 release (DV support) ----------
-FROM debian:bookworm-slim AS ffmpeg-builder
+FROM ubuntu:24.04 AS ffmpeg-builder
 # A release tag, and it is actually used - this ARG was previously declared and
 # then ignored while the source was cloned from master, so no two builds of this
 # image contained the same ffmpeg. The optimizer's measurement path depends on
@@ -104,11 +104,25 @@ FROM debian:bookworm-slim AS ffmpeg-builder
 ARG FFMPEG_REF=n9.0.1
 ARG JOBS=8
 WORKDIR /build
+# Intel's Arc PPA. Battlemage (B580, PCI 0xe20b) needs a media stack newer than
+# any distro ships: Ubuntu's own intel-media-va-driver 24.1.0 fails
+# vaInitialize on it, and Debian cannot get there at all - which is why this
+# image is Ubuntu rather than bookworm. Verified against the card itself:
+# VA-API 1.24 with VAProfileHEVCMain10 decode, and Mesa 25.2.8 reporting
+# "Intel(R) Arc(tm) B580 Graphics (BMG G21)" where bookworm's Mesa 22.3 warned
+# "Driver does not support the 0xe20b PCI ID" and fell back to llvmpipe - which
+# is what the Dolby Vision libplacebo path had been running on all along.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common gpg-agent ca-certificates \
+    && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+    && apt-get purge -y software-properties-common gpg-agent \
+    && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential pkg-config curl nasm yasm ca-certificates \
     libvpx-dev libx264-dev libx265-dev libopus-dev libvorbis-dev \
     libmp3lame-dev libass-dev libfreetype-dev libfontconfig1-dev \
     libvulkan-dev liblcms2-dev libdav1d-dev \
+    libva-dev libvpl-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=svt-builder /out/lib/ /usr/local/lib/
 COPY --from=svt-builder /out/include/ /usr/local/include/
@@ -136,6 +150,7 @@ RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}
         --enable-libopus --enable-libvorbis --enable-libmp3lame \
         --enable-libsvtav1 --enable-libdav1d --enable-libvmaf \
         --enable-libplacebo --enable-vulkan \
+        --enable-vaapi --enable-libvpl \
         --enable-libass --enable-libfreetype --enable-libfontconfig \
         --disable-doc --disable-debug && \
     make -j${JOBS} && make install && \
@@ -144,7 +159,7 @@ RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}
     cp /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /out/bin/
 
 # ---------- stage 4a: zimg >=3.0.5 (bookworm ships 3.0.4; VS R73 needs 3.0.5) ----------
-FROM debian:bookworm-slim AS zimg-builder
+FROM ubuntu:24.04 AS zimg-builder
 ARG ZIMG_TAG=release-3.0.5
 ARG JOBS=8
 WORKDIR /build
@@ -164,7 +179,7 @@ RUN git clone --depth 1 --branch ${ZIMG_TAG} \
     cp -a /out/usr/local/include/* /out/include/
 
 # ---------- stage 4b: VapourSynth (av1an hard-links it) ----------
-FROM debian:bookworm-slim AS vapoursynth-builder
+FROM ubuntu:24.04 AS vapoursynth-builder
 ARG VS_VERSION=R73
 ARG JOBS=8
 WORKDIR /build
@@ -194,7 +209,7 @@ RUN git clone --depth 1 --branch ${VS_VERSION} \
     mkdir -p /out/python && \
     find /out/usr/local -type d -name "site-packages" -exec cp -a {}/vapoursynth* /out/python/ \; 2>/dev/null; \
     find /out -path "*site-packages*" -name "vapoursynth*" -exec cp -a {} /out/python/ \; 2>/dev/null; \
-    cp -a /out/lib/vapoursynth.cpython-311-x86_64-linux-gnu.so /out/python/vapoursynth.cpython-311-x86_64-linux-gnu.so; true
+    cp -a /out/lib/vapoursynth.cpython-312-x86_64-linux-gnu.so /out/python/vapoursynth.cpython-312-x86_64-linux-gnu.so; true
 
 # ---------- stage 4c: VapourSynth plugins for target_metric=ssimulacra2 ----------
 # Prebuilt wheels rather than source builds: vszip is written in Zig (which
@@ -203,7 +218,7 @@ RUN git clone --depth 1 --branch ${VS_VERSION} \
 # plugin .so plus bundled deps, so nothing here links against our ffmpeg or
 # VapourSynth - verified loading into VapourSynth R73, which exposes
 # vszip.SSIMULACRA2(reference, distorted).
-FROM debian:bookworm-slim AS vsplugin-fetcher
+FROM ubuntu:24.04 AS vsplugin-fetcher
 ARG VSZIP_VERSION=22.1.0
 ARG BESTSOURCE_VERSION=21.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -229,9 +244,17 @@ RUN cd /out/vapoursynth && rm -f libvszip.zn4.so && \
     test -f libvszip.so && test -f libbestsource.so
 
 # ---------- stage 5: av1an ----------
-FROM rust:1-bookworm AS av1an-builder
-RUN apt-get update && apt-get install -y --no-install-recommends nasm pkg-config \
-        && rm -rf /var/lib/apt/lists/*
+# Ubuntu + rustup rather than the rust:1-bookworm image: av1an links against
+# the VapourSynth built above, and that is now a noble build. Linking a
+# bookworm binary (glibc 2.36) against a noble .so (which needs 2.38+) fails
+# outright - the compatibility only runs the other way.
+FROM ubuntu:24.04 AS av1an-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential nasm pkg-config curl ca-certificates git \
+        && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
 COPY --from=vapoursynth-builder /out/lib/ /usr/local/lib/
 COPY --from=vapoursynth-builder /out/include/ /usr/local/include/
 COPY --from=zimg-builder /out/lib/ /usr/local/lib/
@@ -247,15 +270,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     cp target/release/dovi_tool /usr/local/bin/
 # Runtime image (all-in-one)
 # =====================================================================
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:24.04 AS runtime
 
+# Intel's Arc PPA - see the note in the ffmpeg builder for why this image is
+# Ubuntu and not Debian.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libopus0 libvpx7 libx264-164 libx265-199 libmp3lame0 libvorbis0a \
+        software-properties-common gpg-agent ca-certificates \
+    && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+    && apt-get purge -y software-properties-common gpg-agent \
+    && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+
+# libvpx9 / libdav1d7 / libpython3.12t64 are the noble spellings of what
+# bookworm called libvpx7 / libdav1d6 / libpython3.11.
+#
+# The Intel block is what lets this image drive the B580. intel-media-va-driver
+# is the VA-API driver, libmfx-gen1 the QSV runtime behind libvpl, and
+# mesa-vulkan-drivers (25.2.8 here) is what libplacebo needs to apply a Dolby
+# Vision RPU on the GPU instead of on llvmpipe.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libopus0 libvpx9 libx264-164 libx265-199 libmp3lame0 libvorbis0a \
         libvorbisenc2 \
         libass9 libfreetype6 libfontconfig1 libvulkan1 \
-        libgl1 libegl1 libopengl0 libdav1d6 mediainfo mkvtoolnix \
-        python3 python3-pip libpython3.11 \
+        libgl1 libegl1 libopengl0 libdav1d7 mediainfo mkvtoolnix \
+        python3 python3-pip libpython3.12t64 \
         libzimg2 liblcms2-2 mesa-vulkan-drivers \
+        libva2 libva-drm2 intel-media-va-driver libmfx-gen1 libvpl2 \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -273,14 +312,14 @@ COPY --from=vmaf-builder /out/lib/ /usr/local/lib/
 COPY --from=vmaf-builder /out/share/model/ /usr/share/model/
 COPY --from=av1an-builder /usr/local/bin/av1an /usr/local/bin/
 COPY --from=dovi-builder /usr/local/bin/dovi_tool /usr/local/bin/
-COPY --from=vapoursynth-builder /out/python/ /usr/local/lib/python3.11/dist-packages/
+COPY --from=vapoursynth-builder /out/python/ /usr/local/lib/python3.12/dist-packages/
 # VapourSynth plugins backing target_metric=ssimulacra2 (see stage 4c)
 COPY --from=vsplugin-fetcher /out/vapoursynth/ /usr/local/lib/vapoursynth/
 # The plugin dir is on the library path too: the bestsource wheel carries
 # its own ffmpeg/lcms/dav1d and has no RPATH, so the loader has to be told
 # where those sit or the plugin fails to load.
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/vapoursynth
-ENV PYTHONPATH=/usr/local/lib/python3.11/dist-packages
+ENV PYTHONPATH=/usr/local/lib/python3.12/dist-packages
 
 # Python scheduler + UI
 COPY requirements.txt /app/requirements.txt

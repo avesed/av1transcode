@@ -22,20 +22,31 @@ services:
       - AV1TC_WORKERS_AV1AN_WORKERS=${AV1AN_WORKERS:-0}
       # P5 -> HDR10 via libplacebo needs a Vulkan device.
       # Without a GPU, use Mesa's llvmpipe software renderer (slow but works):
-      - MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
-      - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      # On a host with NO usable GPU, uncomment these to pin the Vulkan loader
+      # to the software renderer. With a GPU passed through (see `devices`
+      # below) they must stay OFF: they hide every real device, which is how
+      # the Dolby Vision libplacebo pass ended up running on llvmpipe and
+      # burning 23.5 cores where the GPU does it in 4.9.
+      # - MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+      # - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       - TZ=Asia/Shanghai
-    # Pass a real GPU through for hardware-accelerated libplacebo (the DV
-    # Profile 5 conversion is the only thing here that uses one; SVT-AV1 and
-    # libvmaf are CPU-only). The image ships Mesa's Intel and AMD Vulkan ICDs;
-    # NVIDIA additionally needs the NVIDIA Container Toolkit.
-    # NB: on a host WITH a GPU, drop the two MESA_/VK_ICD_FILENAMES lines above
-    # - they pin the loader to the software renderer and hide every real device.
-    # devices:
-    #   - /dev/dri:/dev/dri
-    # group_add:
-    #   - video
-    #   - render
+    # A GPU is used for two things: libplacebo applying a Dolby Vision RPU
+    # (Vulkan), and hardware decode of the source (VA-API / QSV). SVT-AV1 and
+    # libvmaf remain CPU-only.
+    #
+    # ONE render node, not all of /dev/dri: passing the whole directory hands
+    # over every card in the box, which on a mixed host means the NVIDIA ones
+    # too. Find the node for the card you want with
+    #   ls -l /dev/dri/by-path/    # pci-<domain:bus:dev.fn>-render -> renderDN
+    # and put the renderD1NN it points at below. The by-path name itself cannot
+    # go here - it contains colons, which is also this field's separator.
+    #
+    # `group_add` must name the GID that owns the node on the HOST (`getent
+    # group render`), not the name - the name may not resolve inside the image.
+    devices:
+      - /dev/dri/renderD129:/dev/dri/renderD129
+    group_add:
+      - "993"   # host `render` group
     # /dev/shm holds the optimizer's per-shot Dolby Vision P5 shards
     # (a lossless 4K shot is ~200MB and several are in flight at once),
     # which keeps the DV path off disk entirely.
