@@ -1034,9 +1034,16 @@ class ShotEncoder:
         cheap enough that the x264 pass dominates and the wall clock gets worse,
         though the CPU cost still drops about fivefold.
         """
+        # -g 9999: x264 defaults to a keyframe every 250 frames, and the
+        # quality jump at each IDR reads as a content change to the detector -
+        # measured, it invents a shot boundary landing exactly on a keyframe
+        # (frame 250 on one clip, 250 and 750 on another; 1 of 104 shots over
+        # five minutes). The copy is only ever read forward, so nothing needs
+        # the keyframes and dropping them removes the artefact.
+        keyint = ["-g", "9999"]
         sw = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
               "-i", str(self.source), "-vf", f"scale={scale}",
-              "-c:v", "libx264", "-preset", "ultrafast", "-an", "-sn",
+              "-c:v", "libx264", "-preset", "ultrafast", *keyint, "-an", "-sn",
               "-f", "matroska", str(out)]
         cmds: List[Tuple[str, List[str]]] = []
         size = self._scaled_size(scale)
@@ -1051,7 +1058,7 @@ class ShotEncoder:
                 "-i", str(self.source),
                 "-vf", f"scale_qsv=w={w}:h={h}:format=p010le,"
                        f"hwdownload,format=p010le",
-                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:v", "libx264", "-preset", "ultrafast", *keyint,
                 "-pix_fmt", "yuv420p10le", "-an", "-sn",
                 "-f", "matroska", str(out)]))
         cmds.append(("software", sw))

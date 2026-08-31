@@ -2034,3 +2034,19 @@ def test_detection_copy_raises_when_software_also_fails(
                         lambda args, timeout, total_seconds, tag: None)
     with pytest.raises(opt.TranscodeError, match="software"):
         enc._make_detection_copy()
+
+
+def test_detection_copy_disables_periodic_keyframes(settings, info, plan, tmp_path):
+    """x264's default IDR every 250 frames invents shot boundaries.
+
+    The quality jump at a keyframe reads as a content change to the detector,
+    which then reports a cut landing exactly on it - measured on real sources,
+    at frame 250 on one clip and 250 and 750 on another, and 1 of 104 shots
+    over five minutes. The copy is only ever read forward, so nothing needs the
+    keyframes.
+    """
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    for _, args in enc._detection_copy_cmds(tmp_path / "out.mkv", "-2:540"):
+        assert "-g" in args, args
+        assert int(args[args.index("-g") + 1]) >= 1000
