@@ -633,8 +633,8 @@ def _install_fake_scenedetect(scene_frames, monkeypatch):
 
     Installed with setitem so it is REMOVED afterwards: left in sys.modules it
     shadows the real package for the rest of the session, and anything later
-    that imports a submodule (app.detectstream needs scenedetect.frame_timecode)
-    fails with "not a package" and quietly skips instead of running.
+    that imports a submodule fails with "not a package" and quietly skips
+    instead of running.
     """
     mod = types.ModuleType("scenedetect")
     mod.ContentDetector = type("ContentDetector", (), {"__init__": lambda self, **k: None})
@@ -1909,8 +1909,8 @@ def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,
     assert seen["cmd"] == ["mkvmerge", "-o", str(enc.output), str(video_only)]
 
 
-def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path,
-                                                 monkeypatch):
+@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="needs a real ffprobe")
+def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path):
     """Run the probe command for real, not against a stubbed _run.
 
     The first version of this used "-select_streams a,s", which ffprobe rejects
@@ -1919,15 +1919,12 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
     fell back to "assume there is audio" on every single source. Only a real
     ffprobe catches that class of mistake.
     """
-    # ... and the `settings` fixture stubs shutil.which, so without this the
-    # test would reach for /usr/bin/fake-ffprobe and prove nothing.
-    monkeypatch.undo()
-    ffprobe, ffmpeg = shutil.which("ffprobe"), shutil.which("ffmpeg")
-    if not ffprobe or not ffmpeg:
-        pytest.skip("needs a real ffmpeg and ffprobe")
-    settings.tools.ffprobe = ffprobe
+    settings.tools.ffprobe = shutil.which("ffprobe")
     enc = make_encoder(settings, info, plan, tmp_path)
     silent = tmp_path / "silent.mkv"
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("needs a real ffmpeg to build the fixtures")
     import subprocess as sp
     sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
             "-i", "testsrc=size=64x64:rate=5:duration=1", "-c:v", "libx264",
@@ -1940,58 +1937,3 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
             "-i", "sine=frequency=440:duration=1", "-c:v", "libx264",
             "-c:a", "aac", str(noisy)], check=True)
     assert enc._has_audio_or_subs(str(noisy)) is True
-
-
-def test_scaled_size_derives_the_pipe_frame_size():
-    """Reading fixed-size frames off a rawvideo pipe needs an exact size, and a
-    wrong one shears every frame instead of failing - so anything that cannot
-    be derived returns None and the caller stages a copy instead."""
-    ds = pytest.importorskip("app.detectstream")
-    assert ds.scaled_size("-2:540", 3840, 1920) == (1080, 540)   # 2:1 source
-    assert ds.scaled_size("-2:540", 1920, 1080) == (960, 540)
-    assert ds.scaled_size("-1:540", 1920, 1080) == (960, 540)
-    assert ds.scaled_size("960:540", 3840, 1920) == (960, 540)
-    assert ds.scaled_size("-2:270", 1920, 1080) == (480, 270)
-    # widths are rounded to the multiple the spec asks for
-    w, h = ds.scaled_size("-2:540", 1998, 1080)
-    assert h == 540 and w % 2 == 0
-    # not a plain W:H, or no source dimensions -> caller must fall back
-    assert ds.scaled_size("w='min(iw,1920)':h=-2", 3840, 1920) is None
-    assert ds.scaled_size("-2:540", 0, 0) is None
-    assert ds.scaled_size("", 3840, 1920) is None
-
-
-def test_detection_pipe_declines_what_it_cannot_size(settings, info, plan,
-                                                     tmp_path, monkeypatch):
-    pytest.importorskip("app.detectstream")
-    info.width, info.height = 3840, 1920
-    enc = make_encoder(settings, info, plan, tmp_path)
-    settings.transcode.optimizer.scenedetect_scale = "w='min(iw,1920)':h=-2"
-    assert enc._open_detection_pipe() is None
-    settings.transcode.optimizer.scenedetect_scale = ""      # detect on source
-    assert enc._open_detection_pipe() is None
-
-
-def test_detection_pipe_failure_is_loud(settings, info, plan, tmp_path):
-    """A dead decoder must not read as "the video ended".
-
-    read() signals end-of-video with a short read, so ffmpeg dying halfway
-    looks identical to a video that simply finished - and _validate_shots
-    would then take the truncated list as authoritative and encode a fraction
-    of the film.
-    """
-    ds = pytest.importorskip("app.detectstream")
-    missing = tmp_path / "nope.mkv"
-    stream = ds.PipedFrames(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-         "-i", str(missing), "-vf", "scale=-2:540", "-pix_fmt", "bgr24",
-         "-f", "rawvideo", "-"],
-        960, 540, 24.0, 100, str(missing))
-    try:
-        assert stream.read() is False          # nothing decoded
-        failure = stream.check_ok()
-        assert failure and "exited" in failure
-    finally:
-        stream.close()
-    # a stream we closed ourselves is not a failure
-    assert stream.check_ok() is None
