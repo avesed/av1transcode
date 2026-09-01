@@ -87,7 +87,10 @@ transcode:
   # per-shot CRF to hit target_quality, then encodes all shots in parallel.
   optimizer:
     probe_crfs: [20, 26, 32, 38, 44]  # CRF grid probed per shot
-    probe_bracket_width: 6       # 二分到区间窄于此就停(CRF)。注意它和上面 probe_crfs 的
+    probe_bracket_width: 6       # 二分到区间窄于此就停(CRF)。6 并不算粗:
+                                 # 实测 4K 原生下 VMAF-CRF 曲线斜率只有 0.14~0.36,
+                                 # 即 1 分 VMAF = 3~7 个 CRF, 而探测窗口本身的取样差异
+                                 # 就能到 2.5 分。再二分得细也是在追一个测量给不出的精度。注意它和上面 probe_crfs 的
                                  # 间距会互相抵消: 间距 6 => 种子给出宽 12 的区间, 二分一次
                                  # 到 6 就退出, 所以自适应比固定网格只省约一次探测
                                  # (实测 3.3 次/镜头 对 网格的 5)。想让它真正起作用,

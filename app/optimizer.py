@@ -64,6 +64,24 @@ def pick_crf(samples: List[Tuple[int, float]], target: float) -> float:
 
     scores must be monotone-decreasing in crf (as VMAF/ssimulacra2 are).
     Clamps to the sampled range when the target is out of reach.
+
+    Know what this inversion costs. Measured on 4K at native resolution with
+    the 4k model, the curve runs 0.14-0.36 VMAF per CRF, and it is FLATTEST at
+    the top - 0.14 around VMAF 96, 0.36 down at 91. So one point of VMAF is
+    worth three to seven CRF, and a target in the mid-90s sits on the flattest
+    part of it, where the inversion amplifies hardest.
+
+    That is not a defect to fix here, it is the shape of the problem, but it
+    explains a whole class of otherwise baffling results and sets the floor on
+    what any of this can resolve:
+
+      - the probe window is a SAMPLE of the shot, and measured on real 4K,
+        taking 64 frames of a shot instead of 120 moved the score by up to 2.5
+        VMAF - which lands as ~12 CRF (observed: +12.2 on one shot)
+      - conversely, tiny metric differences are harmless: the SYCL backend
+        differs from the CPU one by ~1e-4 VMAF, i.e. ~7e-4 CRF
+      - probe_bracket_width=6 is not coarse. Bisecting finer would be chasing
+        precision the measurement does not have.
     """
     pts = sorted((crf, score) for crf, score in samples if score is not None)
     if not pts:
