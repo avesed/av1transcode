@@ -242,25 +242,49 @@ def test_optimizer_settings_put_merges_partial_body(settings, monkeypatch):
 
 
 def test_settings_page_covers_every_editable_optimizer_field():
-    """Fields the page cannot post are only safe because the API merges; the
-    ones a user is expected to tune should still be on the page."""
+    """Every optimizer knob is either on the settings page or explicitly
+    exempt. A whitelist of names to check would pass for any field nobody
+    remembered to add, which is how vmaf_sycl_device ended up settable exactly
+    once: saving from the UI writes a JSON that overrides config.yaml, so a
+    knob missing from the form is a knob the user cannot change afterwards.
+    """
     import re
     from pathlib import Path
 
+    from app.config import Settings
+
+    # install paths, not tuning - they point at .so files baked into the image
+    exempt = {"bestsource_plugin", "vszip_plugin"}
+
+    fields = set(
+        Settings.model_fields["transcode"].annotation
+        .model_fields["optimizer"].annotation.model_fields
+    )
     html = Path("app/static/settings.html").read_text()
     body = html[html.index("const body = {"):]
     posted = set(re.findall(r"^\s*(\w+):", body[:body.index("};")], re.M))
-    for field in ("probe_crfs", "min_crf", "probe_crf_offset", "vmaf_width",
-                  "vmaf_model_4k", "vmaf_4k_min_width", "ssimulacra2_frame_step",
-                  "min_shot_frames", "verify_shots", "probe_bracket_width",
-                  # a UI save writes a JSON that overrides config.yaml, so a
-                  # knob missing here is a knob the user can only set once
-                  "vmaf_sycl_device", "vmaf_sycl_min_width"):
-        assert field in posted, f"{field} missing from the settings form"
-    assert 'value="xpsnr"' in html
+    missing = fields - posted - exempt
+    assert not missing, f"not on the settings form and not exempt: {sorted(missing)}"
 
 
-# ---- the finished file is checked against the source before it counts as done ----
+def test_config_yaml_documents_every_optimizer_field():
+    """config.yaml is the only documentation most of these knobs have. A field
+    that exists in the model but not in the shipped config is one a user can
+    only find by reading the source."""
+    import yaml
+    from pathlib import Path
+
+    from app.config import Settings
+
+    fields = set(
+        Settings.model_fields["transcode"].annotation
+        .model_fields["optimizer"].annotation.model_fields
+    )
+    shipped = set(yaml.safe_load(
+        Path("config.yaml").read_text())["transcode"]["optimizer"])
+    missing = fields - shipped
+    assert not missing, f"undocumented in config.yaml: {sorted(missing)}"
+
 def _out_info(path, duration=60.0, audio=2, subs=3, codec="av1"):
     from app.analyzer import MediaInfo
 

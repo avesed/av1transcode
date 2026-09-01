@@ -122,6 +122,28 @@
         <input type="number" id="o-scenedetect_threshold" min="0" step="0.5">
       </div>
       <div class="field">
+        <label>scenedetect_engine（scdet=ffmpeg 内建，快且无需落盘；pyscenedetect=旧路径）</label>
+        <select id="o-scenedetect_engine">
+          <option value="scdet">scdet</option>
+          <option value="pyscenedetect">pyscenedetect</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>scdet_threshold（切点判定门限 0-100，越低越敏感；ffmpeg 自己的默认是 10）</label>
+        <input type="number" id="o-scdet_threshold" min="0" max="100" step="0.1">
+      </div>
+      <div class="field">
+        <label>scenedetect_scale（检测前先降到此尺寸，仅为提速；空=原生）</label>
+        <input type="text" id="o-scenedetect_scale">
+      </div>
+      <div class="field">
+        <label>scenedetect_hwaccel（auto=有 QSV 就用它解码；off=一律软解）</label>
+        <select id="o-scenedetect_hwaccel">
+          <option value="auto">auto</option>
+          <option value="off">off</option>
+        </select>
+      </div>
+      <div class="field">
         <label>min_scene_len（最小镜头长度，帧）</label>
         <input type="number" id="o-min_scene_len" min="0">
       </div>
@@ -510,6 +532,10 @@ async function loadOptimizer() {
     $("o-encode_workers").value = o.encode_workers;
     $("o-encode_threads").value = o.encode_threads;
     $("o-scenedetect_threshold").value = o.scenedetect_threshold;
+    $("o-scenedetect_engine").value = o.scenedetect_engine;
+    $("o-scdet_threshold").value = o.scdet_threshold;
+    $("o-scenedetect_scale").value = o.scenedetect_scale;
+    $("o-scenedetect_hwaccel").value = o.scenedetect_hwaccel;
     $("o-min_scene_len").value = o.min_scene_len;
     $("o-min_shot_frames").value = o.min_shot_frames;
     $("o-max_shots").value = o.max_shots;
@@ -549,6 +575,10 @@ $("optimizerForm").addEventListener("submit", async e => {
       encode_workers: parseInt($("o-encode_workers").value, 10) || 0,
       encode_threads: parseInt($("o-encode_threads").value, 10) || 0,
       scenedetect_threshold: parseFloat($("o-scenedetect_threshold").value),
+      scenedetect_engine: $("o-scenedetect_engine").value,
+      scdet_threshold: parseFloat($("o-scdet_threshold").value),
+      scenedetect_scale: $("o-scenedetect_scale").value.trim(),
+      scenedetect_hwaccel: $("o-scenedetect_hwaccel").value,
       min_scene_len: parseInt($("o-min_scene_len").value, 10),
       min_shot_frames: parseInt($("o-min_shot_frames").value, 10),
       max_shots: parseInt($("o-max_shots").value, 10),

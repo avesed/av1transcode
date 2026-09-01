@@ -6,7 +6,8 @@
 
 - **自动发现**：监控输入目录，文件稳定（默认 30s 未变化）后自动入队
 - **AV1 高压缩存档**：av1an 场景切分 + SVT-AV1 并行编码，CRF/preset/film-grain 全可配
-- **Shot-based 优化器引擎（Netflix 风格，可选）**：PySceneDetect 分镜 → 所有镜头<b>并行</b>质量探测（VMAF/SSIMULACRA2）→ 插值出每镜头精细 CRF → 并行编码。预设里 `engine=optimizer` + `target_quality` 启用，替代 av1an 串行 `--target-quality`
+- **Shot-based 优化器引擎（Netflix 风格，可选）**：ffmpeg `scdet` 分镜 → 所有镜头<b>并行</b>质量探测（VMAF/SSIMULACRA2）→ 二分出每镜头精细 CRF → 并行编码 → 抽验实际交付质量。预设里 `engine=optimizer` + `target_quality` 启用，替代 av1an 串行 `--target-quality`（`scenedetect_engine: pyscenedetect` 可切回旧的 PySceneDetect 路径）
+- **GPU 打分（Intel Arc）**：VMAF 可通过 libvmaf 的 SYCL 后端在 Arc 上计算，`optimizer.vmaf_sycl_device` 设为设备号启用（默认 -1 关闭）。4K 上实测每次探测1.7s/1 核/0.25GB，对比 CPU 的 5.6s/10.7 核/7.6GB，分数不变。每个任务开头会自证设备可用且与 CPU 后端一致，不一致就整个任务退回 CPU
 - **HDR 直通**：BT.2020 + PQ/HLG 色彩与母版元数据（mastering display / MaxCLL）完整保留
 - **Dolby Vision 存档**：
   - P5：ICtCp → HDR10（`libplacebo`，需 Vulkan）

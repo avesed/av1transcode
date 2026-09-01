@@ -87,6 +87,15 @@ transcode:
   # per-shot CRF to hit target_quality, then encodes all shots in parallel.
   optimizer:
     probe_crfs: [20, 26, 32, 38, 44]  # CRF grid probed per shot
+    probe_bracket_width: 6       # 二分到区间窄于此就停(CRF)。注意它和上面 probe_crfs 的
+                                 # 间距会互相抵消: 间距 6 => 种子给出宽 12 的区间, 二分一次
+                                 # 到 6 就退出, 所以自适应比固定网格只省约一次探测
+                                 # (实测 3.3 次/镜头 对 网格的 5)。想让它真正起作用,
+                                 # 要么调窄这个值, 要么把 probe_crfs 铺得更疏。
+    min_shot_frames: 0           # 短于此的镜头并入相邻镜头 (0=不合并)
+    verify_shots: 10             # 编码后抽验多少个镜头的实际交付质量 (0=不验)。
+                                 # 这是全流程唯一的对账机制: 它把"探测预测"和"实际交付"
+                                 # 的偏差报出来, 偏差大通常意味着窗口没对齐而不是编码器问题
     probe_preset: 10             # fast SVT-AV1 preset for probe encodes (4K 下 SVT 自动降到 9)
     probe_scale: ""              # 空=按源分辨率探测。填了就等于用另一个分辨率的 RD 曲线
                                  # 去挑 CRF，4K 实测会把 CRF 20..44 压成 5 个 VMAF 点
