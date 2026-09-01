@@ -1,0 +1,99 @@
+--- a/configure
++++ b/configure
+@@ -2802,6 +2802,7 @@
+     ividsp
+     jpegtables
+     lgplv3
++    libvmaf_sycl
+     libx262
+     libx264_hdr10
+     llauddsp
+@@ -7457,6 +7458,7 @@
+ enabled libvidstab        && require_pkg_config libvidstab "vidstab >= 0.98" vid.stab/libvidstab.h vsMotionDetectInit
+ enabled libvmaf           && require_pkg_config libvmaf "libvmaf >= 2.0.0" libvmaf.h vmaf_init
+ enabled libvmaf           && check_pkg_config libvmaf_cuda "libvmaf >= 2.0.0" libvmaf_cuda.h vmaf_cuda_state_init
++enabled libvmaf           && check_pkg_config libvmaf_sycl "libvmaf >= 3.0.0" libvmaf/libvmaf_sycl.h vmaf_sycl_state_init
+ enabled libvo_amrwbenc    && { check_pkg_config libvo_amrwbenc vo-amrwbenc vo-amrwbenc/enc_if.h E_IF_init ||
+                                require libvo_amrwbenc vo-amrwbenc/enc_if.h E_IF_init -lvo-amrwbenc; }
+ enabled libvorbis         && require_pkg_config libvorbis vorbis vorbis/codec.h vorbis_info_init &&
+--- a/libavfilter/vf_libvmaf.c
++++ b/libavfilter/vf_libvmaf.c
+@@ -46,6 +46,10 @@
+ #include "libavutil/hwcontext_cuda_internal.h"
+ #endif
+ 
++#if CONFIG_LIBVMAF_SYCL
++#include <libvmaf/libvmaf_sycl.h>
++#endif
++
+ typedef struct LIBVMAFContext {
+     const AVClass *class;
+     FFFrameSync fs;
+@@ -64,6 +68,11 @@
+ #if CONFIG_LIBVMAF_CUDA_FILTER
+     VmafCudaState *cu_state;
+ #endif
++    int sycl_device;
++    int sycl_profile;
++#if CONFIG_LIBVMAF_SYCL
++    VmafSyclState *sycl_state;
++#endif
+ } LIBVMAFContext;
+ 
+ #define OFFSET(x) offsetof(LIBVMAFContext, x)
+@@ -77,6 +86,8 @@
+     {"n_subsample", "Set interval for frame subsampling used when computing vmaf.",     OFFSET(n_subsample), AV_OPT_TYPE_INT, {.i64=1}, 1, UINT_MAX, FLAGS},
+     {"model",  "Set the model to be used for computing vmaf.",                          OFFSET(model_cfg), AV_OPT_TYPE_STRING, {.str="version=vmaf_v0.6.1"}, 0, 1, FLAGS},
+     {"feature",  "Set the feature to be used for computing vmaf.",                      OFFSET(feature_cfg), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, FLAGS},
++    {"sycl_device", "Score on this SYCL device index (-1 = CPU).",                       OFFSET(sycl_device), AV_OPT_TYPE_INT, {.i64=-1}, -1, INT_MAX, FLAGS},
++    {"sycl_profile", "Enable SYCL queue profiling.",                                     OFFSET(sycl_profile), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
+     { NULL }
+ };
+ 
+@@ -441,6 +452,34 @@
+     if (err)
+         return AVERROR(EINVAL);
+ 
++    if (s->sycl_device >= 0) {
++#if CONFIG_LIBVMAF_SYCL
++        VmafSyclConfiguration sycl_cfg = {
++            .device_index     = s->sycl_device,
++            .enable_profiling = !!s->sycl_profile,
++        };
++
++        err = vmaf_sycl_state_init(&s->sycl_state, sycl_cfg);
++        if (err) {
++            av_log(ctx, AV_LOG_ERROR,
++                   "vmaf_sycl_state_init(%d) failed: %d.\n",
++                   s->sycl_device, err);
++            return AVERROR(EINVAL);
++        }
++
++        err = vmaf_sycl_import_state(s->vmaf, s->sycl_state);
++        if (err) {
++            av_log(ctx, AV_LOG_ERROR, "vmaf_sycl_import_state failed: %d.\n",
++                   err);
++            return AVERROR(EINVAL);
++        }
++#else
++        av_log(ctx, AV_LOG_ERROR,
++               "sycl_device set but libvmaf was built without SYCL.\n");
++        return AVERROR(ENOSYS);
++#endif
++    }
++
+     err = parse_models(ctx);
+     if (err)
+         return err;
+@@ -595,6 +634,11 @@
+ 
+     if (s->vmaf)
+         vmaf_close(s->vmaf);
++
++#if CONFIG_LIBVMAF_SYCL
++    if (s->sycl_state)
++        vmaf_sycl_state_free(&s->sycl_state);
++#endif
+ }
+ 
+ static const AVFilterPad libvmaf_inputs[] = {

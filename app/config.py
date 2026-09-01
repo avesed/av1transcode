@@ -195,6 +195,23 @@ class OptimizerSettings(BaseModel):
     # NB: ffmpeg's own libvmaf default is single-threaded, which now costs more
     # than the probe encode it measures (7.0s vs 2.1s at 8 threads, same score).
     vmaf_threads: int = 0
+    # Score on the GPU via libvmaf's SYCL backend. -1 = off (the CPU path);
+    # >= 0 selects a SYCL device index, passed to the libvmaf filter as
+    # sycl_device=N. Needs the image built with the VMAFx libvmaf and a Level
+    # Zero device (Intel Arc). The filter fails loudly at init when the device
+    # is not there rather than quietly scoring on the CPU, so a preflight runs
+    # once per job and falls the whole job back to CPU instead of letting
+    # every probe die.
+    # Measured on a B580 at the real probe scale (120 frames, native 4K):
+    # 1.7s on ONE core and 0.25GB, against 5.6s on 10.7 cores and 7.6GB.
+    # Scores are unchanged - see the note on the vmaf-builder stage.
+    vmaf_sycl_device: int = -1
+    # Below this source width the CPU path is used even when vmaf_sycl_device
+    # is set. The GPU win scales with frame size while its per-invocation
+    # overhead does not: at 1080p CPU scoring is already only ~1.8s and the
+    # warm GPU cost there has not been measured. Conservative on purpose -
+    # lower it once 1080p is measured, do not assume.
+    vmaf_sycl_min_width: int = 2560
     # Parallel probe workers across shots. Probes now encode at source
     # resolution, so each instance holds a multi-GB frame pool at 4K just like
     # the final encode (measured 3.5GB at 4K). 0 = auto, from the memory

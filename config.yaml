@@ -116,6 +116,17 @@ transcode:
                                  # vmaf_v0.6.1 是 1080p 训练的，直接测 4K 超出模型适用范围
     vmaf_threads: 0              # 0 = auto(核数/probe_workers)。libvmaf 自己的默认是单线程，
                                  # 在 4K 上比它要测的探测编码还慢(7.0s vs 8 线程 2.1s，分数一样)
+    vmaf_sycl_device: -1         # 用 libvmaf 的 SYCL 后端在 GPU 上打分。-1=关闭(走 CPU)；
+                                 # >=0 是 SYCL 设备号，会作为 sycl_device=N 传给 libvmaf filter。
+                                 # 需要镜像里是 VMAFx 版 libvmaf + 一块 Level Zero 设备(Intel Arc)。
+                                 # B580 实测(120 帧原生 4K，即真实探测规模)：1.7s / 1 核 / 0.25GB，
+                                 # 对比 CPU 的 5.6s / 10.7 核 / 7.6GB；分数不变(15 个对照点差 <=0.0001，
+                                 # 过 pick_crf 后选出的 CRF 偏差 <=0.0006)。
+                                 # 设备不可用时 filter 会直接报错而不是偷偷回退 CPU，
+                                 # 所以每个任务开头会先做一次预检，不行就整个任务退回 CPU。
+    vmaf_sycl_min_width: 2560    # 源宽度低于此值即使开了也走 CPU。GPU 的收益随帧大小增长，
+                                 # 但每次调用的固定开销不变：1080p 上 CPU 本来就只要 ~1.8s，
+                                 # 而 GPU 热态在 1080p 没实测过。保守设置，测过再往下调。
     probe_workers: 0             # 并行探测实例数 (0=自动，按本 cgroup 可用内存算，
                                  # 不是整机内存；4K 探测实例实测峰值 3.5GB)
     encode_workers: 0            # 并行正式编码实例数的硬上限 (0=推荐，不设上限)。

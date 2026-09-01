@@ -968,6 +968,136 @@ def test_sub_4k_source_keeps_1080p_model_and_downscale(settings, info, plan, tmp
     assert enc._vmaf_scale_filter().startswith("scale=w='min(iw,1920)'")
 
 
+# ---- libvmaf SYCL backend (Intel Arc) ----
+def _stub_run(enc, ok=True):
+    """Record ffmpeg invocations; satisfy whatever libvmaf log they ask for."""
+    calls = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        calls.append(args)
+        joined = " ".join(args)
+        if "libvmaf=" in joined:
+            if not ok:
+                raise opt.TranscodeError("vmaf_sycl_state_init(0) failed: -1")
+            lavfi = args[args.index("-lavfi") + 1]
+            log = lavfi.split("log_path=")[1].split(":")[0]
+            Path(log).write_text(
+                json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    return calls
+
+
+def test_sycl_off_by_default_costs_nothing(settings, info, plan, tmp_path):
+    """The default must not so much as launch ffmpeg to decide it is off."""
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = _stub_run(enc)
+    assert enc._sycl_device() == -1
+    assert calls == []
+
+
+def test_sycl_gated_below_min_width(settings, info, plan, tmp_path):
+    """1080p CPU scoring is already ~1.8s; the GPU's per-call overhead is not
+    amortised there, and the warm number has never been measured."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 1920, 1080
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = _stub_run(enc)
+    assert enc._sycl_device() == -1
+    assert calls == []                       # gated before the preflight
+
+
+def test_sycl_used_when_enabled_and_wide_enough(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = _stub_run(enc)
+    assert enc._sycl_device() == 0
+    assert len(calls) == 1                   # the preflight, once
+    assert "sycl_device=0" in " ".join(calls[0])
+
+
+def test_sycl_preflight_runs_once_and_is_cached(settings, info, plan, tmp_path):
+    """Probe workers all call this; it must not launch an ffmpeg each time."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = _stub_run(enc)
+    for _ in range(5):
+        assert enc._sycl_device() == 0
+    assert len(calls) == 1
+
+
+def test_sycl_falls_back_to_cpu_when_device_missing(settings, info, plan, tmp_path):
+    """A dead device must cost one failed preflight, not one failure per probe:
+    the filter aborts the whole ffmpeg run when sycl init fails."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = _stub_run(enc, ok=False)
+    for _ in range(4):
+        assert enc._sycl_device() == -1
+    assert len(calls) == 1
+
+
+def test_sycl_not_used_for_other_metrics(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    plan.params.target_metric = "ssimulacra2"
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_run(enc)
+    assert enc._sycl_device() == -1
+
+
+def test_score_vmaf_carries_sycl_device(settings, info, plan, tmp_path):
+    """The option has to reach the filter, not just the helper."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    cmds = _capture_probe(enc, tmp_path)
+    scoring = [c for c in cmds
+               if any("libvmaf=" in a for a in c) and "sycl_preflight" not in " ".join(c)]
+    assert scoring, "no scoring command issued"
+    lavfi = scoring[-1][scoring[-1].index("-lavfi") + 1]
+    assert "sycl_device=0" in lavfi
+
+
+def test_score_vmaf_drops_n_threads_under_sycl(settings, info, plan, tmp_path):
+    """On the GPU the CPU threads only buy frame pools: measured on a B580,
+    unset is 0.98s/0.16GB and 40 threads is 2.04s/1.54GB for the same score.
+    Passing the CPU path's thread count would hand back the memory win."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    settings.transcode.optimizer.vmaf_threads = 40
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    cmds = _capture_probe(enc, tmp_path)
+    scoring = [c for c in cmds
+               if any("libvmaf=" in a for a in c) and "sycl_preflight" not in " ".join(c)]
+    lavfi = scoring[-1][scoring[-1].index("-lavfi") + 1]
+    assert "sycl_device=0" in lavfi
+    assert "n_threads" not in lavfi
+
+
+def test_score_vmaf_keeps_n_threads_on_cpu(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.vmaf_threads = 40
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    cmds = _capture_probe(enc, tmp_path)
+    lavfi = [c for c in cmds if any("libvmaf=" in a for a in c)][-1]
+    lavfi = lavfi[lavfi.index("-lavfi") + 1]
+    assert "n_threads=40" in lavfi
+
+
+def test_score_vmaf_omits_sycl_when_off(settings, info, plan, tmp_path):
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    cmds = _capture_probe(enc, tmp_path)
+    assert not any("sycl_device=" in " ".join(c) for c in cmds)
+
+
 def test_4k_model_not_used_for_other_metrics(settings, info, plan, tmp_path):
     info.width, info.height = 3840, 1920
     plan.params.target_metric = "ssimulacra2"

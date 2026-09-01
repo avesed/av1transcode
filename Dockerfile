@@ -67,29 +67,86 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cp -a vulkan-headers/include/vk_video /out/include/ && \
     printf 'prefix=/usr\nincludedir=${prefix}/include\nName: vulkan\nDescription: Vulkan loader\nVersion: 1.4.350\nCflags: -I${includedir}\nLibs: -lvulkan\n' > /out/vulkan.pc
 
-# ---------- stage 3b: libvmaf v2.3.1 (not packaged in bookworm) ----------
+# ---------- stage 3b: libvmaf (the VMAFx fork, for its SYCL backend) ----------
+# Netflix's libvmaf has no Intel GPU path at all - its only accelerated backend
+# is CUDA - so on this box (a B580, no CUDA) scoring ran entirely on the CPU,
+# and scoring is the *larger* half of a probe: measured at the real probe scale
+# (120 frames, native 4K) it is 5.6s on 10.7 cores and 7.6GB RSS against 3.0s
+# on 4 cores for the preset-10 probe encode itself. Since _score_probe runs on
+# every CRF bisection step of every shot, that is where the machine's memory
+# and cores actually go.
+#
+# VMAFx is a fork that adds SYCL kernels while leaving the metric alone.
+# Verified rather than assumed, 2026-09-01: 5 real sources (4K SDR/DV/HDR,
+# 1080p SDR/HDR) x 3 CRFs, all scorers fed byte-identical y4m with the same
+# model file. VMAFx on CPU and VMAFx on SYCL each agreed with the stock ffmpeg
+# libvmaf to within 0.0001 VMAF on every one of the 15 points, and running
+# those curves through the optimizer's own pick_crf over targets 88-96 moved
+# the chosen CRF by at most 0.0006 - i.e. never. On the B580 the same probe
+# scores in 1.7s on one core and 0.25GB.
+#
+# Pinned to a commit rather than a tag because the fork publishes no releases.
 FROM ubuntu:24.04 AS vmaf-builder
-ARG VMAF_TAG=v2.3.1
+ARG VMAFX_REF=0b58cb597680ef634c8cb15ef42c887e3465cfd0
 ARG JOBS=8
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential meson ninja-build nasm xxd pkg-config git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch ${VMAF_TAG} \
-        https://github.com/Netflix/vmaf.git vmaf && \
-    cd vmaf/libvmaf && \
-    meson setup build --buildtype=release --prefix=/usr/local --libdir=lib \
-        -Denable_avx512=true && \
-    ninja -C build -j${JOBS} && \
-    meson install -C build --destdir /out && \
-    mkdir -p /out/lib /out/include /out/lib/pkgconfig /out/share/model && \
-    cp -a /out/usr/local/lib/*.so* /out/lib/ && \
+        ca-certificates curl gpg gpg-agent software-properties-common \
+        build-essential ninja-build nasm xxd pkg-config git python3 python3-pip \
+    && curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+        | gpg --dearmor -o /usr/share/keyrings/oneapi.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" \
+        > /etc/apt/sources.list.d/oneAPI.list \
+    && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        intel-oneapi-compiler-dpcpp-cpp libze1 libze-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    # noble ships meson 1.3.2; VMAFx's meson.build requires >= 1.4
+    && pip3 install --break-system-packages --no-cache-dir 'meson>=1.4'
+RUN git clone --filter=blob:none https://github.com/VMAFx/vmafx.git vmafx && \
+    cd vmafx && git checkout -q ${VMAFX_REF}
+# -Dsycl_icpx_aot_targets=bmg-g21: ahead-of-time compile for the B580 only.
+# The default list carries 19 Intel GPU generations this fleet will never run.
+# -Denable_tests=false is not tidiness - `meson install` otherwise relinks the
+# test binaries, and those fail to link (unresolved vmaf_log under LTO), which
+# takes the whole install step down with them.
+# DNN/CUDA/HIP/Metal/MCP off: none of them are reachable here, and enable_dnn
+# would drag in ONNX Runtime.
+RUN . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 && \
+    cd /build/vmafx && \
+    CC=icx CXX=icpx meson setup /bld core \
+        --buildtype=release --prefix=/usr/local --libdir=lib \
+        --default-library=shared \
+        -Denable_sycl=true -Dsycl_icpx_aot_targets=bmg-g21 \
+        -Denable_avx512=true -Denable_float=true \
+        -Denable_tests=false -Denable_docs=false -Denable_tools=true \
+        -Denable_dnn=disabled -Denable_cuda=false -Denable_hip=false \
+        -Denable_metal=disabled -Denable_mcp=false -Denable_rust_features=false && \
+    ninja -C /bld -j${JOBS} && \
+    meson install -C /bld --destdir /out --no-rebuild && \
+    mkdir -p /out/lib /out/include /out/lib/pkgconfig /out/share/model /out/bin /out/oneapi && \
+    cp -a /out/usr/local/lib/libvmaf.so* /out/lib/ && \
     cp -a /out/usr/local/lib/pkgconfig/*.pc /out/lib/pkgconfig/ && \
     cp -a /out/usr/local/include/libvmaf /out/include/ && \
     # all of them: the 4k model is what a 4K source should be scored with,
     # and neg is the variant that does not reward enhancement/sharpening
-    cp -a /build/vmaf/model/*.json /out/share/model/ && \
-    cp -a /out/usr/local/bin/vmaf /out/bin/ 2>/dev/null; true
+    cp -a /build/vmafx/model/*.json /out/share/model/ && \
+    cp -a /out/usr/local/bin/vmaf /out/bin/ && \
+    # The DPC++ runtime closure the built library actually needs: 11 files,
+    # ~77MB, against 2.9GB for the whole oneAPI install. Derived by walking
+    # ldd over the library, the UR adapter and libumf - not guessed. Note that
+    # BOTH level_zero adapters are required: with only v1 present the UR loader
+    # reports UR_RESULT_ERROR_UNSUPPORTED_VERSION and enumerates no device,
+    # and libvmaf's CLI would then silently score on the CPU instead.
+    O=$(ls -d /opt/intel/oneapi/compiler/*/lib | head -1) && \
+    U=$(ls -d /opt/intel/oneapi/umf/*/lib | head -1) && \
+    T=$(ls -d /opt/intel/oneapi/tcm/*/lib | head -1) && \
+    for f in "$O"/libimf.so "$O"/libintlc.so.5 "$O"/libirc.so "$O"/libirng.so \
+             "$O"/libsvml.so "$O"/libsycl.so.9 "$O"/libur_loader.so.0 \
+             "$O"/libur_adapter_level_zero.so.0 "$O"/libur_adapter_level_zero_v2.so.0 \
+             "$U"/libumf.so.1 "$T"/libhwloc.so.15 ; do \
+        cp -aL "$f" /out/oneapi/ || exit 1 ; done && \
+    test "$(ls /out/oneapi | wc -l)" = 11
 
 # ---------- stage 4: ffmpeg 9.0.1 release (DV support) ----------
 FROM ubuntu:24.04 AS ffmpeg-builder
@@ -118,11 +175,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y software-properties-common gpg-agent \
     && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential pkg-config curl nasm yasm ca-certificates \
+    build-essential pkg-config curl nasm yasm ca-certificates patch \
     libvpx-dev libx264-dev libx265-dev libopus-dev libvorbis-dev \
     libmp3lame-dev libass-dev libfreetype-dev libfontconfig1-dev \
     libvulkan-dev liblcms2-dev libdav1d-dev \
     libva-dev libvpl-dev \
+    libze-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=svt-builder /out/lib/ /usr/local/lib/
 COPY --from=svt-builder /out/include/ /usr/local/include/
@@ -134,6 +192,10 @@ COPY --from=vulkan-headers-builder /out/vulkan.pc /usr/local/lib/pkgconfig/vulka
 COPY --from=vmaf-builder /out/lib/ /usr/local/lib/
 COPY --from=vmaf-builder /out/include/ /usr/local/include/
 COPY --from=vmaf-builder /out/lib/pkgconfig/ /usr/local/lib/pkgconfig/
+# libvmaf.so now has libsycl/libur/libumf in its DT_NEEDED, so configure's
+# link test for vmaf_sycl_state_init cannot resolve without these present.
+COPY --from=vmaf-builder /out/oneapi/ /usr/local/lib/
+RUN ldconfig
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 # The release tarball from the GitHub mirror, not a clone of git.ffmpeg.org:
@@ -141,9 +203,15 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 # outright, and a tarball is 17MB against 137MB for the shallowest useful
 # fetch. The tree carries a RELEASE file, so the version string stays correct
 # without a .git directory.
+# Vendored, not fetched: see patches/README.md, which also records why this is
+# our patch and not the fork's (theirs needs two of the fork's earlier patches
+# to place at all, and gates the code behind a CONFIG_ symbol it never
+# defines). Adds sycl_device/sycl_profile to the existing libvmaf filter.
+COPY patches/ffmpeg-n9.0.1-libvmaf-sycl.patch /build/
 RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}.tar.gz" \
       | tar xz && \
     cd "FFmpeg-${FFMPEG_REF}" && \
+    patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-libvmaf-sycl.patch && \
     ./configure --prefix=/usr/local \
         --enable-gpl --enable-nonfree \
         --enable-libvpx --enable-libx264 --enable-libx265 \
@@ -154,6 +222,11 @@ RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}
         --enable-libass --enable-libfreetype --enable-libfontconfig \
         --disable-doc --disable-debug && \
     make -j${JOBS} && make install && \
+    # Prove the SYCL path is really compiled in, not just that the patch
+    # applied: the option can exist while CONFIG_LIBVMAF_SYCL is 0, in which
+    # case sycl_device=0 would fail at run time with ENOSYS instead of here.
+    ffmpeg -hide_banner -h filter=libvmaf 2>&1 | grep -q sycl_device && \
+    grep -q "^#define CONFIG_LIBVMAF_SYCL 1" config.h && \
     mkdir -p /out/lib /out/bin && \
     cp -a /usr/local/lib/* /out/lib/ && \
     cp /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /out/bin/
@@ -286,7 +359,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The Intel block is what lets this image drive the B580. intel-media-va-driver
 # is the VA-API driver, libmfx-gen1 the QSV runtime behind libvpl, and
 # mesa-vulkan-drivers (25.2.8 here) is what libplacebo needs to apply a Dolby
-# Vision RPU on the GPU instead of on llvmpipe.
+# Vision RPU on the GPU instead of on llvmpipe. libze1 + libze-intel-gpu1 are
+# the Level Zero loader and driver, which is a separate stack from both VA-API
+# and Vulkan and is what the SYCL libvmaf talks to.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libopus0 libvpx9 libx264-164 libx265-199 libmp3lame0 libvorbis0a \
         libvorbisenc2 \
@@ -295,6 +370,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip libpython3.12t64 \
         libzimg2 liblcms2-2 mesa-vulkan-drivers \
         libva2 libva-drm2 intel-media-va-driver libmfx-gen1 libvpl2 \
+        libze1 libze-intel-gpu1 \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -309,6 +385,12 @@ COPY --from=libplacebo-builder /out/include/ /usr/local/include/
 COPY --from=vapoursynth-builder /out/lib/ /usr/local/lib/
 COPY --from=zimg-builder /out/lib/ /usr/local/lib/
 COPY --from=vmaf-builder /out/lib/ /usr/local/lib/
+COPY --from=vmaf-builder /out/oneapi/ /usr/local/lib/
+# The libvmaf CLI, for diagnosing the GPU path by hand. Careful with it: unlike
+# the filter, the CLI falls back to the CPU when SYCL init fails and still
+# prints a valid score, so `--backend sycl` (not the default) is what actually
+# proves a device is being used.
+COPY --from=vmaf-builder /out/bin/vmaf /usr/local/bin/
 COPY --from=vmaf-builder /out/share/model/ /usr/share/model/
 COPY --from=av1an-builder /usr/local/bin/av1an /usr/local/bin/
 COPY --from=dovi-builder /usr/local/bin/dovi_tool /usr/local/bin/

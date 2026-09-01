@@ -471,6 +471,10 @@ class ShotEncoder:
         self._log_handle = open(log_path, "a", buffering=1) if log_path else None
         # one-time warning for av1an-style probing_vmaf_features
         self._feature_warned = False
+        # SYCL preflight result: None = not yet checked (see _sycl_device).
+        # Probe workers call it concurrently, hence the lock.
+        self._sycl_ok: Optional[bool] = None
+        self._sycl_lock = threading.Lock()
         # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads)
         self._probe_worker_count = 1
         # affinity slices currently taken (only used when encode_threads is set)
@@ -1624,6 +1628,61 @@ class ShotEncoder:
         cores = self._cores()
         return max(1, cores // max(1, self._probe_worker_count))
 
+    def _sycl_device(self) -> int:
+        """SYCL device index to hand the libvmaf filter, or -1 for the CPU.
+
+        Gated on three things, in order: the setting, the source being big
+        enough to be worth it (see vmaf_sycl_min_width), and the device
+        actually being there.
+        """
+        dev = int(self.opt.vmaf_sycl_device)
+        if dev < 0 or self.metric != "vmaf":
+            return -1
+        min_w = int(self.opt.vmaf_sycl_min_width or 0)
+        if min_w and (self.info.width or 0) < min_w:
+            return -1
+        with self._sycl_lock:
+            if self._sycl_ok is None:
+                self._sycl_ok = self._sycl_preflight(dev)
+        return dev if self._sycl_ok else -1
+
+    def _sycl_preflight(self, device: int) -> bool:
+        """Prove the SYCL device works before any probe depends on it.
+
+        The libvmaf filter aborts the ffmpeg run outright when
+        vmaf_sycl_state_init fails, which is the behaviour we want - libvmaf's
+        own CLI instead falls back to the CPU and returns a perfectly valid
+        score, so a broken driver would show up only as everything being three
+        times slower. But "abort" once per probe would mean a job that fails
+        hundreds of times. So spend one tiny comparison up front: if the device
+        is not usable, say so loudly and run the whole job on the CPU.
+        """
+        log = self.probe_dir / "sycl_preflight.json"
+        # testsrc2, not a flat colour: a black frame has zero variance
+        # everywhere, and VIF's log ratios on that are a good way to fail the
+        # preflight for a reason that has nothing to do with the device.
+        src = "testsrc2=s=256x256:d=0.1:r=2"
+        lavfi = ("[0:v]format=yuv420p10le[d];[1:v]format=yuv420p10le[r];"
+                 f"[d][r]libvmaf=model={self._model_cfg()}:sycl_device={device}:"
+                 f"log_fmt=json:log_path={log}")
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", src,
+                "-lavfi", lavfi, "-f", "null", "-"]
+        try:
+            self._run(args, timeout=300)
+        except TranscodeError as e:
+            logger.warning(
+                "optimizer: libvmaf SYCL device {} unusable, scoring this job "
+                "on the CPU instead ({}). Expect the probe phase to cost "
+                "roughly 3x the wall time and 30x the cores it would on the "
+                "GPU; fix the device or set vmaf_sycl_device=-1 to silence "
+                "this.", device, (str(e).strip().splitlines() or [""])[-1])
+            return False
+        finally:
+            _unlink(log)
+        logger.info("optimizer: scoring on libvmaf SYCL device {}", device)
+        return True
+
     def _use_4k_model(self) -> bool:
         """Whether this source should be scored with the 4K VMAF model."""
         if self.metric != "vmaf" or not self.opt.vmaf_model_4k:
@@ -1978,9 +2037,19 @@ class ShotEncoder:
                     "if needed, or leave empty for default VMAF features)",
                     feats,
                 )
-        n_threads = self._vmaf_threads()
-        if n_threads:
-            opts.append(f"n_threads={n_threads}")
+        sycl = self._sycl_device()
+        if sycl >= 0:
+            # Deliberately WITHOUT n_threads. On the GPU the CPU threads only
+            # add frame pools and synchronisation, and the cost is monotone in
+            # both directions - measured on a B580, same clip and same score:
+            # unset 0.98s / 0.16GB, 4 threads 1.07s / 0.30GB, 8 threads 1.25s /
+            # 0.43GB, 40 threads 2.04s / 1.54GB. Passing the CPU path's thread
+            # count here would give back most of the memory the GPU just saved.
+            opts.append(f"sycl_device={sycl}")
+        else:
+            n_threads = self._vmaf_threads()
+            if n_threads:
+                opts.append(f"n_threads={n_threads}")
         # Input 0 is the DISTORTED encode and input 1 the REFERENCE source:
         # ffmpeg's libvmaf takes #0 as main (distorted) and #1 as reference.
         # Passing them the other way round makes libvmaf treat the encode as
