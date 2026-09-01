@@ -996,6 +996,35 @@ def test_sub_4k_source_keeps_1080p_model_and_downscale(settings, info, plan, tmp
     assert enc._vmaf_scale_filter().startswith("scale=w='min(iw,1920)'")
 
 
+# idle=False throughout: `idle` deliberately overshoots the budget when
+# nothing is running at all, which would mask what these are checking.
+_ADM = dict(cost=lambda k, lp: 1.0, lp_ladder=[4], idle=False)
+
+
+def test_cpu_charge_defaults_to_booking_the_whole_lp():
+    """1.0 has to be exactly today's behaviour, or every existing measurement
+    of this scheduler stops meaning anything."""
+    assert opt.plan_admission([0], mem_free=100.0, cpu_free=4.0, **_ADM) == (0, 4, 1.0)
+    assert opt.plan_admission([0], mem_free=100.0, cpu_free=3.9, **_ADM) is None
+
+
+def test_cpu_charge_below_one_admits_more_at_once():
+    """A probe holds lp cores only while it encodes; it also decodes its window
+    and then scores it. Charging half the lp is what lets those cores be used
+    by something else - and the encoder is still handed the full lp."""
+    half = dict(_ADM, cpu_charge=0.5)
+    pick = opt.plan_admission([0], mem_free=100.0, cpu_free=2.0, **half)
+    assert pick == (0, 4, 1.0)          # 4 booked as 2, and still lp=4
+    assert opt.plan_admission([0], mem_free=100.0, cpu_free=1.9, **half) is None
+
+
+def test_cpu_charge_does_not_touch_the_memory_budget():
+    """Only the CPU side is discounted. Memory is held for the whole task
+    either way - and it is what becomes binding once CPU stops being."""
+    assert opt.plan_admission([0], mem_free=0.9, cpu_free=100.0,
+                              **dict(_ADM, cpu_charge=0.25)) is None
+
+
 # ---- libvmaf SYCL backend (Intel Arc) ----
 def _stub_run(enc, ok=True, gpu_score=90.0, raises=None, announces=True):
     """Record ffmpeg invocations; satisfy whatever libvmaf log they ask for.

@@ -168,6 +168,27 @@ class OptimizerSettings(BaseModel):
     # on average (worst +12.2, some pinned to the ceiling) and the delivered-
     # vs-predicted gap went from -0.38 to -2.28, i.e. the probes became six
     # times less predictive. Change it only while watching that gap.
+    # Fraction of its lp a probe books against the CPU budget. 1.0 charges
+    # the full lp for the task's whole life, which is what the encoding phase
+    # wants - there the process really is SVT-AV1 start to finish. A probe is
+    # not: it also reads and decodes its window and then scores it, and only
+    # the encode segment uses lp cores. Measured on a 4K job, a probe averaged
+    # 1.79 cores while holding 4 tokens, so the phase ran at 45% CPU
+    # utilisation with concurrency pinned at cores/lp.
+    # Below 1.0 admits more probes at once, and it does work: measured on a
+    # 4K job, 0.5 took the probe phase from 10 concurrent to 18.
+    #
+    # It did not make it faster. Same clip, same 158 probes, identical chosen
+    # CRFs: 313.1s at 1.0 against 342.4s at 0.5, i.e. 80% more in flight for 9%
+    # LESS throughput. The idle-looking cores are not idle - one probe decodes
+    # or scores while another encodes, so the phases already interleave across
+    # tasks, and the reservation that looks like over-booking per task is about
+    # right in aggregate. Adding more only adds contention.
+    #
+    # Left in because it is the right lever on a differently shaped machine
+    # (many cores, little memory, or a much cheaper metric), but do not reach
+    # for it expecting free throughput here. Default 1.0 is today's behaviour.
+    probe_cpu_charge: float = 1.0
     probe_max_frames: int = 120
     # libvmaf model configs. Accepts "path=/x.json", "version=NAME", or a bare
     # path (wrapped as path=...). Note: stock libvmaf <= 2.3.1 has no

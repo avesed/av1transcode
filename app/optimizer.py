@@ -340,6 +340,7 @@ def plan_admission(
     cost: Callable[[int, int], float],
     lp_ladder: List[int],
     idle: bool,
+    cpu_charge: float = 1.0,
 ) -> Optional[Tuple[int, int, float]]:
     """Pick the next (position in `pending`, lp, GB) to start, or None to wait.
 
@@ -376,7 +377,11 @@ def plan_admission(
     there is nothing else to do but overshoot.
     """
     ladder = sorted({max(1, lp) for lp in lp_ladder}, reverse=True)
-    top = next((lp for lp in ladder if lp <= cpu_free), None)
+    # cpu_charge lets a phase book fewer tokens than the lp it hands the
+    # encoder. A probe is not an encoder for its whole life - it also reads
+    # and decodes the window and then scores it - so charging the full lp
+    # across all of that reserves cores nothing is using. See _schedule.
+    top = next((lp for lp in ladder if lp * cpu_charge <= cpu_free), None)
     if top is not None:
         for pos, idx in enumerate(pending):
             gb = cost(idx, top)
@@ -385,7 +390,7 @@ def plan_admission(
     if idle and pending:
         for lp in ladder:
             gb = cost(pending[0], lp)
-            if gb <= mem_free and lp <= cpu_free:
+            if gb <= mem_free and lp * cpu_charge <= cpu_free:
                 return 0, lp, gb
         lp = ladder[-1]
         return 0, lp, cost(pending[0], lp)
@@ -694,7 +699,8 @@ class ShotEncoder:
                   run_one: Callable[[int, int, int, int], object],
                   on_done: Callable[[int, object], None],
                   progress: Callable[[int], None],
-                  max_conc: int, ladder: List[int]) -> None:
+                  max_conc: int, ladder: List[int],
+                  cpu_charge: float = 1.0) -> None:
         """Run `tasks` concurrently, admitting each against a memory/CPU budget.
 
         Shared by probing and encoding because both have the same shape: many
@@ -744,7 +750,7 @@ class ShotEncoder:
                     state["done"] += 1
                     cal.observe(raw, observed)
                 state["mem"] += gb
-                state["cpu"] += lp
+                state["cpu"] += lp * cpu_charge
                 state["live"] -= 1
                 cv.notify_all()
 
@@ -765,7 +771,8 @@ class ShotEncoder:
                                 f"shows free; admitting against the smaller")
                         pick = plan_admission(pending, min(state["mem"], real),
                                               state["cpu"], corrected, ladder,
-                                              idle=state["live"] == 0)
+                                              idle=state["live"] == 0,
+                                              cpu_charge=cpu_charge)
                     if pick is None:
                         cv.wait(timeout=0.5)
                     else:
@@ -779,7 +786,7 @@ class ShotEncoder:
                                 "starting it anyway because nothing else is "
                                 "running", phase, gb, state["mem"], budget)
                         state["mem"] -= gb
-                        state["cpu"] -= lp
+                        state["cpu"] -= lp * cpu_charge
                         state["live"] += 1
                         state["peak_conc"] = max(state["peak_conc"], state["live"])
                         th = threading.Thread(target=_worker,
@@ -1915,7 +1922,8 @@ class ShotEncoder:
             self._schedule(list(range(len(shots))), phase="probing", cost=cost,
                            run_one=run_one, on_done=on_done, progress=progress,
                            max_conc=self._max_probe_concurrency(len(shots)),
-                           ladder=ladder)
+                           ladder=ladder,
+                           cpu_charge=self.opt.probe_cpu_charge)
         finally:
             stop.set()
         self._log_phase_memory("probing", peak[0])
