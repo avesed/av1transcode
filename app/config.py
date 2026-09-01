@@ -162,6 +162,12 @@ class OptimizerSettings(BaseModel):
     # minutes-long take would cost minutes of 4K encoding per CRF. Shots longer
     # than this are probed over a contiguous window taken from their middle
     # (not subsampled - see probing_rate).
+    # Load-bearing, not a conservative default. Measured at 64: the probe
+    # phase does get 1.55x faster and the job 1.30x, but a shorter window
+    # over-estimates quality systematically - chosen CRFs came out +2.2 higher
+    # on average (worst +12.2, some pinned to the ceiling) and the delivered-
+    # vs-predicted gap went from -0.38 to -2.28, i.e. the probes became six
+    # times less predictive. Change it only while watching that gap.
     probe_max_frames: int = 120
     # libvmaf model configs. Accepts "path=/x.json", "version=NAME", or a bare
     # path (wrapped as path=...). Note: stock libvmaf <= 2.3.1 has no

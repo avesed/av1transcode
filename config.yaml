@@ -100,7 +100,13 @@ transcode:
     probe_scale: ""              # 空=按源分辨率探测。填了就等于用另一个分辨率的 RD 曲线
                                  # 去挑 CRF，4K 实测会把 CRF 20..44 压成 5 个 VMAF 点
     probing_rate: 1              # probe every nth frame of each shot (>1 会低估质量)
-    probe_max_frames: 120        # 每镜头探测帧数上限；超长镜头取中间一段连续帧，不做抽帧
+    probe_max_frames: 120        # 每镜头探测帧数上限；超长镜头取中间一段连续帧，不做抽帧。
+                                 # 这不是保守默认值，是承重的。实测降到 64: 探测阶段确实
+                                 # 快 1.55x、整体快 1.30x，但窗口变短会系统性高估质量——
+                                 # 选出的 CRF 平均偏高 +2.2(最大 +12.2, 有镜头直接顶到上限),
+                                 # 而"预测 vs 交付"的偏差从 -0.38 恶化到 -2.28，
+                                 # 即探测的预测力掉了 6 倍。想动它就得连着看 verify_shots
+                                 # 报出来的那个偏差，只看快了多少会亏掉画质。
     vmaf_model: /usr/share/model/vmaf_v0.6.1.json
     vmaf_model_4k: /usr/share/model/vmaf_4k_v0.6.1.json  # 源宽 >= vmaf_4k_min_width 时改用它，
                                  # 并且按原生分辨率测(不再缩到 vmaf_width)。0.6.1 是 1080p/3H 训练的，
