@@ -152,6 +152,11 @@ class OptimizerSettings(BaseModel):
     # depending on where the target lands), and 3 is four times more accurate
     # for what the sweep already cost. Below 3 buys nothing: integer CRF is
     # the floor. 0 = probe the whole probe_crfs grid, i.e. the old behaviour.
+    # NB this interacts with the spacing of probe_crfs, and at the defaults
+    # the two cancel out: seeds 6 apart give a bracket 12 wide, one bisection
+    # halves it to 6, and 6 <= width stops. So the adaptive search buys about
+    # one probe per shot over the plain grid (measured: 3.3 probes/shot against
+    # a grid of 5). Narrow this, or widen probe_crfs, to get more from it.
     probe_bracket_width: int = 6
     # Cap on frames probed per shot. Probes encode at source resolution, so a
     # minutes-long take would cost minutes of 4K encoding per CRF. Shots longer

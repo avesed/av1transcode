@@ -162,6 +162,14 @@
         <input type="number" id="o-vmaf_4k_min_width" min="0" max="7680">
       </div>
       <div class="field">
+        <label>vmaf_sycl_device（-1=关闭，用 CPU 打分；≥0=SYCL 设备号，需 Intel Arc）</label>
+        <input type="number" id="o-vmaf_sycl_device" min="-1" max="16">
+      </div>
+      <div class="field">
+        <label>vmaf_sycl_min_width（低于此宽度仍用 CPU；GPU 的收益随帧大小增长）</label>
+        <input type="number" id="o-vmaf_sycl_min_width" min="0" max="7680">
+      </div>
+      <div class="field">
         <label>ssimulacra2_frame_step（打分侧每 n 帧取 1；逐帧度量抽帧成立，和 probing_rate 不同）</label>
         <input type="number" id="o-ssimulacra2_frame_step" min="1" max="60">
       </div>
@@ -512,6 +520,8 @@ async function loadOptimizer() {
     $("o-vmaf_width").value = o.vmaf_width;
     $("o-vmaf_model_4k").value = o.vmaf_model_4k;
     $("o-vmaf_4k_min_width").value = o.vmaf_4k_min_width;
+    $("o-vmaf_sycl_device").value = o.vmaf_sycl_device;
+    $("o-vmaf_sycl_min_width").value = o.vmaf_sycl_min_width;
     $("o-ssimulacra2_frame_step").value = o.ssimulacra2_frame_step;
     $("o-vmaf_threads").value = o.vmaf_threads;
     $("o-vmaf_model").value = o.vmaf_model;
@@ -549,6 +559,8 @@ $("optimizerForm").addEventListener("submit", async e => {
       vmaf_width: parseInt($("o-vmaf_width").value, 10) || 0,
       vmaf_model_4k: $("o-vmaf_model_4k").value.trim(),
       vmaf_4k_min_width: parseInt($("o-vmaf_4k_min_width").value, 10) || 0,
+      vmaf_sycl_device: parseInt($("o-vmaf_sycl_device").value, 10),
+      vmaf_sycl_min_width: parseInt($("o-vmaf_sycl_min_width").value, 10) || 0,
       ssimulacra2_frame_step: parseInt($("o-ssimulacra2_frame_step").value, 10) || 1,
       vmaf_threads: parseInt($("o-vmaf_threads").value, 10) || 0,
       vmaf_model: $("o-vmaf_model").value.trim(),

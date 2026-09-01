@@ -576,6 +576,10 @@ def _capture_probe(enc, tmp_path):
             Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
         elif "-f" in args and args[args.index("-f") + 1] == "ivf":
             Path(args[-1]).write_bytes(b"ivf-dummy")
+        # the SYCL backend announces itself on stderr, which _run folds in;
+        # the preflight refuses the GPU without it
+        if "sycl_device=" in " ".join(args):
+            return "[vmaf-sycl] timing: 30 frames, gpu%=100%"
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -599,6 +603,30 @@ def test_probe_encode_matches_final_encode_config(settings, info, plan, tmp_path
     # exactly the probe window of the source, read once (no y4m intermediate)
     assert encode_cmd.count("-i") == 1
     assert encode_cmd[encode_cmd.index("-i") - 1] == "3.000000"  # 90 frames @ 30fps
+
+
+def _source_read(cmd, source):
+    """The `-ss X -t D -i <source>` slice of a probe command."""
+    i = next(k for k, a in enumerate(cmd) if a == str(source))
+    return cmd[max(0, i - 5):i + 1]
+
+
+def test_probe_encode_and_reference_read_the_same_frames(
+        settings, info, plan, tmp_path):
+    """The one invariant this whole engine rests on.
+
+    _probe_input serves both the probe encode and the VMAF reference read so
+    the two are frame-aligned by construction. Nothing downstream re-checks it:
+    if they drift apart the reference and the distorted side simply describe
+    different frames, the score collapses, and the CRF walks down to compensate
+    with a bigger file - silently. Measured elsewhere in this file: a ONE-frame
+    slip scored 66.3 where the aligned pair scored 92.4.
+    """
+    enc = make_encoder(settings, info, plan, tmp_path)
+    encode_cmd, vmaf_cmd = _capture_probe(enc, tmp_path)[:2]
+    assert _source_read(encode_cmd, enc.source) == _source_read(vmaf_cmd, enc.source)
+    # and it is a real read, not two empty slices comparing equal
+    assert "-ss" in _source_read(encode_cmd, enc.source)
 
 
 def test_probe_scores_distorted_against_reference(settings, info, plan, tmp_path):
@@ -969,21 +997,33 @@ def test_sub_4k_source_keeps_1080p_model_and_downscale(settings, info, plan, tmp
 
 
 # ---- libvmaf SYCL backend (Intel Arc) ----
-def _stub_run(enc, ok=True):
-    """Record ffmpeg invocations; satisfy whatever libvmaf log they ask for."""
+def _stub_run(enc, ok=True, gpu_score=90.0, raises=None, announces=True):
+    """Record ffmpeg invocations; satisfy whatever libvmaf log they ask for.
+
+    The SYCL preflight scores the same pair twice - on the device and on the
+    CPU - so which score comes back depends on which of the two this is.
+    """
     calls = []
+    lock = threading.Lock()
 
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
-        calls.append(args)
+        with lock:
+            calls.append(args)
         joined = " ".join(args)
         if "libvmaf=" in joined:
+            if raises is not None:
+                raise raises
             if not ok:
                 raise opt.TranscodeError("vmaf_sycl_state_init(0) failed: -1")
             lavfi = args[args.index("-lavfi") + 1]
             log = lavfi.split("log_path=")[1].split(":")[0]
+            mean = gpu_score if "sycl_device=" in joined else 90.0
             Path(log).write_text(
-                json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
+                json.dumps({"pooled_metrics": {"vmaf": {"mean": mean}}}))
+            # the backend announces itself on stderr, which _run folds in
+            if "sycl_device=" in joined and announces:
+                return "[vmaf-sycl] timing: 30 frames, gpu%=100%"
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1016,8 +1056,13 @@ def test_sycl_used_when_enabled_and_wide_enough(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     calls = _stub_run(enc)
     assert enc._sycl_device() == 0
-    assert len(calls) == 1                   # the preflight, once
+    # the preflight scores the pair twice: once on the device, once on the CPU
+    assert len(calls) == 2
     assert "sycl_device=0" in " ".join(calls[0])
+    assert "sycl_device=" not in " ".join(calls[1])
+    # and against a blurred copy, not itself: a pair scored against itself
+    # returns 100.000000 from any backend, working or not
+    assert "boxblur" in " ".join(calls[0])
 
 
 def test_sycl_preflight_runs_once_and_is_cached(settings, info, plan, tmp_path):
@@ -1028,7 +1073,106 @@ def test_sycl_preflight_runs_once_and_is_cached(settings, info, plan, tmp_path):
     calls = _stub_run(enc)
     for _ in range(5):
         assert enc._sycl_device() == 0
-    assert len(calls) == 1
+    assert len(calls) == 2
+
+
+def test_sycl_falls_back_when_it_disagrees_with_the_cpu_backend(
+        settings, info, plan, tmp_path):
+    """libvmaf comes from a fork pinned to a commit and nothing else re-checks
+    it numerically. A device that runs but scores differently is what a bad
+    VMAFX_REF bump looks like, and it is otherwise invisible: every score
+    shifts together and the job stays self-consistent."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = _stub_run(enc, gpu_score=90.5)   # the CPU says 90.0
+    assert enc._sycl_device() == -1
+    assert len(calls) == 2
+
+
+def test_sycl_tolerates_backend_rounding(settings, info, plan, tmp_path):
+    """The backends are not bit-identical - 1e-4 worst case measured - so the
+    guard must not trip on that."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_run(enc, gpu_score=90.0 + 1e-4)
+    assert enc._sycl_device() == 0
+
+
+def test_sycl_preflight_does_not_swallow_a_cancel(settings, info, plan, tmp_path):
+    """_check_cancel raises TranscodeError too. Catching that as a dead device
+    would put 'GPU unusable' in the log of every cancelled job."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc.cancel_flag = lambda: True
+    _stub_run(enc, raises=opt.TranscodeError("Job cancelled by user"))
+    with pytest.raises(opt.TranscodeError, match="cancel"):
+        enc._sycl_device()
+
+
+def test_sycl_preflight_runs_once_under_concurrent_callers(
+        settings, info, plan, tmp_path):
+    """Probe workers all reach this at once; the lock is the only thing
+    stopping one pair of ffmpeg launches per worker."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = _stub_run(enc)
+    out = []
+    threads = [threading.Thread(target=lambda: out.append(enc._sycl_device()))
+               for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert out == [0] * 8
+    assert len(calls) == 2
+
+
+def test_sycl_falls_back_when_the_backend_never_announces_itself(
+        settings, info, plan, tmp_path):
+    """Matching scores prove the numbers, not who computed them. An ignored
+    sycl_device agrees with the CPU perfectly - and that is the exact shape the
+    fork's own ffmpeg patch had, gating its code behind a CONFIG_ symbol it
+    never defined."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_run(enc, announces=False)
+    assert enc._sycl_device() == -1
+
+
+def test_sycl_preflight_survives_an_unreadable_log(settings, info, plan, tmp_path):
+    """ffmpeg can exit 0 and still leave no usable log - which is what a bad
+    build looks like, i.e. the case this check exists for. parse_score then
+    raises FileNotFoundError, and letting that out would kill the job instead
+    of falling back."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+
+    def fake_run(self, args, timeout=None):
+        return "[vmaf-sycl] ran"          # exits fine, writes nothing
+
+    enc._run = fake_run.__get__(enc)
+    assert enc._sycl_device() == -1       # falls back, does not raise
+
+
+def test_cpu_fallback_restores_the_thread_count(settings, info, plan, tmp_path):
+    """The fallback path is the one that actually needs CPU threads - 7.0s
+    single-threaded against 2.1s at 8. Losing n_threads here would make the
+    degraded path degrade twice."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    settings.transcode.optimizer.vmaf_threads = 40
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._sycl_ok = False                  # preflight already failed
+    cmds = _capture_probe(enc, tmp_path)
+    lavfi = [c for c in cmds if any("libvmaf=" in a for a in c)][-1]
+    lavfi = lavfi[lavfi.index("-lavfi") + 1]
+    assert "n_threads=40" in lavfi and "sycl_device" not in lavfi
 
 
 def test_sycl_falls_back_to_cpu_when_device_missing(settings, info, plan, tmp_path):
@@ -1048,8 +1192,9 @@ def test_sycl_not_used_for_other_metrics(settings, info, plan, tmp_path):
     plan.params.target_metric = "ssimulacra2"
     info.width, info.height = 3840, 2160
     enc = make_encoder(settings, info, plan, tmp_path)
-    _stub_run(enc)
+    calls = _stub_run(enc)
     assert enc._sycl_device() == -1
+    assert calls == []                   # gated before the preflight, like the others
 
 
 def test_score_vmaf_carries_sycl_device(settings, info, plan, tmp_path):

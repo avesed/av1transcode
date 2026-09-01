@@ -665,6 +665,14 @@ class ShotEncoder:
         admission scheduler came out 5% SLOWER than the fixed pool it replaced
         purely from the stranding. With lp bounded by the CPU budget instead,
         the instances in flight cannot oversubscribe the cores by construction.
+
+        That holds for the SVT-AV1 encode, which is what this pins. It does
+        NOT hold for the decode side of a probe: nothing here passes -threads,
+        so ffmpeg sizes its own frame threads from the host core count, not
+        from the lp this task was admitted for. At 10 probes in flight on 40
+        cores that is a real oversubscription, and it is why the admission
+        accounting reads lower than the machine actually behaves. Measuring
+        before capping it, rather than capping it and hoping.
         """
         cores = self._cores()
         if threads >= cores:
@@ -1429,6 +1437,13 @@ class ShotEncoder:
         return grid
 
     def _probe_preset(self) -> int:
+        """The preset probe encodes run at.
+
+        Note this saturates: SVT-AV1 forces the preset down to M9 at 4K (see
+        the note on _est_probe_gb), so on 4K sources anything above 9 here is
+        the same encode. Raising it to chase a faster probe phase will do
+        nothing; probe_max_frames is the knob that actually scales.
+        """
         raw = (self.video.probe_video_params or "").strip()
         if not raw:
             return self.opt.probe_preset
@@ -1616,11 +1631,16 @@ class ShotEncoder:
     def _vmaf_threads(self) -> int:
         """Threads for the libvmaf calculation.
 
-        ffmpeg's libvmaf defaults n_threads to 0, which is single-threaded, and
-        the score is now computed on 1080p frames decoded from 4K sources - the
-        measurement ends up slower than the probe encode it is measuring (7.0s
-        vs 2.1s at n_threads=8 for the same clip, identical score). Auto-size it
-        to the cores each probe worker has to itself.
+        ffmpeg's libvmaf defaults n_threads to 0, which is single-threaded,
+        and the measurement then ends up slower than the probe encode it is
+        measuring (7.0s vs 2.1s at n_threads=8 for the same clip, identical
+        score). Auto-size it to the cores each probe worker has to itself.
+
+        Note this is the CPU path only - _score_vmaf drops n_threads entirely
+        when the SYCL backend is on, where more threads are strictly worse.
+        And the frames are no longer 1080p: a source at or above
+        vmaf_4k_min_width is scored against the 4k model at native resolution
+        (see _vmaf_scale_filter), so this sizes threads for 4K work.
         """
         explicit = self.video.vmaf_threads or self.opt.vmaf_threads
         if explicit:
@@ -1646,6 +1666,12 @@ class ShotEncoder:
                 self._sycl_ok = self._sycl_preflight(dev)
         return dev if self._sycl_ok else -1
 
+    # How far the GPU and CPU backends may disagree on the same pair. Measured
+    # across 5 sources x 3 CRFs the worst was 1e-4, and 5e-5 on the preflight's
+    # own synthetic pair; 1e-3 leaves room for a sane build without letting a
+    # broken one through.
+    _SYCL_MAX_DELTA = 1e-3
+
     def _sycl_preflight(self, device: int) -> bool:
         """Prove the SYCL device works before any probe depends on it.
 
@@ -1658,29 +1684,86 @@ class ShotEncoder:
         is not usable, say so loudly and run the whole job on the CPU.
         """
         log = self.probe_dir / "sycl_preflight.json"
+        cpu_log = self.probe_dir / "sycl_preflight_cpu.json"
         # testsrc2, not a flat colour: a black frame has zero variance
         # everywhere, and VIF's log ratios on that are a good way to fail the
         # preflight for a reason that has nothing to do with the device.
-        src = "testsrc2=s=256x256:d=0.1:r=2"
-        lavfi = ("[0:v]format=yuv420p10le[d];[1:v]format=yuv420p10le[r];"
-                 f"[d][r]libvmaf=model={self._model_cfg()}:sycl_device={device}:"
-                 f"log_fmt=json:log_path={log}")
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", src,
-                "-lavfi", lavfi, "-f", "null", "-"]
+        #
+        # And the distorted side is blurred, not identical: a pair scored
+        # against itself returns 100.000000 from any backend, working or not,
+        # which would make the comparison below pure theatre. boxblur puts it
+        # near 49 VMAF, where adm/vif/motion all actually run.
+        src = "testsrc2=s=256x256:d=1:r=30"
+        def _lavfi(dev: Optional[int], path: Path) -> str:
+            sycl = f"sycl_device={dev}:" if dev is not None else ""
+            return ("[0:v]boxblur=2,format=yuv420p10le[d];"
+                    "[1:v]format=yuv420p10le[r];"
+                    f"[d][r]libvmaf=model={self._model_cfg()}:{sycl}"
+                    f"log_fmt=json:log_path={path}")
+        def _cmd(dev: Optional[int], path: Path) -> List[str]:
+            return [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", src,
+                    "-lavfi", _lavfi(dev, path), "-f", "null", "-"]
         try:
-            self._run(args, timeout=300)
-        except TranscodeError as e:
+            out = self._run(_cmd(device, log), timeout=300)
+            # Score the same pair on the CPU and compare. libvmaf now comes
+            # from a fork pinned to a commit, and a device that runs but
+            # computes differently is invisible otherwise: every score shifts
+            # together, pick_crf picks differently, and the delivered-vs-
+            # predicted report still looks self-consistent because both sides
+            # use the same scorer. Costs one more 256x256 pass.
+            #
+            # Note what this does NOT catch: a VMAFX_REF bump that moves the
+            # shared feature code shifts CPU and GPU together and passes. That
+            # would need a pinned expected value, which in turn needs a fixed
+            # model rather than the job's - worth doing, not done here.
+            self._run(_cmd(None, cpu_log), timeout=300)
+            gpu, cpu = parse_score(log, "vmaf"), parse_score(cpu_log, "vmaf")
+        # OSError/ValueError as well as TranscodeError: ffmpeg can exit 0 and
+        # still leave no usable log, and parse_score then raises FileNotFound
+        # or JSONDecodeError. Letting those out would kill the job, which is
+        # the exact opposite of this function's contract - and "exited fine but
+        # wrote nothing" is what a bad build looks like, i.e. the case this
+        # exists for.
+        except (TranscodeError, OSError, ValueError) as e:
+            # A cancel arrives as a TranscodeError too (see _check_cancel), and
+            # reporting that as a dead GPU would be a lie in the logs of every
+            # cancelled job.
+            self._check_cancel()
+            detail = "; ".join(
+                [ln for ln in str(e).strip().splitlines() if ln.strip()][-3:])
             logger.warning(
                 "optimizer: libvmaf SYCL device {} unusable, scoring this job "
                 "on the CPU instead ({}). Expect the probe phase to cost "
                 "roughly 3x the wall time and 30x the cores it would on the "
                 "GPU; fix the device or set vmaf_sycl_device=-1 to silence "
-                "this.", device, (str(e).strip().splitlines() or [""])[-1])
+                "this.", device, detail)
             return False
         finally:
             _unlink(log)
-        logger.info("optimizer: scoring on libvmaf SYCL device {}", device)
+            _unlink(cpu_log)
+        # Agreeing scores prove the numbers are right; they do not prove the
+        # GPU produced them. An ignored sycl_device would give agreement too -
+        # and that is not hypothetical, the fork's own ffmpeg patch gated its
+        # code behind a CONFIG_ symbol it never defined, so "compiles, runs,
+        # silently on the CPU" is a shape this build has already taken once.
+        # The backend announces itself on stderr, which _run folds into stdout.
+        if "vmaf-sycl" not in out:
+            logger.warning(
+                "optimizer: libvmaf accepted sycl_device={} but never announced "
+                "the SYCL backend, so it is probably scoring on the CPU while "
+                "claiming otherwise. Scoring on the CPU explicitly instead.",
+                device)
+            return False
+        if abs(gpu - cpu) > self._SYCL_MAX_DELTA:
+            logger.warning(
+                "optimizer: libvmaf SYCL device {} scores {:.6f} where the CPU "
+                "backend scores {:.6f} on the same pair - a {:.2e} gap against "
+                "an expected ~1e-4. The libvmaf build is suspect, so this job "
+                "scores on the CPU.", device, gpu, cpu, abs(gpu - cpu))
+            return False
+        logger.info("optimizer: scoring on libvmaf SYCL device {} (agrees with "
+                    "the CPU backend to {:.2e})", device, abs(gpu - cpu))
         return True
 
     def _use_4k_model(self) -> bool:
