@@ -611,6 +611,21 @@ def _source_read(cmd, source):
     return cmd[max(0, i - 5):i + 1]
 
 
+def test_probe_reads_the_window_the_encode_will_encode(settings, info, plan, tmp_path):
+    """The probe measures a window; the final encode encodes one. If they do
+    not start on the same frame the probe is scoring footage that never ships.
+
+    Both must use _seek's half-frame lead - asking for a frame's exact time
+    lands just above its stored timestamp often enough to skip it, which is
+    what _seek exists for. Measured on a 4K mp4, the bare w0/fps form missed on
+    1 of 12 windows; on Matroska's millisecond timebase _seek's own note
+    records 6 of 16.
+    """
+    enc = make_encoder(settings, info, plan, tmp_path)
+    probe_args, _ = enc._probe_input(600, 720)
+    assert probe_args[probe_args.index("-ss") + 1] == enc._seek(600)
+
+
 def test_probe_encode_and_reference_read_the_same_frames(
         settings, info, plan, tmp_path):
     """The one invariant this whole engine rests on.

@@ -1854,7 +1854,16 @@ class ShotEncoder:
         """
         if shard is not None:
             return ["-i", str(shard)], []
-        args = ["-ss", f"{w0 / self.fps:.6f}", "-t", f"{(w1 - w0) / self.fps:.6f}",
+        # _seek, not w0/fps: the same half-frame lead the final encode and the
+        # shard staging already use. Without it the probe reads a window that
+        # starts one frame later than the one that actually gets encoded -
+        # measured on a 4K mp4, 1 of 12 sampled windows; the note on _seek
+        # records 6 of 16 on a Matroska split, whose millisecond timebase is
+        # coarser. With it, all 12 come out frame-identical to the encode's
+        # read. That matters more than it sounds: the VMAF/CRF curve here runs
+        # 0.14-0.36 VMAF per CRF (see pick_crf), so measuring a window the
+        # encoder never sees is worth whole CRF steps.
+        args = ["-ss", self._seek(w0), "-t", f"{(w1 - w0) / self.fps:.6f}",
                 "-i", str(self.source)]
         vf: List[str] = []
         rate = self._probing_rate()
