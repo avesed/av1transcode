@@ -611,6 +611,29 @@ def _source_read(cmd, source):
     return cmd[max(0, i - 5):i + 1]
 
 
+def test_probe_read_caps_decoder_threads_at_the_admitted_lp(settings, info, plan, tmp_path):
+    """ffmpeg sizes decoder threads from the host core count unless told, so a
+    probe admitted 4 cores opens as many frame threads as the machine has. Ten
+    of those oversubscribe 40 cores, and measured that is both slower and more
+    expensive: 7.18s and 261 CPU-seconds unbounded, 4.61s and 130 at 4."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    args, _ = enc._probe_input(600, 720, lp=3)
+    assert args[args.index("-threads") + 1] == "3"
+    # -threads has to precede -i or it is an encoder option, not a decoder one
+    assert args.index("-threads") < args.index("-i")
+    # and a shard read is a decode too
+    sh, _ = enc._probe_input(600, 720, shard=tmp_path / "s.mkv", lp=2)
+    assert sh[sh.index("-threads") + 1] == "2"
+
+
+def test_probe_read_falls_back_to_the_top_of_the_ladder(settings, info, plan, tmp_path):
+    """The scoring read does not carry the task's lp; the top rung is what
+    admission hands out in the common case."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    args, _ = enc._probe_input(600, 720)
+    assert args[args.index("-threads") + 1] == str(enc._lp_ladder()[0])
+
+
 def test_probe_reads_the_window_the_encode_will_encode(settings, info, plan, tmp_path):
     """The probe measures a window; the final encode encodes one. If they do
     not start on the same frame the probe is scoring footage that never ships.

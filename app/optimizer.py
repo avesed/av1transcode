@@ -1841,7 +1841,8 @@ class ShotEncoder:
 
     # ---------- phase 2: parallel probing ----------
     def _probe_input(self, w0: int, w1: int,
-                     shard: Optional[Path] = None) -> Tuple[List[str], List[str]]:
+                     shard: Optional[Path] = None,
+                     lp: Optional[int] = None) -> Tuple[List[str], List[str]]:
         """(input args, video filters) reading frames [w0, w1) of the source.
 
         Used identically by the probe encode and by the VMAF reference read, so
@@ -1852,8 +1853,16 @@ class ShotEncoder:
         A DV shard already holds exactly these frames with the probe-side
         filters baked in, so it is read whole and needs no filters of its own.
         """
+        # -threads before -i is a DECODER thread count, and it wants to be the
+        # lp this task was admitted for. Left to itself ffmpeg sizes it from
+        # the host core count, so ten probes admitted 4 cores each open enough
+        # frame threads to oversubscribe 40 - which is not merely untidy
+        # accounting, it is slower AND more expensive. Measured on 10
+        # concurrent 120-frame 4K reads: unbounded 7.18s wall and 261
+        # CPU-seconds, against 4.61s and 130 at -threads 4. Both axes.
+        threads = ["-threads", str(lp if lp and lp > 0 else self._lp_ladder()[0])]
         if shard is not None:
-            return ["-i", str(shard)], []
+            return threads + ["-i", str(shard)], []
         # _seek, not w0/fps: the same half-frame lead the final encode and the
         # shard staging already use. Without it the probe reads a window that
         # starts one frame later than the one that actually gets encoded -
@@ -1863,8 +1872,9 @@ class ShotEncoder:
         # read. That matters more than it sounds: the VMAF/CRF curve here runs
         # 0.14-0.36 VMAF per CRF (see pick_crf), so measuring a window the
         # encoder never sees is worth whole CRF steps.
-        args = ["-ss", self._seek(w0), "-t", f"{(w1 - w0) / self.fps:.6f}",
-                "-i", str(self.source)]
+        args = threads + ["-ss", self._seek(w0),
+                          "-t", f"{(w1 - w0) / self.fps:.6f}",
+                          "-i", str(self.source)]
         vf: List[str] = []
         rate = self._probing_rate()
         if rate > 1:
@@ -2020,7 +2030,7 @@ class ShotEncoder:
     def _probe_encode_and_score(self, idx: int, w0: int, w1: int, crf: int,
                                 lp: int, shard: Optional[Path]) -> Tuple[int, int, float]:
         ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
-        in_args, vf = self._probe_input(w0, w1, shard)
+        in_args, vf = self._probe_input(w0, w1, shard, lp=lp)
         args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"] + in_args
         if vf:
             args += ["-vf", ",".join(vf)]
