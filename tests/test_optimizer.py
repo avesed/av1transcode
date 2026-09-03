@@ -2766,6 +2766,84 @@ def test_cuts_from_scores_honours_threshold_and_min_scene_len(
     assert enc._cuts_from_scores(scores) == []
 
 
+def _cfr_pts(n, fps=30.0, jitter_ms=True):
+    """Timestamps of n frames at fps, rounded to whole milliseconds the way
+    Matroska stores them (so consecutive intervals alternate around 1/fps)."""
+    return [round(i / fps, 3) if jitter_ms else i / fps for i in range(n)]
+
+
+def test_cfr_check_accepts_millisecond_jitter(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)          # 30fps
+    enc.fps = 24000 / 1001
+    enc._assert_constant_frame_rate([round(i * 1001 / 24000, 3) for i in range(2000)])
+
+
+def test_cfr_check_refuses_a_dropped_frame(settings, info, plan, tmp_path):
+    """One missing frame is a 2-period interval; from there every seek lands a
+    frame early and the output runs ahead of its audio. Measured on a 30s clip
+    with every 7th frame dropped: delivered VMAF median 54, video 4.2s short."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    pts = _cfr_pts(300)
+    del pts[120]                                                # frame 120 never existed
+    with pytest.raises(opt.TranscodeError) as e:
+        enc._assert_constant_frame_rate(pts)
+    msg = str(e.value)
+    assert "constant frame rate" in msg and "1 of 298" in msg
+    assert "frame 120" in msg and "66ms" in msg               # where, and how long
+    assert "engine=av1an" in msg
+
+
+def test_cfr_check_lets_a_gap_at_the_very_end_through(settings, info, plan, tmp_path):
+    """A cut at a non-keyframe leaves the last frame a period late; nothing
+    after it can be shifted, so it is not a reason to refuse the file."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    pts = _cfr_pts(300)
+    pts[-1] += 1 / 30.0                                         # 2-period gap before the last frame
+    enc._assert_constant_frame_rate(pts)                        # accepted
+    pts = _cfr_pts(300)
+    pts[-3:] = [x + 1 / 30.0 for x in pts[-3:]]                 # the gap sits 3 from the end
+    with pytest.raises(opt.TranscodeError):
+        enc._assert_constant_frame_rate(pts)
+
+
+def test_cfr_check_refuses_a_container_rate_that_is_not_the_timestamps(
+        settings, info, plan, tmp_path):
+    """Intervals all equal but at 25fps while the container claims 30: every
+    frame number would be converted with the wrong period."""
+    enc = make_encoder(settings, info, plan, tmp_path)          # info.fps = 30
+    with pytest.raises(opt.TranscodeError) as e:
+        enc._assert_constant_frame_rate(_cfr_pts(300, fps=25.0))
+    assert "average 25.000 fps" in str(e.value) and "container's 30" in str(e.value)
+
+
+def test_cfr_check_skips_when_the_pass_had_no_timestamps(settings, info, plan, tmp_path,
+                                                        monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+    enc._assert_constant_frame_rate([])                         # no raise
+    assert any("could not be verified" in str(w[0]) for w in warnings)
+
+
+def test_scdet_pass_collects_every_frames_pts(settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    lines = ""
+    for i in range(5):
+        lines += f"frame:{i}    pts:{i * 42}      pts_time:{i * 0.042:.3f}\nlavfi.scd.mafd=0.1\nlavfi.scd.score=0.0\n"
+    import io
+
+    class FakeProc:
+        stdout = io.StringIO(lines)
+        pid = 4242
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(opt.subprocess, "Popen", lambda *a, **k: FakeProc())
+    scores = enc._run_scdet(["ffmpeg"])
+    assert len(scores) == 5
+    assert enc._frame_pts == pytest.approx([0.0, 0.042, 0.084, 0.126, 0.168])
+
+
 def test_scdet_builds_shots_covering_every_frame(settings, info, plan, tmp_path,
                                                  monkeypatch):
     settings.transcode.optimizer.scdet_threshold = 2.0

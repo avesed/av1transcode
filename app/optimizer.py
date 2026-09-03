@@ -519,6 +519,8 @@ class ShotEncoder:
         self._sycl_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0
+        # every frame's pts_time from the scdet pass (see _run_scdet)
+        self._frame_pts: List[float] = []
         # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads)
         self._probe_worker_count = 1
         # affinity slices currently taken (only used when encode_threads is set)
@@ -1253,7 +1255,7 @@ class ShotEncoder:
         return shots
 
     # "frame:123 pts:... " and "lavfi.scd.score=1.234" from metadata=print
-    _SCD_FRAME = re.compile(r"^frame:(\d+)")
+    _SCD_FRAME = re.compile(r"^frame:(\d+)(?:\s+pts:\S+\s+pts_time:(-?[\d.]+))?")
     _SCD_SCORE = re.compile(r"^lavfi\.scd\.score=([\d.]+)")
 
     def _scdet_cmds(self) -> List[Tuple[str, List[str]]]:
@@ -1302,6 +1304,10 @@ class ShotEncoder:
         with self._proc_lock:
             self._procs.add(proc)
         scores: List[float] = []
+        # every frame's presentation time, from the same lines: the only pass
+        # that sees the whole timeline, and what _assert_constant_frame_rate
+        # judges it by
+        self._frame_pts = []
         total = max(self.total_frames, 1)
         last_pct = -1.0
         try:
@@ -1314,6 +1320,8 @@ class ShotEncoder:
                 m = self._SCD_FRAME.match(line)
                 if m:
                     n = int(m.group(1))
+                    if m.group(2) is not None:
+                        self._frame_pts.append(float(m.group(2)))
                     pct = min(n / total * 100, 100.0)
                     if pct > last_pct + 0.5:
                         last_pct = pct
@@ -1327,6 +1335,74 @@ class ShotEncoder:
         if rc != 0:
             raise TranscodeError(f"scdet pass failed (rc={rc})")
         return scores
+
+    # How far a frame interval may stray from 1/fps before it counts as a
+    # dropped or duplicated frame. Matroska rounds timestamps to whole
+    # milliseconds, so at 23.976fps the intervals alternate 41 and 42ms
+    # (0.98-1.01 periods); a dropped frame is 2.0. Half to one-and-a-half.
+    _CFR_INTERVAL = (0.5, 1.5)
+    # and how far the timestamps' average rate may sit from the container's
+    _CFR_RATE_TOLERANCE = 0.005
+    # Intervals at the very end are not judged: a cut made at a non-keyframe
+    # leaves the last frame a period late (every 150s test clip here had one,
+    # 83ms before frame 3605 of 3606), and a gap there shifts nothing that
+    # follows it. A gap anywhere earlier shifts every seek after it.
+    _CFR_TAIL_SLACK = 2
+
+    def _assert_constant_frame_rate(self, pts: List[float]) -> None:
+        """Refuse a source whose timestamps are not one frame per 1/fps.
+
+        Everything here maps frame numbers to time through fps: shot
+        boundaries come from a frame count, -ss is (frame - 0.5) / fps, and the
+        encoder reads emit one frame per decoded frame at that rate. On a
+        variable frame rate source all of that is quietly wrong. Measured on a
+        30s clip with every 7th frame dropped: the job reported success,
+        delivered VMAF median 54 (every seek after the first gap lands early),
+        and the video track ended 4.2s before its audio - a 14% speed-up
+        nothing checked, because the shot count matched the frame count and
+        the duration check tolerates 0.5%.
+
+        The container's frame rate cannot tell: an mkv with frames missing
+        still reports avg_frame_rate == r_frame_rate. The scdet pass already
+        prints every frame's pts_time, so the timeline is judged from that,
+        for free. Only the scdet engine has it; the PySceneDetect path sees no
+        timestamps and gets no check.
+        """
+        n = len(pts)
+        if n < 3:
+            if n == 0:
+                logger.warning("optimizer: the scene-detection pass reported no "
+                               "timestamps, so the source's frame rate could not "
+                               "be verified as constant")
+            return
+        period = 1.0 / self.fps
+        lo, hi = self._CFR_INTERVAL
+        judged = pts[:max(2, n - self._CFR_TAIL_SLACK)]
+        bad = [(i + 1, b - a) for i, (a, b) in enumerate(zip(judged, judged[1:]))
+               if not (lo * period <= b - a <= hi * period)]
+        span = pts[-1] - pts[0]
+        measured = (n - 1) / span if span > 0 else 0.0
+        rate_off = abs(measured - self.fps) / self.fps
+        if not bad and rate_off <= self._CFR_RATE_TOLERANCE:
+            self._log(f"timeline: {n} frames at a constant {measured:.4f} fps "
+                      f"(container says {self.fps:g})")
+            return
+        if bad:
+            i, d = bad[0]
+            first = (f"; the first is frame {i} at {pts[i]:.3f}s, {d * 1000:.0f}ms "
+                     f"after the previous one where {period * 1000:.1f}ms is one frame")
+        else:
+            first = ""
+        raise TranscodeError(
+            f"engine=optimizer needs a constant frame rate and {self.source.name} "
+            f"does not have one: {len(bad)} of {n - 1} frame intervals are not "
+            f"one frame long{first}; the timestamps average {measured:.3f} fps "
+            f"against the container's {self.fps:g}. Shot boundaries, probe "
+            f"windows and every seek here are frame numbers times 1/fps, so on "
+            f"this source they would land on the wrong frames and the picture "
+            f"would run {measured / self.fps * 100 - 100:+.1f}% against the audio. "
+            f"Use engine=av1an for it, or convert it to a constant frame rate "
+            f"first.")
 
     def _cuts_from_scores(self, scores: List[float]) -> List[int]:
         """Frames whose score clears the threshold, min_scene_len apart."""
@@ -1377,6 +1453,7 @@ class ShotEncoder:
         if len(scores) != self.total_frames:
             self._log(f"scdet saw {len(scores)} frames, "
                       f"fps x duration estimated {self.total_frames}")
+        self._assert_constant_frame_rate(self._frame_pts)
         cuts = self._cuts_from_scores(scores)
         bounds = [0] + cuts + [len(scores)]
         return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
