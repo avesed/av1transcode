@@ -76,7 +76,9 @@ def run(
     if settings.watcher.enabled and not no_watch:
         from app.watcher import FileWatcher
 
-        watcher = FileWatcher(settings, manager.enqueue_file)
+        # enqueue_new_file, not enqueue_file: the watcher must not re-submit a
+        # file this system has already handled. See TranscodeManager.
+        watcher = FileWatcher(settings, manager.enqueue_new_file)
         watcher.start()
     else:
         watcher = None

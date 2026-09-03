@@ -22,7 +22,11 @@ class FileWatcher:
     def __init__(
         self,
         settings: Settings,
-        submit: Callable[[str], None],
+        # Returns the new job id, or None when the file was not enqueued -
+        # which TranscodeManager.enqueue_new_file does for anything this system
+        # has handled before. The watcher does not care either way, but the
+        # annotation said None and both callers have always returned an id.
+        submit: Callable[[str], Optional[str]],
     ) -> None:
         self.settings = settings
         self.submit = submit

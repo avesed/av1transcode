@@ -85,6 +85,31 @@ class TranscodeManager:
             return jids[0] if jids else None
         return self._enqueue_single(src, preset, overrides)
 
+    def enqueue_new_file(self, source: str) -> Optional[str]:
+        """The watcher's entry point: enqueue only files never seen before.
+
+        Deliberately stricter than enqueue_file, which refuses only a job that
+        is currently in flight. That is right for a person re-submitting a file
+        on purpose, and wrong for the watcher, whose whole job is to notice NEW
+        files.
+
+        The only thing that used to stop a second submission was the watcher's
+        own in-memory seen-set, which is empty at startup. So every restart
+        re-enqueued every file still sitting in the input directory, including
+        the ones already transcoded - the source stays in place by default and
+        the output goes to an excluded av1/ subdirectory, so nothing else
+        noticed. Reproduced: file transcoded to done, fresh watcher over the
+        same database, second pending job for the same source.
+
+        Any job at all counts, not just a successful one. A file that failed
+        past max_retries would otherwise be retried on every restart forever,
+        and one that was skipped or cancelled was a decision, not an accident.
+        Pruning the job history deliberately forgets all of this.
+        """
+        if self.store.has_job(source):
+            return None
+        return self.enqueue_file(source)
+
     def _is_video(self, p: Path) -> bool:
         return p.is_file() and p.suffix.lower().lstrip(".") in self.settings.watcher.extensions
 

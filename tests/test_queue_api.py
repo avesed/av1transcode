@@ -115,6 +115,100 @@ def test_enqueue_allows_a_requeue_once_the_job_is_done(settings, store, tmp_path
     assert second is not None and second != first
 
 
+# -------------------------------------------------------------- watcher ----
+
+def _watched(settings, store, tmp_path):
+    """A watcher over a scratch input dir, wired the way cli.run wires it."""
+    from app.queue import TranscodeManager
+    from app.watcher import FileWatcher
+
+    settings.dirs.input = tmp_path / "in"
+    settings.dirs.input.mkdir(exist_ok=True)
+    settings.watcher.min_size_mb = 0
+    settings.watcher.stable_seconds = 0
+    manager = TranscodeManager(settings, store)
+    return manager, FileWatcher(settings, manager.enqueue_new_file)
+
+
+def _scan_once(watcher):
+    for p in watcher._scan():
+        watcher._maybe_submit(p)
+
+
+def test_the_watcher_does_not_resubmit_after_a_restart(settings, store, tmp_path):
+    """The in-memory seen-set is empty at startup, so it cannot be what stops
+    a second submission - and it was the only thing that did.
+
+    A restart therefore re-enqueued every file still in the input directory,
+    including the ones already transcoded: the source stays in place by
+    default and the output goes to an excluded av1/ subdirectory, so nothing
+    downstream noticed the whole library being encoded again.
+    """
+    manager, watcher = _watched(settings, store, tmp_path)
+    (settings.dirs.input / "movie.mkv").write_bytes(b"x" * 1024)
+
+    _scan_once(watcher)
+    jobs = store.list(status=None, limit=100)
+    assert len(jobs) == 1
+    store.update(jobs[0]["id"], status=db.DONE)
+
+    for _ in range(3):                      # three restarts
+        _, restarted = _watched(settings, store, tmp_path)
+        _scan_once(restarted)
+    assert len(store.list(status=None, limit=100)) == 1
+
+
+@pytest.mark.parametrize("status", [db.DONE, db.FAILED, db.SKIPPED, db.CANCELLED])
+def test_the_watcher_leaves_a_finished_file_alone_whatever_the_outcome(
+        settings, store, tmp_path, status):
+    """Any job at all counts. A file that failed past max_retries would
+    otherwise be retried on every restart forever, and skipped/cancelled were
+    decisions rather than accidents."""
+    _, watcher = _watched(settings, store, tmp_path)
+    (settings.dirs.input / "movie.mkv").write_bytes(b"x" * 1024)
+    _scan_once(watcher)
+    store.update(store.list(status=None, limit=1)[0]["id"], status=status)
+
+    _, restarted = _watched(settings, store, tmp_path)
+    _scan_once(restarted)
+    assert len(store.list(status=None, limit=100)) == 1
+
+
+def test_the_watcher_still_picks_up_a_genuinely_new_file(settings, store, tmp_path):
+    _, watcher = _watched(settings, store, tmp_path)
+    (settings.dirs.input / "movie.mkv").write_bytes(b"x" * 1024)
+    _scan_once(watcher)
+    store.update(store.list(status=None, limit=1)[0]["id"], status=db.DONE)
+
+    (settings.dirs.input / "another.mkv").write_bytes(b"y" * 1024)
+    _, restarted = _watched(settings, store, tmp_path)
+    _scan_once(restarted)
+
+    names = sorted(Path(j["source"]).name for j in store.list(status=None, limit=100))
+    assert names == ["another.mkv", "movie.mkv"]
+
+
+def test_a_person_can_still_resubmit_what_the_watcher_will_not(settings, store, tmp_path):
+    """enqueue_new_file is the watcher's rule, not everyone's - the UI and CLI
+    still go through enqueue_file."""
+    manager, watcher = _watched(settings, store, tmp_path)
+    src = settings.dirs.input / "movie.mkv"
+    src.write_bytes(b"x" * 1024)
+    _scan_once(watcher)
+    store.update(store.list(status=None, limit=1)[0]["id"], status=db.DONE)
+
+    assert manager.enqueue_new_file(str(src)) is None
+    assert manager.enqueue_file(str(src)) is not None
+
+
+def test_has_job_is_broader_than_find_active(store):
+    jid = store.create(source="/media/in/x.mkv", preset="balanced")
+    store.update(jid, status=db.DONE)
+    assert store.find_active("/media/in/x.mkv") is None
+    assert store.has_job("/media/in/x.mkv") is True
+    assert store.has_job("/media/in/never-seen.mkv") is False
+
+
 # ------------------------------------------------------- work-dir sweep ----
 
 def test_sweep_removes_what_an_interrupted_job_left(settings):

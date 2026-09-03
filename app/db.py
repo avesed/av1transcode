@@ -212,6 +212,19 @@ class JobStore:
             row = cur.fetchone()
             return row["id"] if row else None
 
+    def has_job(self, source: str) -> bool:
+        """Whether ANY job exists for `source`, in any state.
+
+        find_active answers "is it in flight", which is the right question for
+        a manual re-submit. This answers "has this system ever handled it",
+        which is the right question for the watcher: a file it has already
+        transcoded must not be picked up again just because the process
+        restarted. See TranscodeManager.enqueue_new_file.
+        """
+        with self._cursor() as cur:
+            cur.execute("SELECT 1 FROM jobs WHERE source=? LIMIT 1", (source,))
+            return cur.fetchone() is not None
+
     def next_pending(self) -> Optional[str]:
         """Atomically claim the oldest pending job (sets it analyzing) so
         concurrent workers never pick the same job."""
