@@ -104,6 +104,21 @@ def pick_crf(samples: List[Tuple[int, float]], target: float) -> float:
     return float(min(pts, key=lambda p: abs(p[1] - target))[0])
 
 
+def concat_quote(path: Path) -> str:
+    """`path` as one field of an ffmpeg concat demuxer list.
+
+    The demuxer's quoting is the shell's, not Python's: inside single quotes
+    everything is literal, so a single quote in the path has to close the
+    string, emit an escaped quote and reopen it -> 'it'\\''s'. Writing
+    f"'{path}'" instead silently truncates the filename at the first
+    apostrophe, and every shot after it lands in the wrong place or vanishes.
+
+    Reachable because these paths are rooted at the configured dirs.work, not
+    at a name this code chose.
+    """
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+
 def _unlink(path: Path) -> None:
     try:
         path.unlink()
@@ -2607,7 +2622,8 @@ class ShotEncoder:
             raise TranscodeError("no shot encodes to concatenate")
         list_file = self.tempdir / "concat.txt"
         list_file.write_text(
-            "".join(f"file '{p}'\n" for p in ivf_paths), encoding="utf-8")
+            "".join(f"file {concat_quote(p)}\n" for p in ivf_paths),
+            encoding="utf-8")
         video_only = self.tempdir / "video_only.mkv"
         args = [self.ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0",
                 "-i", str(list_file), "-c", "copy", "-fflags", "+genpts",

@@ -2486,3 +2486,29 @@ def test_detect_shots_dispatches_on_the_configured_engine(
     settings.transcode.optimizer.scenedetect_engine = "pyscenedetect"
     assert enc.detect_shots() == [(0, 900)]
     assert called == ["scdet", "pysd"]
+
+
+def test_concat_quote_escapes_apostrophes():
+    """The concat demuxer quotes like a shell, not like Python.
+
+    f"'{path}'" truncates the filename at the first apostrophe, so a work
+    directory such as /mnt/Trevor's Media loses every shot after that point.
+    These paths are rooted at the configured dirs.work, so the character is
+    the operator's to choose, not ours.
+    """
+    assert opt.concat_quote(Path("/w/enc_00000.ivf")) == "'/w/enc_00000.ivf'"
+    assert opt.concat_quote(Path("/a b/c.ivf")) == "'/a b/c.ivf'"
+    assert (opt.concat_quote(Path("/mnt/Trevor's Media/e.ivf"))
+            == "'/mnt/Trevor'\\''s Media/e.ivf'")
+
+
+def test_concat_quote_matches_shell_word_splitting():
+    """Same escaping rules, so bash is a usable oracle for the demuxer's."""
+    import subprocess
+
+    for raw in ("/plain/a.ivf", "/a b/c.ivf", "/mnt/Trevor's Media/e.ivf",
+                "/x/'quoted'/b.ivf", '/x/"dq"/b.ivf'):
+        quoted = opt.concat_quote(Path(raw))
+        out = subprocess.run(["bash", "-c", f"printf %s {quoted}"],
+                             capture_output=True, text=True).stdout
+        assert out == raw, f"{raw!r} -> {quoted} -> {out!r}"
