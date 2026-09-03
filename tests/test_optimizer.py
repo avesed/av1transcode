@@ -595,7 +595,8 @@ def test_probe_encode_matches_final_encode_config(settings, info, plan, tmp_path
     enc = make_encoder(settings, info, plan, tmp_path)
     encode_cmd = _capture_probe(enc, tmp_path)[0]
 
-    assert "-vf" not in encode_cmd                       # no probe downscale
+    # no probe downscale: the only filters are the timestamp regeneration
+    assert encode_cmd[encode_cmd.index("-vf") + 1] == "settb=AVTB,setpts=N/30.000000/TB"
     assert encode_cmd[encode_cmd.index("-pix_fmt") + 1] == "yuv420p10le"
     svt = encode_cmd[encode_cmd.index("-svtav1-params") + 1]
     assert "tune=0" in svt and "lp=4" in svt
@@ -603,6 +604,52 @@ def test_probe_encode_matches_final_encode_config(settings, info, plan, tmp_path
     # exactly the probe window of the source, read once (no y4m intermediate)
     assert encode_cmd.count("-i") == 1
     assert encode_cmd[encode_cmd.index("-i") - 1] == "3.000000"  # 90 frames @ 30fps
+
+
+def test_encoder_reads_emit_exactly_one_frame_per_decoded_frame(settings, info, plan, tmp_path):
+    """ffmpeg's default cfr sync duplicated a frame on these reads: the
+    half-frame seek lead puts every frame at +0.5 of the output grid and
+    Matroska's millisecond rounding decides the dup per shot. Measured: a
+    120-frame probe window came out as 121 frames and pooled 82.41 where the
+    same read scores 93.97 without sync. So: pts rebuilt from the frame index
+    (microsecond timebase, or it rounds again) and sync switched off - on the
+    probe encode, the final encode and the staged window alike."""
+    enc = make_encoder(settings, info, plan, tmp_path)               # 30fps
+    probe_cmd = _capture_probe(enc, tmp_path)[0]
+    final_cmd = _encode_cmd(make_encoder(settings, info, plan, tmp_path), 30.0)
+    for cmd in (probe_cmd, final_cmd):
+        assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
+        assert cmd[cmd.index("-vf") + 1].endswith("settb=AVTB,setpts=N/30.000000/TB")
+        # an output option: after the input, before the encoder
+        assert cmd.index("-i") < cmd.index("-fps_mode") < cmd.index("-c:v")
+
+
+def test_probe_regeneration_follows_the_subsampling(settings, info, plan, tmp_path):
+    """With probing_rate 2 the frames arrive at fps/2, and the regenerated
+    pts have to say so, after the fps= filter that made it so."""
+    settings.transcode.optimizer.probing_rate = 2
+    enc = make_encoder(settings, info, plan, tmp_path)
+    vf = _capture_probe(enc, tmp_path)[0]
+    vf = vf[vf.index("-vf") + 1]
+    assert vf.index("fps=15") < vf.index("setpts=N/15.000000/TB")
+
+
+def test_staged_window_is_frame_exact_too(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    seen = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        seen.append(args)
+        Path(args[-1]).write_bytes(b"x")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc._extract_window(100, 220, tmp_path / "w.mkv")
+    cmd = seen[0]
+    assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
+    assert cmd[cmd.index("-vf") + 1] == "settb=AVTB,setpts=N/30.000000/TB"
+    assert cmd[cmd.index("-frames:v") + 1] == "120"
 
 
 def _source_read(cmd, source):

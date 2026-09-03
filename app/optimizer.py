@@ -1574,10 +1574,37 @@ class ShotEncoder:
         """
         return f"{max(0.0, (frame - 0.5) / self.fps):.6f}"
 
+    def _exact_frames(self, rate: float) -> Tuple[List[str], List[str]]:
+        """(video filters, output options) that make an encoder read emit
+        exactly one frame per decoded frame, with pts 0, 1, 2, ...
+
+        ffmpeg's default constant-frame-rate sync duplicates frames on these
+        reads. The half-frame seek lead leaves every decoded frame at +0.5
+        frame of the output grid, and Matroska's millisecond timestamps land
+        that on either side of the rounding threshold - per shot. Measured on
+        a 120-frame probe window: cfr emitted 121 frames ("*** 1 dup!" in the
+        debug log, then "Clipping frame in rate conversion by 0.508"), every
+        frame after the duplicate paired one off, and the probe pooled 82.41
+        where the same read without sync scores 93.97. Timestamps regenerated
+        exactly on the grid still got one duplicate. In the final encode
+        -frames:v hides it completely: the count is right, one real frame is
+        gone, and everything after it is a frame late.
+
+        So the timestamps are rebuilt from the frame index in a fine timebase
+        (AVTB is microseconds; the millisecond one would round again) and
+        frame sync is switched off. `rate` is the frame rate the frames arrive
+        at - the source's, or fps/probing_rate after the probe subsampling.
+        Appended AFTER the read's other filters, which is where the frames it
+        counts come out.
+        """
+        return (["settb=AVTB", f"setpts=N/{rate:.6f}/TB"],
+                ["-fps_mode", "passthrough"])
+
     def _extract_window(self, w0: int, w1: int, dest: Path, *,
                         source: Optional[Path] = None,
                         vf: Optional[List[str]] = None,
-                        apply_dv: bool = False) -> None:
+                        apply_dv: bool = False,
+                        rate: Optional[float] = None) -> None:
         """Copy frames [w0, w1) of `source` (default: the encode input) into a
         lossless file.
 
@@ -1591,11 +1618,12 @@ class ShotEncoder:
 
             pre, dv = dovi.dv_apply_chain(self.settings)
             chain.append(dv)
+        exact_vf, exact_out = self._exact_frames(rate or self.fps)
+        chain += exact_vf
         args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
                 "-ss", self._seek(w0), "-i", str(source or self.source),
-                "-frames:v", str(w1 - w0), "-map", "0:v:0"]
-        if chain:
-            args += ["-vf", ",".join(chain)]
+                "-frames:v", str(w1 - w0), "-map", "0:v:0",
+                "-vf", ",".join(chain), *exact_out]
         args += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
                  "-an", "-sn", "-f", "matroska", str(dest)]
         self._run(args, timeout=3600)
@@ -1612,7 +1640,8 @@ class ShotEncoder:
         repeat reads in page cache.
         """
         try:
-            self._extract_window(w0, w1, dest, vf=vf, apply_dv=self._p5)
+            self._extract_window(w0, w1, dest, vf=vf, apply_dv=self._p5,
+                                 rate=self.fps / self._probing_rate())
         except TranscodeError as e:
             raise TranscodeError(f"DV shard for shot {idx}: {e}") from e
 
@@ -2070,9 +2099,11 @@ class ShotEncoder:
                                 lp: int, shard: Optional[Path]) -> Tuple[int, int, float]:
         ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
         in_args, vf = self._probe_input(w0, w1, shard, lp=lp)
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"] + in_args
-        if vf:
-            args += ["-vf", ",".join(vf)]
+        # a shard already holds the subsampled frames, so the rate is the
+        # same either way: what the frames arrive at after probing_rate
+        exact_vf, exact_out = self._exact_frames(self.fps / self._probing_rate())
+        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+                + in_args + ["-vf", ",".join(vf + exact_vf)] + exact_out)
         # the probe must use the same encoder configuration as the final encode
         # (tune, film grain, keyint, extra params) or it measures a different
         # rate-distortion curve than the one that gets delivered. Only the
@@ -2448,10 +2479,11 @@ class ShotEncoder:
             pre, chain = dovi.dv_apply_chain(self.settings)
             args += pre
             vf.append(chain)
+        exact_vf, exact_out = self._exact_frames(self.fps)
+        vf += exact_vf
         args += ["-ss", self._seek(s0), "-i", str(self.source),
-                 "-frames:v", str(s1 - s0), "-map", "0:v:0"]
-        if vf:
-            args += ["-vf", ",".join(vf)]
+                 "-frames:v", str(s1 - s0), "-map", "0:v:0",
+                 "-vf", ",".join(vf), *exact_out]
         svt = _svt_params_dict(self.video)
         svt["lp"] = lp
         args += ["-c:v", "libsvtav1", "-preset", str(self.video.preset)]
