@@ -1745,13 +1745,13 @@ def _verifying_encoder(settings, info, plan, tmp_path, delivered):
 
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
+        seen.append(args)
         if any("libvmaf=" in a for a in args):
             lavfi = args[args.index("-lavfi") + 1]
             log = lavfi.split("log_path=")[1].split(":")[0]
             Path(log).write_text(json.dumps(
                 {"pooled_metrics": {"vmaf": {"mean": delivered}}}))
             return ""
-        seen.append(args)
         Path(args[-1]).write_bytes(b"win")
         return ""
 
@@ -1759,17 +1759,61 @@ def _verifying_encoder(settings, info, plan, tmp_path, delivered):
     return enc, seen
 
 
+def _inputs(args):
+    """Every `-i X` operand of one ffmpeg command, in order."""
+    return [args[i + 1] for i, a in enumerate(args) if a == "-i"]
+
+
 def test_verify_compares_the_output_against_the_source(settings, info, plan, tmp_path):
+    """Nothing is staged now, so the assertion is on the metric command itself.
+
+    Order is load-bearing: libvmaf takes input #0 as the distorted side and #1
+    as the reference, and swapping them inflates and flattens the whole curve.
+    """
     enc, seen = _verifying_encoder(settings, info, plan, tmp_path, 76.0)
     shots = [(0, 90), (90, 180), (180, 300)]
     enc.verify_delivered(shots, {0: 30.0, 1: 30.0, 2: 30.0},
                          {0: {26: 80.0, 32: 74.0}, 2: {26: 80.0, 32: 74.0}})
-    inputs = [a[a.index("-i") + 1] for a in seen if "-i" in a]
-    assert str(enc.output) in inputs, "the finished file is never read"
-    assert str(enc.source) in inputs, "the source is never read"
-    # both sides are staged frame-exactly, never with a -t duration
-    assert all("-t" not in a for a in seen)
-    assert all("-frames:v" in a for a in seen)
+
+    metric_cmds = [a for a in seen if any("libvmaf=" in x for x in a)]
+    assert metric_cmds, "the metric never ran"
+    for cmd in metric_cmds:
+        assert _inputs(cmd) == [str(enc.output), str(enc.source)], \
+            "distorted must be input 0 (the output) and reference input 1"
+    # and nothing was written to disk to get there
+    assert not [a for a in seen if "-c:v" in a and "ffv1" in a], \
+        "verification staged a lossless window again"
+
+
+def test_verify_reads_both_windows_at_the_same_offset(settings, info, plan, tmp_path):
+    """The two seeks have to agree, or the comparison is of different frames."""
+    enc, seen = _verifying_encoder(settings, info, plan, tmp_path, 76.0)
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0},
+                         {0: {26: 80.0}, 1: {26: 80.0}})
+    for cmd in [a for a in seen if any("libvmaf=" in x for x in a)]:
+        seeks = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-ss"]
+        durs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-t"]
+        assert len(seeks) == 2 and seeks[0] == seeks[1], seeks
+        assert len(durs) == 2 and durs[0] == durs[1], durs
+
+
+def test_verify_still_stages_when_the_reference_needs_building(
+        settings, info, plan, tmp_path):
+    """Dolby Vision P5 and SSIMULACRA2 cannot read the source in place - the
+    first needs its RPU applied, the second reads through bestsource, which
+    indexes a file. Both keep the staged path, frame-exactly."""
+    enc, seen = _verifying_encoder(settings, info, plan, tmp_path, 76.0)
+    enc._p5 = True
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0},
+                         {0: {26: 80.0}, 1: {26: 80.0}})
+
+    staged = [a for a in seen if "ffv1" in a]
+    assert staged, "the shard path stopped staging"
+    # -frames:v, never a -t duration: that is what kept windows frame-exact
+    assert all("-t" not in a for a in staged)
+    assert all("-frames:v" in a for a in staged)
+    inputs = [i for a in staged for i in _inputs(a)]
+    assert str(enc.output) in inputs and str(enc.source) in inputs
 
 
 def _capture_logs(monkeypatch):

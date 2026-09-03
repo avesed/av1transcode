@@ -1688,6 +1688,30 @@ class ShotEncoder:
         cores = self._cores()
         return max(1, cores // max(1, self._probe_worker_count))
 
+    def _verify_threads(self) -> int:
+        """libvmaf threads for the verification pass.
+
+        _vmaf_threads() divides the cores by the PROBE pool, which is right
+        while that pool is running and wrong two phases later: verification
+        runs on its own, after the encode, and would otherwise ask for the
+        cores/probe_workers handful it needed when ten probes were competing.
+
+        Half the cores is the knee, and all of them is never better. Measured
+        on 32 cores, one 120-frame 3840x1920 window against the 4k model,
+        reading both sides in place:
+
+            n_threads      4      8     16     32
+            wall       11.2s   6.7s   5.5s   5.8s
+            cpu        60.3s  62.1s  66.9s  69.5s
+
+        and the same shape on a second window (12.6 / 7.9 / 6.6 / 7.2s). The
+        score is identical at every count, to six decimals.
+
+        An explicit vmaf_threads still wins, as it does for probing.
+        """
+        explicit = self.video.vmaf_threads or self.opt.vmaf_threads
+        return explicit if explicit else max(1, self._cores() // 2)
+
     def _sycl_device(self) -> int:
         """SYCL device index to hand the libvmaf filter, or -1 for the CPU.
 
@@ -2071,12 +2095,40 @@ class ShotEncoder:
         return idx, crf, score
 
     def _score_probe(self, w0: int, w1: int, dist: Path, idx: int, crf: int,
-                     shard: Optional[Path] = None) -> float:
+                     shard: Optional[Path] = None,
+                     threads: Optional[int] = None) -> float:
+        """Score a distorted window that already exists as a file."""
         if self.metric == "ssimulacra2":
             return self._score_ssimulacra2(w0, w1, dist, idx, crf, shard)
+        ref_args, ref_vf = self._probe_input(w0, w1, shard)
+        dist_args = ["-i", str(dist)]
         if self.metric == "xpsnr":
-            return self._score_xpsnr(w0, w1, dist, idx, crf, shard)
-        return self._score_vmaf(w0, w1, dist, idx, crf, shard)
+            return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf)
+        return self._score_vmaf(dist_args, ref_args, ref_vf, idx, crf,
+                                threads=threads)
+
+    def _window_input(self, w0: int, w1: int, source: Path,
+                      threads: int) -> List[str]:
+        """ffmpeg input args reading frames [w0, w1) of `source` unfiltered.
+
+        Not _probe_input: that one also applies the probe-side filters
+        (probing_rate subsampling, probe_scale). Verification compares what was
+        delivered against the source at native everything, and applying a probe
+        filter to one side of that would be measuring the wrong thing.
+        """
+        return ["-threads", str(max(1, threads)), "-ss", self._seek(w0),
+                "-t", f"{(w1 - w0) / self.fps:.6f}", "-i", str(source)]
+
+    def _score_windows(self, w0: int, w1: int, idx: int, crf: int,
+                       threads: int) -> float:
+        """Score [w0, w1) of the finished output against the same frames of the
+        source, reading both in place."""
+        dist_args = self._window_input(w0, w1, self.output, threads)
+        ref_args = self._window_input(w0, w1, self.source, threads)
+        if self.metric == "xpsnr":
+            return self._score_xpsnr(dist_args, ref_args, [], idx, crf)
+        return self._score_vmaf(dist_args, ref_args, [], idx, crf,
+                                threads=threads)
 
     # ---- colour description of the reference, for metrics that need it ----
     # ffmpeg's colour names are not zimg's, and a wrong one is not a rounding
@@ -2126,21 +2178,17 @@ class ShotEncoder:
         self._log(f"shot {idx:05d} crf {crf} ssimulacra2={score:.3f}")
         return score
 
-    def _score_xpsnr(self, w0: int, w1: int, dist: Path, idx: int,
-                     crf: int, shard: Optional[Path]) -> float:
+    def _score_xpsnr(self, dist_args: List[str], ref_args: List[str],
+                     ref_vf: List[str], idx: int, crf: int) -> float:
         """ffmpeg's xpsnr filter: a dB scale, not 0-100. Weighted luma is what
         the ITU work reports, so that is what is returned."""
-        if shard is not None:
-            ref_args, ref_vf = ["-i", str(shard)], []
-        else:
-            ref_args, ref_vf = self._probe_input(w0, w1)
         fmt = f"format={self._pix_fmt()}"
         dist_chain = fmt
         ref_chain = ",".join(f for f in (*ref_vf, fmt) if f)
         lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
                  f"[dist][ref]xpsnr=shortest=1")
-        args = ([self.ffmpeg, "-hide_banner", "-y", "-loglevel", "info",
-                 "-i", str(dist)] + ref_args
+        args = ([self.ffmpeg, "-hide_banner", "-y", "-loglevel", "info"]
+                + dist_args + ref_args
                 + ["-lavfi", lavfi, "-f", "null", "-"])
         out = self._run(args, timeout=3600)
         m = re.findall(r"XPSNR\s+y:\s*([0-9.]+)", out)
@@ -2150,8 +2198,16 @@ class ShotEncoder:
         self._log(f"shot {idx:05d} crf {crf} xpsnr={score:.3f}dB")
         return score
 
-    def _score_vmaf(self, w0: int, w1: int, dist: Path, idx: int, crf: int,
-                    shard: Optional[Path]) -> float:
+    def _score_vmaf(self, dist_args: List[str], ref_args: List[str],
+                    ref_vf: List[str], idx: int, crf: int,
+                    threads: Optional[int] = None) -> float:
+        """Score one distorted window against one reference window.
+
+        Both sides arrive as ffmpeg INPUT ARGUMENTS rather than paths, because
+        the two callers hand over different shapes: a probe has already written
+        its distorted window to an ivf, while verification seeks into the
+        finished output and the source in place. See _score_windows.
+        """
         out_json = self.probe_dir / f"score_{idx:05d}_{crf}.json"
         # ts_sync_mode=nearest is NOT optional. The reference is read straight
         # from the source container while the distorted side is an ivf carrying
@@ -2190,7 +2246,7 @@ class ShotEncoder:
             # count here would give back most of the memory the GPU just saved.
             opts.append(f"sycl_device={sycl}")
         else:
-            n_threads = self._vmaf_threads()
+            n_threads = threads if threads is not None else self._vmaf_threads()
             if n_threads:
                 opts.append(f"n_threads={n_threads}")
         # Input 0 is the DISTORTED encode and input 1 the REFERENCE source:
@@ -2200,7 +2256,6 @@ class ShotEncoder:
         # encode and VIF sees detail being *added* rather than lost, which
         # inflates and flattens the whole CRF curve (measured +5 VMAF at CRF 20
         # and +18 at CRF 44 on 4K HDR10).
-        ref_args, ref_vf = self._probe_input(w0, w1, shard)
         scale = self._vmaf_scale_filter()
         fmt = f"format={self._pix_fmt()}"
         dist_chain = ",".join(f for f in (scale, fmt) if f)
@@ -2209,8 +2264,8 @@ class ShotEncoder:
         ref_chain = ",".join(f for f in (*ref_vf, scale, fmt) if f)
         lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
                  f"[dist][ref]libvmaf={':'.join(opts)}")
-        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                 "-i", str(dist)] + ref_args
+        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+                + dist_args + ref_args
                 + ["-lavfi", lavfi, "-f", "null", "-"])
         try:
             self._run(args, timeout=3600)
@@ -2482,17 +2537,34 @@ class ShotEncoder:
     def _score_delivered(self, idx: int, w0: int, w1: int, crf: float) -> float:
         """Score frames [w0, w1) of the FINISHED file against the source.
 
-        Both sides are staged as lossless windows so the comparison is between
-        two files holding exactly these frames - the same footing the probes
-        score on, so a delivered score is directly comparable to the probe's
-        prediction for the same window.
+        Both windows are read in place and piped straight into the metric.
+        Staging them as lossless FFV1 first - which is what this used to do -
+        buys nothing at all. Measured on a 4K DV-P8 pair, 120 frames of
+        3840x1920 against the 4k model, three runs each:
+
+            staged   17.0s wall   166s cpu   377MB written and re-read
+            direct   11.2s wall    61s cpu     0MB
+
+        and the two score IDENTICALLY, 99.081524 to six decimals, on every run
+        and on a second window. So the staging was buying a 2.7x CPU bill and
+        a third of a gigabyte per shot for a number that does not move.
+
+        Two cases still stage, and they are the same two the probe path stages
+        for, so _needs_shard() decides here as well: SSIMULACRA2 reads through
+        bestsource, which indexes a file rather than a stream, and a Dolby
+        Vision P5 reference has to have its RPU applied before it means
+        anything.
         """
+        threads = self._verify_threads()
+        if not self._needs_shard():
+            return self._score_windows(w0, w1, idx, int(round(crf)), threads)
         ref = self.probe_dir / f"verify_ref_{idx:05d}.mkv"
         dist = self.probe_dir / f"verify_out_{idx:05d}.mkv"
         try:
             self._extract_window(w0, w1, ref, apply_dv=self._p5)
             self._extract_window(w0, w1, dist, source=self.output)
-            return self._score_probe(w0, w1, dist, idx, int(round(crf)), shard=ref)
+            return self._score_probe(w0, w1, dist, idx, int(round(crf)),
+                                     shard=ref, threads=threads)
         finally:
             for path in (ref, dist):
                 try:
