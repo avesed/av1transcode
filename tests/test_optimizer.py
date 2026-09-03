@@ -688,6 +688,35 @@ def test_probe_scores_distorted_against_reference(settings, info, plan, tmp_path
     assert "ts_sync_mode=nearest" in lavfi
 
 
+def test_probe_pairs_frames_by_index_not_by_timestamp(settings, info, plan, tmp_path):
+    """The two sides of a probe never share a timebase: the ivf starts at t=0
+    with exact 1/fps periods, while the reference comes out of -ss still
+    carrying _seek's half-frame lead, at +0.5 frame, which Matroska then rounds
+    to a millisecond. ts_sync_mode=nearest is choosing between two equidistant
+    frames and the rounding decides - per frame. Measured on the dovi_split=bl
+    mkv of a DV-P8 4K source: per-frame scores alternated 48 / 93 and pooled
+    to 76.86 where the aligned pair scores 93.97, so every shot read ~17 low
+    and fell back to CRF 20. Rebasing both sides to t=0 pairs frame k with
+    frame k, which is right by construction: the ivf was encoded from the very
+    read the reference is."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    vmaf_cmd = _capture_probe(enc, tmp_path)[1]
+    lavfi = vmaf_cmd[vmaf_cmd.index("-lavfi") + 1]
+    dist, ref = lavfi.split(";")[:2]
+    assert dist.startswith("[0:v]setpts=PTS-STARTPTS,")
+    assert ref.startswith("[1:v]") and "setpts=PTS-STARTPTS" in ref
+
+
+def test_probe_rebase_follows_the_probe_side_filters(settings, info, plan, tmp_path):
+    """With probing_rate > 1 the reference is fps= subsampled first, and fps=
+    re-times what it emits; the ivf holds THAT stream, so the rebase has to
+    come after the subsampling, not before it."""
+    settings.transcode.optimizer.probing_rate = 2
+    enc = make_encoder(settings, info, plan, tmp_path)
+    vmaf_cmd = _capture_probe(enc, tmp_path)[1]
+    ref = vmaf_cmd[vmaf_cmd.index("-lavfi") + 1].split(";")[1]
+    assert "fps=" in ref
+    assert ref.index("fps=") < ref.index("setpts=PTS-STARTPTS")
 # ---- detect_shots with a fake scenedetect ----
 class _FrameNum:
     def __init__(self, n):
@@ -1365,9 +1394,11 @@ def test_ssimulacra2_stages_a_reference_shard(settings, info, plan, tmp_path):
 def test_xpsnr_parses_weighted_luma(settings, info, plan, tmp_path):
     enc = _metric_encoder(settings, info, plan, tmp_path, "xpsnr")
     assert not enc._needs_shard()      # reads the source directly, like vmaf
+    seen = []
 
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
+        seen.append(args)
         if any("xpsnr" in a for a in args):
             return ("[Parsed_xpsnr_2 @ 0x1] XPSNR  y: 43.6691  u: 49.5918  "
                     "v: 51.1706  (minimum: 43.6691)\n")
@@ -1377,6 +1408,10 @@ def test_xpsnr_parses_weighted_luma(settings, info, plan, tmp_path):
     enc._run = fake_run.__get__(enc)
     score = enc._probe_shot(0, 0, 90, [32], lp=4)[32]
     assert score == pytest.approx(43.6691)
+    # same index pairing as the vmaf scorer, for the same reason
+    xpsnr_cmd = [c for c in seen if any("xpsnr=" in a for a in c)][0]
+    lavfi = xpsnr_cmd[xpsnr_cmd.index("-lavfi") + 1]
+    assert lavfi.count("setpts=PTS-STARTPTS") == 2, lavfi
 
 
 def test_ssimulacra2_error_names_the_missing_plugins(settings, info, plan, tmp_path):
@@ -1797,6 +1832,19 @@ def test_verify_reads_both_windows_at_the_same_offset(settings, info, plan, tmp_
         assert len(durs) == 2 and durs[0] == durs[1], durs
 
 
+def test_verify_pairs_frames_by_index_too(settings, info, plan, tmp_path):
+    """Both verify inputs are read with the same seek, so they already share
+    the half-frame phase and pair correctly - but by both sides rounding the
+    same way, not by construction. Rebasing both makes it by construction, and
+    keeps one scorer for both callers."""
+    enc, seen = _verifying_encoder(settings, info, plan, tmp_path, 76.0)
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0},
+                         {0: {26: 80.0}, 1: {26: 80.0}})
+    metric_cmds = [a for a in seen if any("libvmaf=" in x for x in a)]
+    assert metric_cmds
+    for cmd in metric_cmds:
+        lavfi = cmd[cmd.index("-lavfi") + 1]
+        assert lavfi.count("setpts=PTS-STARTPTS") == 2, lavfi
 def test_verify_still_stages_when_the_reference_needs_building(
         settings, info, plan, tmp_path):
     """Dolby Vision P5 and SSIMULACRA2 cannot read the source in place - the

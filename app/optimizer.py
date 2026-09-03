@@ -2183,8 +2183,10 @@ class ShotEncoder:
         """ffmpeg's xpsnr filter: a dB scale, not 0-100. Weighted luma is what
         the ITU work reports, so that is what is returned."""
         fmt = f"format={self._pix_fmt()}"
-        dist_chain = fmt
-        ref_chain = ",".join(f for f in (*ref_vf, fmt) if f)
+        # same index pairing as _score_vmaf, for the same reason
+        rebase = "setpts=PTS-STARTPTS"
+        dist_chain = f"{rebase},{fmt}"
+        ref_chain = ",".join(f for f in (*ref_vf, rebase, fmt) if f)
         lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
                  f"[dist][ref]xpsnr=shortest=1")
         args = ([self.ffmpeg, "-hide_banner", "-y", "-loglevel", "info"]
@@ -2258,10 +2260,28 @@ class ShotEncoder:
         # and +18 at CRF 44 on 4K HDR10).
         scale = self._vmaf_scale_filter()
         fmt = f"format={self._pix_fmt()}"
-        dist_chain = ",".join(f for f in (scale, fmt) if f)
+        # Both sides are rebased to t=0 before they meet, so libvmaf pairs
+        # frame k with frame k. Pairing by timestamp cannot work here because
+        # the two sides never share one: a probe's ivf starts at 0 with exact
+        # 1/fps periods, while the reference comes out of -ss still carrying
+        # _seek's half-frame lead, i.e. at +0.5 frame, and Matroska rounds each
+        # of those to a millisecond. ts_sync_mode=nearest is then choosing
+        # between two frames exactly equidistant, and the rounding decides -
+        # per frame. Measured on the dovi_split=bl mkv of a DV-P8 4K source,
+        # one 120-frame window at CRF 20: per-frame scores alternate 48 / 93
+        # and pool to 76.86; rebased, the same pair scores 93.97, which is what
+        # the un-remuxed source gives. Every shot of that job read ~17 low and
+        # fell back to CRF 20. Index pairing is right by construction: the ivf
+        # was encoded from the very read the reference is (_probe_input), and
+        # verification reads both files with the same seek, which the
+        # half-frame lead makes land on the same index either side.
+        rebase = "setpts=PTS-STARTPTS"
+        dist_chain = ",".join(f for f in (rebase, scale, fmt) if f)
         # the reference goes through the same probe-side filters the distorted
         # copy was encoded with, then both land on the same comparison raster.
-        ref_chain = ",".join(f for f in (*ref_vf, scale, fmt) if f)
+        # The rebase comes AFTER those filters: fps= subsampling re-times its
+        # output, and it is that output the ivf holds.
+        ref_chain = ",".join(f for f in (*ref_vf, rebase, scale, fmt) if f)
         lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
                  f"[dist][ref]libvmaf={':'.join(opts)}")
         args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
