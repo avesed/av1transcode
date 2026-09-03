@@ -764,6 +764,99 @@ def test_probe_rebase_follows_the_probe_side_filters(settings, info, plan, tmp_p
     ref = vmaf_cmd[vmaf_cmd.index("-lavfi") + 1].split(";")[1]
     assert "fps=" in ref
     assert ref.index("fps=") < ref.index("setpts=PTS-STARTPTS")
+
+
+def test_metric_runs_output_nothing_but_the_scored_video(settings, info, plan, tmp_path):
+    """Without -an ffmpeg maps the source's audio into the null output and
+    interleaves it with the scored frames; when the scorer lags, that
+    interleaving deadlocks (every thread in futex_do_wait, frame 56 of 120,
+    until the 3600s timeout). Measured with the SYCL backend; the CPU one is
+    just fast enough to hide it."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    vmaf_cmd = _capture_probe(enc, tmp_path)[1]
+    for flag in ("-an", "-sn", "-dn"):
+        assert flag in vmaf_cmd
+        assert vmaf_cmd.index("-lavfi") < vmaf_cmd.index(flag) < vmaf_cmd.index("-f")
+
+
+def _timeout_encoder(settings, info, plan, tmp_path, stall_first_n):
+    """An encoder whose first `stall_first_n` SYCL scorings time out."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    info.width, info.height = 3840, 2160
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._sycl_ok = True                    # preflight already passed
+    seen = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        seen.append((args, timeout))
+        if any("libvmaf=" in a for a in args):
+            lavfi = args[args.index("-lavfi") + 1]
+            if "sycl_device=" in lavfi and sum(
+                    1 for a, _ in seen if "sycl_device=" in " ".join(a)) <= stall_first_n:
+                raise opt.CommandTimeout(f"command timed out after {timeout}s: ffmpeg")
+            log = lavfi.split("log_path=")[1].split(":")[0]
+            Path(log).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 91.0}}}))
+            return "[vmaf-sycl] timing: 30 frames, gpu%=100%"
+        Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    return enc, seen
+
+
+def test_sycl_scoring_timeout_is_sized_to_the_window_and_retried_on_cpu(
+        settings, info, plan, tmp_path):
+    """A stalled SYCL scoring used to sit for the full 3600s and then fail
+    the job. Now it gets 60s plus a second per frame, is killed, and the same
+    window is scored on the CPU."""
+    enc, seen = _timeout_encoder(settings, info, plan, tmp_path, stall_first_n=1)
+    dist = tmp_path / "d.ivf"
+    dist.write_bytes(b"x")
+    score = enc._score_probe(0, 120, dist, 0, 28)
+    assert score == pytest.approx(91.0)
+    metric = [(a, t) for a, t in seen if any("libvmaf=" in x for x in a)]
+    assert len(metric) == 2
+    first, second = metric
+    assert "sycl_device=0" in first[0][first[0].index("-lavfi") + 1]
+    assert first[1] == 60 + 120                         # sized to the window
+    lavfi2 = second[0][second[0].index("-lavfi") + 1]
+    assert "sycl_device" not in lavfi2 and "n_threads=" in lavfi2
+    assert second[1] == 3600                            # the CPU keeps its budget
+    assert enc._sycl_timeouts == 1
+    assert enc._sycl_device() == 0                      # one stall does not banish the GPU
+
+
+def test_repeated_sycl_stalls_move_the_job_to_the_cpu(settings, info, plan, tmp_path):
+    enc, seen = _timeout_encoder(settings, info, plan, tmp_path, stall_first_n=3)
+    dist = tmp_path / "d.ivf"
+    dist.write_bytes(b"x")
+    for crf in (20, 26, 32, 38):
+        assert enc._score_probe(0, 120, dist, 0, crf) == pytest.approx(91.0)
+    assert enc._sycl_timeouts == 3
+    assert enc._sycl_device() == -1
+    lavfis = [a[a.index("-lavfi") + 1] for a, _ in seen if any("libvmaf=" in x for x in a)]
+    # 3 stalled SYCL attempts, 3 CPU retries, then the 4th goes straight to the CPU
+    assert sum("sycl_device=" in l for l in lavfis) == 3
+    assert sum("n_threads=" in l for l in lavfis) == 4
+    assert "sycl_device" not in lavfis[-1]
+
+
+def test_a_cpu_scoring_timeout_still_fails_the_probe(settings, info, plan, tmp_path):
+    """The retry is for the GPU; a CPU scoring that runs out of its hour is a
+    real fault and must surface as before."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+
+    def fake_run(self, args, timeout=None):
+        raise opt.CommandTimeout("command timed out after 3600s: ffmpeg")
+
+    enc._run = fake_run.__get__(enc)
+    dist = tmp_path / "d.ivf"
+    dist.write_bytes(b"x")
+    with pytest.raises(opt.TranscodeError):
+        enc._score_probe(0, 120, dist, 0, 28)
+
+
 # ---- detect_shots with a fake scenedetect ----
 class _FrameNum:
     def __init__(self, n):

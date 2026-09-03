@@ -449,6 +449,10 @@ def run_shot_transcode(
                 progress_cb, cancel_flag, stage_cb).run()
 
 
+class CommandTimeout(TranscodeError):
+    """A subprocess hit its _run timeout and was killed."""
+
+
 class ShotEncoder:
     """Parallel shot-based encoder with per-shot interpolated CRF selection."""
 
@@ -513,6 +517,8 @@ class ShotEncoder:
         # Probe workers call it concurrently, hence the lock.
         self._sycl_ok: Optional[bool] = None
         self._sycl_lock = threading.Lock()
+        # scorings the SYCL backend failed to finish in time (see _score_vmaf)
+        self._sycl_timeouts = 0
         # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads)
         self._probe_worker_count = 1
         # affinity slices currently taken (only used when encode_threads is set)
@@ -980,7 +986,7 @@ class ShotEncoder:
                         stream.close()
                     except OSError:
                         pass
-            raise TranscodeError(f"command timed out after {timeout}s: {args[0]}")
+            raise CommandTimeout(f"command timed out after {timeout}s: {args[0]}")
         finally:
             with self._proc_lock:
                 self._procs.discard(proc)
@@ -2197,7 +2203,8 @@ class ShotEncoder:
         if self.metric == "xpsnr":
             return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf)
         return self._score_vmaf(dist_args, ref_args, ref_vf, idx, crf,
-                                threads=threads)
+                                threads=threads,
+                                frames=(w1 - w0) // self._probing_rate())
 
     def _window_input(self, w0: int, w1: int, source: Path,
                       threads: int) -> List[str]:
@@ -2222,7 +2229,7 @@ class ShotEncoder:
         if self.metric == "xpsnr":
             return self._score_xpsnr(dist_args, ref_args, [], idx, crf)
         return self._score_vmaf(dist_args, ref_args, [], idx, crf,
-                                threads=threads)
+                                threads=threads, frames=w1 - w0)
 
     # ---- colour description of the reference, for metrics that need it ----
     # ffmpeg's colour names are not zimg's, and a wrong one is not a rounding
@@ -2272,6 +2279,21 @@ class ShotEncoder:
         self._log(f"shot {idx:05d} crf {crf} ssimulacra2={score:.3f}")
         return score
 
+    # A metric run must output the metric's video and nothing else. Without
+    # these, ffmpeg also maps the source's audio into the null output - decodes
+    # it, encodes it to pcm, and interleaves it with the scored frames in the
+    # muxer. That interleaving is a deadlock waiting for a slow video path:
+    # when the scorer lags (the SYCL backend under contention, mostly) the
+    # audio fills the mux queue, the demuxer blocks on its packet queue, the
+    # video decoder starves and framesync waits forever. Measured: a scoring
+    # that stalled at frame 56 of 120 had every thread - dav1d workers, filter
+    # threads, dec1:1:eac3, enc0:1:pcm_s16le, mux0:null - parked in
+    # futex_do_wait, none in a GPU ioctl; with -an the same pair never stalls.
+    # The one-in-a-few-hundred version of this ate the full 3600s command
+    # timeout and failed a real job. The DV paths score a video-only remux,
+    # which is why they never saw it.
+    _VIDEO_ONLY_OUTPUT = ("-an", "-sn", "-dn")
+
     def _score_xpsnr(self, dist_args: List[str], ref_args: List[str],
                      ref_vf: List[str], idx: int, crf: int) -> float:
         """ffmpeg's xpsnr filter: a dB scale, not 0-100. Weighted luma is what
@@ -2285,7 +2307,7 @@ class ShotEncoder:
                  f"[dist][ref]xpsnr=shortest=1")
         args = ([self.ffmpeg, "-hide_banner", "-y", "-loglevel", "info"]
                 + dist_args + ref_args
-                + ["-lavfi", lavfi, "-f", "null", "-"])
+                + ["-lavfi", lavfi, *self._VIDEO_ONLY_OUTPUT, "-f", "null", "-"])
         out = self._run(args, timeout=3600)
         m = re.findall(r"XPSNR\s+y:\s*([0-9.]+)", out)
         if not m:
@@ -2294,16 +2316,68 @@ class ShotEncoder:
         self._log(f"shot {idx:05d} crf {crf} xpsnr={score:.3f}dB")
         return score
 
+    # After this many SYCL scorings have had to be killed in one job, the
+    # rest of the job scores on the CPU: a GPU that keeps stalling is not
+    # going to get better, and every stall already cost a full timeout.
+    _SYCL_MAX_TIMEOUTS = 3
+
+    def _sycl_timeout(self, frames: Optional[int]) -> int:
+        """Seconds a SYCL scoring may take before it is killed and retried.
+
+        A 120-frame 4K window scores in 1-6s on the GPU, ~30s with ten
+        scorers contending. A stall never finishes at all (see
+        _VIDEO_ONLY_OUTPUT for the one that was found), so what matters is
+        that the budget is a small multiple of the honest case, not the
+        3600s the CPU path keeps: 60s plus a second per frame.
+        """
+        return 60 + max(0, int(frames or 0))
+
     def _score_vmaf(self, dist_args: List[str], ref_args: List[str],
                     ref_vf: List[str], idx: int, crf: int,
-                    threads: Optional[int] = None) -> float:
+                    threads: Optional[int] = None,
+                    frames: Optional[int] = None) -> float:
         """Score one distorted window against one reference window.
 
         Both sides arrive as ffmpeg INPUT ARGUMENTS rather than paths, because
         the two callers hand over different shapes: a probe has already written
         its distorted window to an ivf, while verification seeks into the
         finished output and the source in place. See _score_windows.
+
+        `frames` sizes the SYCL timeout; a SYCL scoring that overruns it is
+        killed and the window is scored again on the CPU, so a stalled GPU
+        costs one short wait rather than the job.
         """
+        sycl = self._sycl_device()
+        if sycl >= 0:
+            try:
+                return self._score_vmaf_on(sycl, dist_args, ref_args, ref_vf,
+                                           idx, crf, threads,
+                                           timeout=self._sycl_timeout(frames))
+            except CommandTimeout as e:
+                # Under the lock: probe workers time out concurrently, and
+                # the flip to the CPU should be announced exactly once.
+                with self._sycl_lock:
+                    self._sycl_timeouts += 1
+                    n = self._sycl_timeouts
+                    flip = n >= self._SYCL_MAX_TIMEOUTS and self._sycl_ok
+                    if flip:
+                        self._sycl_ok = False
+                logger.warning(
+                    "optimizer: SYCL scoring of shot {} crf {} did not finish "
+                    "within {}s (stall {} this job); scoring it on the CPU "
+                    "instead", idx, crf, self._sycl_timeout(frames), n)
+                self._log(f"sycl timeout shot {idx:05d} crf {crf}: {e}")
+                if flip:
+                    logger.warning(
+                        "optimizer: libvmaf SYCL device {} stalled {} times; "
+                        "the rest of this job scores on the CPU", sycl, n)
+        return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,
+                                   threads, timeout=3600)
+
+    def _score_vmaf_on(self, sycl: int, dist_args: List[str], ref_args: List[str],
+                       ref_vf: List[str], idx: int, crf: int,
+                       threads: Optional[int], timeout: int) -> float:
+        """One libvmaf run on the given backend (`sycl` < 0 = CPU)."""
         out_json = self.probe_dir / f"score_{idx:05d}_{crf}.json"
         # ts_sync_mode=nearest is NOT optional. The reference is read straight
         # from the source container while the distorted side is an ivf carrying
@@ -2332,7 +2406,6 @@ class ShotEncoder:
                     "if needed, or leave empty for default VMAF features)",
                     feats,
                 )
-        sycl = self._sycl_device()
         if sycl >= 0:
             # Deliberately WITHOUT n_threads. On the GPU the CPU threads only
             # add frame pools and synchronisation, and the cost is monotone in
@@ -2380,9 +2453,11 @@ class ShotEncoder:
                  f"[dist][ref]libvmaf={':'.join(opts)}")
         args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
                 + dist_args + ref_args
-                + ["-lavfi", lavfi, "-f", "null", "-"])
+                + ["-lavfi", lavfi, *self._VIDEO_ONLY_OUTPUT, "-f", "null", "-"])
         try:
-            self._run(args, timeout=3600)
+            self._run(args, timeout=timeout)
+        except CommandTimeout:
+            raise
         except TranscodeError as e:
             raise TranscodeError(
                 f"{e}\n"
