@@ -632,7 +632,11 @@ def save_user_settings(settings: Settings, data: Dict[str, Any]) -> None:
     existing.update(data)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+    # default=str so one un-encodable value cannot cost the caller its whole
+    # save. Callers should hand this JSON-mode data (model_dump(mode="json"));
+    # this is the guard for when they do not - a Path field added to a settings
+    # model turned every optimizer save into a 500 exactly that way.
+    tmp.write_text(json.dumps(existing, indent=2, ensure_ascii=False, default=str))
     tmp.replace(p)
 
 

@@ -218,10 +218,15 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
             params = OptimizerSettings.model_validate(merged)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(422, f"invalid optimizer settings: {e}")
-        # persist (merge keeps workers / delete_source intact)
-        config.save_user_settings(settings, {"optimizer": params.model_dump()})
+        # persist (merge keeps workers / delete_source intact).
+        # mode="json", not a plain model_dump: vszip_plugin and
+        # bestsource_plugin are Path fields, and a bare dump hands
+        # save_user_settings a PosixPath that json cannot encode - which made
+        # every save from the settings page a 500 that persisted nothing.
+        config.save_user_settings(settings,
+                                  {"optimizer": params.model_dump(mode="json")})
         settings.transcode.optimizer = params
-        logger.info("Updated optimizer settings: {}", params.model_dump())
+        logger.info("Updated optimizer settings: {}", params.model_dump(mode="json"))
         return {"ok": True, "optimizer": params.model_dump()}
 
     # ---------- safety settings (delete_source) ----------

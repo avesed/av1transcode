@@ -162,3 +162,52 @@ def test_sweep_tolerates_a_missing_work_dir(settings):
 
     settings.dirs.work = settings.dirs.work / "does" / "not" / "exist"
     assert sweep_stale_work(settings) == 0
+
+
+# --------------------------------------------- settings persistence ----
+
+def _client(settings, store, api_key=""):
+    from fastapi.testclient import TestClient
+
+    from app.api import create_app
+    from app.queue import TranscodeManager
+
+    settings.web.api_key = api_key
+    manager = TranscodeManager(settings, store)
+    return TestClient(create_app(settings, store, manager))
+
+
+def test_optimizer_settings_save_round_trips(settings, store, tmp_path):
+    """Saving from the settings page must actually persist.
+
+    OptimizerSettings carries two Path fields (vszip_plugin, bestsource_plugin)
+    and a bare model_dump() yields PosixPath, which json cannot encode - so
+    every save from the UI raised inside save_user_settings and came back a
+    500, having written nothing. Only ever exercised through the merge helper
+    before, never through the route.
+    """
+    from app.config import load_user_settings
+
+    settings.dirs.settings_file = tmp_path / "settings.json"
+    client = _client(settings, store)
+
+    r = client.put("/api/settings/optimizer", json={"probe_preset": 7})
+    assert r.status_code == 200, r.text
+    assert r.json()["optimizer"]["probe_preset"] == 7
+
+    # persisted, and in a shape load_settings can read back
+    saved = load_user_settings(settings)
+    assert saved["optimizer"]["probe_preset"] == 7
+    assert settings.transcode.optimizer.probe_preset == 7
+    assert isinstance(saved["optimizer"]["vszip_plugin"], str)
+
+
+def test_optimizer_settings_save_keeps_unposted_fields(settings, store, tmp_path):
+    """The form posts a subset; the rest must survive the save."""
+    settings.dirs.settings_file = tmp_path / "settings.json"
+    settings.transcode.optimizer.verify_shots = 3
+    client = _client(settings, store)
+
+    r = client.put("/api/settings/optimizer", json={"probe_preset": 7})
+    assert r.status_code == 200, r.text
+    assert r.json()["optimizer"]["verify_shots"] == 3
