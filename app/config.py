@@ -168,6 +168,7 @@ class OptimizerSettings(BaseModel):
     # on average (worst +12.2, some pinned to the ceiling) and the delivered-
     # vs-predicted gap went from -0.38 to -2.28, i.e. the probes became six
     # times less predictive. Change it only while watching that gap.
+    probe_max_frames: int = 120
     # Fraction of its lp a probe books against the CPU budget. 1.0 charges
     # the full lp for the task's whole life, which is what the encoding phase
     # wants - there the process really is SVT-AV1 start to finish. A probe is
@@ -189,7 +190,6 @@ class OptimizerSettings(BaseModel):
     # (many cores, little memory, or a much cheaper metric), but do not reach
     # for it expecting free throughput here. Default 1.0 is today's behaviour.
     probe_cpu_charge: float = 1.0
-    probe_max_frames: int = 120
     # libvmaf model configs. Accepts "path=/x.json", "version=NAME", or a bare
     # path (wrapped as path=...). Note: stock libvmaf <= 2.3.1 has no
     # ssimulacra2 model; a patched libvmaf or a ssimulacra2.json is required
