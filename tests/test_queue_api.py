@@ -211,3 +211,88 @@ def test_optimizer_settings_save_keeps_unposted_fields(settings, store, tmp_path
     r = client.put("/api/settings/optimizer", json={"probe_preset": 7})
     assert r.status_code == 200, r.text
     assert r.json()["optimizer"]["verify_shots"] == 3
+
+
+# ------------------------------------------------------------- API auth ----
+
+# Every mutating route, plus the one read that walks the host filesystem
+# rather than this app's own state. cancel/cancel_all/browse were the three
+# that never called _auth.
+GATED = [
+    ("post", "/api/jobs", {"json": {"path": "/nope.mkv"}}),
+    ("post", "/api/jobs/deadbeef/cancel", {}),
+    ("post", "/api/cancel", {}),
+    ("post", "/api/jobs/prune", {"json": {}}),
+    ("put", "/api/presets/x", {"json": {}}),
+    ("delete", "/api/presets/x", {}),
+    ("put", "/api/settings/workers", {"json": {"concurrency": 1}}),
+    ("put", "/api/settings/optimizer", {"json": {}}),
+    ("put", "/api/settings/delete_source", {"json": {"enabled": False}}),
+    ("get", "/api/browse", {"params": {"path": "/"}}),
+]
+
+
+@pytest.mark.parametrize("method,url,kw", GATED, ids=[g[1] for g in GATED])
+def test_gated_routes_reject_a_missing_key(settings, store, method, url, kw):
+    client = _client(settings, store, api_key="s3cret")
+    assert getattr(client, method)(url, **kw).status_code == 401
+
+
+@pytest.mark.parametrize("method,url,kw", GATED, ids=[g[1] for g in GATED])
+def test_gated_routes_reject_a_wrong_key(settings, store, method, url, kw):
+    client = _client(settings, store, api_key="s3cret")
+    r = getattr(client, method)(url, headers={"X-API-Key": "nope"}, **kw)
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("method,url,kw", GATED, ids=[g[1] for g in GATED])
+def test_gated_routes_pass_the_key_through(settings, store, method, url, kw):
+    """With the right key these must get past _auth. What they answer after
+    that is the route's own business (a 404 for a job that does not exist is a
+    pass here); only 401 means the gate rejected us."""
+    client = _client(settings, store, api_key="s3cret")
+    r = getattr(client, method)(url, headers={"X-API-Key": "s3cret"}, **kw)
+    assert r.status_code != 401
+
+
+@pytest.mark.parametrize("method,url,kw", GATED, ids=[g[1] for g in GATED])
+def test_gated_routes_stay_open_when_no_key_is_configured(settings, store,
+                                                          method, url, kw):
+    """api_key defaults to empty, and that has to keep meaning "open" - this
+    is the shipped configuration."""
+    client = _client(settings, store, api_key="")
+    assert getattr(client, method)(url, **kw).status_code != 401
+
+
+def test_reads_of_app_state_stay_open(settings, store):
+    """The status/job reads are deliberately not gated; only /api/browse is,
+    because it reads the host filesystem rather than this app's own state."""
+    client = _client(settings, store, api_key="s3cret")
+    for url in ("/api/health", "/api/status", "/api/jobs", "/api/presets",
+                "/api/workers", "/api/settings/optimizer", "/api/settings/safety"):
+        assert client.get(url).status_code == 200, url
+
+
+def test_browse_refuses_a_relative_path(settings, store):
+    client = _client(settings, store)
+    r = client.get("/api/browse", params={"path": "relative/dir"})
+    assert r.status_code == 400
+
+
+# --------------------------------------------------------------- the UI ----
+
+def test_ui_pages_send_the_api_key():
+    """Both pages must route their /api calls through the key-aware wrapper.
+
+    Neither page used to send X-API-Key at all, which made web.api_key
+    unusable: setting it locked the bundled UI out of every write rather than
+    securing anything. A bare fetch("/api/...") here is that regression.
+    """
+    static = Path(__file__).resolve().parent.parent / "app" / "static"
+    assert (static / "apikey.js").exists()
+    for page in ("index.html", "settings.html"):
+        text = (static / page).read_text()
+        assert "/static/apikey.js" in text, f"{page} does not load the helper"
+        for bad in ('fetch("/api', "fetch(`/api"):
+            assert bad not in text.replace("afetch(", ""), \
+                f"{page} calls {bad}...) without the key"

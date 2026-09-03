@@ -175,7 +175,7 @@
   <tr><td><code>transcode.hdr</code></td><td><code>preserve</code></td><td>输出保留 mastering display / CLL 元数据。</td></tr>
   <tr><td><code>transcode.optimizer</code></td><td>—</td><td>Shot-based 优化器引擎的管线参数（见上节），设置页可改并持久化。</td></tr>
   <tr><td><code>web</code></td><td><code>enabled / host / port</code></td><td>Web UI 与 API 服务。</td></tr>
-  <tr><td><code>web</code></td><td><code>api_key</code></td><td>写操作（提交任务/改预设）的 API 密钥；空 = 开放。</td></tr>
+  <tr><td><code>web</code></td><td><code>api_key</code></td><td>API 密钥，空 = 全部开放。设了之后，<b>所有写操作</b>（提交/取消任务、改预设与设置）<b>以及 <code>/api/browse</code></b> 都要求请求头 <code>X-API-Key</code>；browse 之所以也算在内，是因为它读的是宿主机文件系统而不是本程序自己的状态。网页端需在「设置 → API 密钥」里填一次，存在浏览器本地。</td></tr>
   <tr><td><code>tools</code></td><td><code>ffmpeg / ffprobe / av1an / …</code></td><td>各外部工具的可执行路径。</td></tr>
 </table>
 
@@ -197,9 +197,10 @@ python3 -m app.cli status / cancel / check</pre>
 <h2>API</h2>
 <table>
   <tr><th>方法</th><th>路径</th><th>说明</th></tr>
-  <tr><td>GET</td><td><code>/api/health /status /jobs /presets /browse /workers</code></td><td>状态、任务、预设、目录浏览、并行设置。</td></tr>
+  <tr><td>GET</td><td><code>/api/health /status /jobs /presets /workers</code></td><td>状态、任务、预设、并行设置（开放读取）。</td></tr>
+  <tr><td>GET</td><td><code>/api/browse</code></td><td>目录浏览。<b>需 api_key</b>——它遍历的是宿主机文件系统。</td></tr>
   <tr><td>POST</td><td><code>/api/jobs</code></td><td>入队：<code>{"path": "...", "preset": "balanced", "overrides": {"crf": 24}}</code>。</td></tr>
-  <tr><td>POST</td><td><code>/api/jobs/{id}/cancel</code></td><td>取消任务。</td></tr>
+  <tr><td>POST</td><td><code>/api/jobs/{id}/cancel</code></td><td>取消任务（需 api_key）。会中断在编的任务并删除其输出文件。</td></tr>
   <tr><td>PUT/DELETE</td><td><code>/api/presets/{name}</code></td><td>新增/修改 / 删除预设（写操作需 api_key）。</td></tr>
   <tr><td>PUT</td><td><code>/api/settings/workers</code></td><td>并行设置：<code>{"concurrency": 2, "av1an_workers": 4}</code>，即时生效并持久化。</td></tr>
   <tr><td>GET/PUT</td><td><code>/api/settings/optimizer</code></td><td>优化器引擎管线参数读写（持久化到 settings_file）。</td></tr>

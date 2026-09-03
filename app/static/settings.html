@@ -58,6 +58,19 @@
   </nav>
 </header>
 <main>
+  <h2>API 密钥</h2>
+  <p class="hint">仅当 config.yaml 里设置了 <code>web.api_key</code> 时才需要填。写操作（提交/取消任务、改预设与设置）和目录浏览都会校验它。密钥<b>只存在这台浏览器的 localStorage 里</b>，不会回传给服务端保存——服务端的密钥始终以 config.yaml 为准。留空 = 服务端也没设，全部开放。</p>
+  <form class="editor open" id="keyForm" style="margin-bottom:24px">
+    <div class="field">
+      <label>web.api_key</label>
+      <input type="password" id="apiKeyInput" placeholder="留空表示服务端未启用密钥" autocomplete="off">
+    </div>
+    <div class="editor-actions">
+      <button type="submit">保存到本浏览器</button>
+      <span class="hint" id="keyState" style="margin:0"></span>
+    </div>
+  </form>
+
   <h2>并行处理</h2>
   <p class="hint">同时转码的任务数（concurrency）与每个任务内部的 av1an 切片并行数（av1an_workers，0=自动吃满所有核心）。修改即时生效并持久化到 settings_file。</p>
   <form class="editor open" id="workersForm" style="margin-bottom:24px">
@@ -366,6 +379,7 @@
 
   <div id="list"></div>
 </main>
+<script src="/static/apikey.js"></script>
 <script>
 const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const $ = id => document.getElementById(id);
@@ -376,10 +390,13 @@ function showMsg(text, ok) {
   clearTimeout(msgTimer); msgTimer = setTimeout(() => { m.textContent = ""; m.className = ""; }, 4000);
 }
 async function api(url, opts) {
-  const r = await fetch(url, opts);
+  const r = await afetch(url, opts);
   if (!r.ok) {
-    let msg = `HTTP ${r.status}`;
-    try { const b = await r.json(); if (b && b.detail) msg = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch(_) {}
+    // A 401 has a specific remedy, and "HTTP 401" does not name it.
+    let msg = authHint(r.status) || `HTTP ${r.status}`;
+    if (r.status !== 401) {
+      try { const b = await r.json(); if (b && b.detail) msg = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch(_) {}
+    }
     throw new Error(msg);
   }
   return r.json();
@@ -646,6 +663,25 @@ async function presetsBuiltin(name) {
   const presets = await api("/api/presets");
   return !!(presets[name] && presets[name]._builtin);
 }
+function renderKeyState(note) {
+  // Reported in the span beside the button, not through showMsg: #msg lives
+  // down in the presets section and this form is at the top of the page, so
+  // the confirmation would land off-screen.
+  $("keyState").textContent = note || (apiKey()
+    ? "已保存（本浏览器）" : "未设置——服务端若启用了密钥，写操作会返回 401");
+}
+$("keyForm").addEventListener("submit", e => {
+  e.preventDefault();
+  setApiKey($("apiKeyInput").value.trim());
+  renderKeyState("已保存到本浏览器");
+  setTimeout(() => renderKeyState(), 3000);
+  // Everything on this page was loaded before the key existed; a save is
+  // usually someone fixing a 401, so re-run the reads that just failed.
+  loadWorkers(); loadOptimizer(); loadSafety(); loadList();
+});
+$("apiKeyInput").value = apiKey();
+renderKeyState();
+
 loadWorkers();
 loadOptimizer();
 loadSafety();

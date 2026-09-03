@@ -105,15 +105,20 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
             raise HTTPException(400, "could not enqueue (invalid path or already active)")
         return {"job_id": jid}
 
+    # Cancelling is a mutation like any other: it aborts work in flight and
+    # unlinks the output file of a job that had already finished encoding. It
+    # was the one write path that never asked for the key.
     @router.post("/jobs/{jid}/cancel")
-    def cancel_job(jid: str):
+    def cancel_job(jid: str, request: Request):
+        _auth(request)
         ok = manager.cancel(jid)
         if not ok:
             raise HTTPException(404, "job not found")
         return {"cancelled": jid}
 
     @router.post("/cancel")
-    def cancel_all():
+    def cancel_all(request: Request):
+        _auth(request)
         return {"cancelled": manager.cancel()}
 
     @router.post("/jobs/prune")
@@ -269,8 +274,13 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         items.sort(key=lambda e: (not e["dir"], e["name"].lower()))
         return items
 
+    # Keyed even though it is a GET. The other reads here return this app's own
+    # state; this one walks the HOST filesystem from any absolute path, so with
+    # the container's mounts it enumerates the media library and everything
+    # else the process can see. That is not the same kind of read.
     @router.get("/browse")
-    def browse(path: str = "/"):
+    def browse(request: Request, path: str = "/"):
+        _auth(request)
         p = Path(path)
         if not p.is_absolute():
             raise HTTPException(400, "path must be absolute")

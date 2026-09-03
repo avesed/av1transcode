@@ -124,6 +124,7 @@
   </table>
   <div class="empty" id="empty" style="display:none">暂无任务</div>
 </main>
+<script src="/static/apikey.js"></script>
 <script>
 const fmt = n => { if (n==null) return "–"; const u=["B","KB","MB","GB","TB"]; let i=0;
   while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
@@ -150,7 +151,7 @@ function liveStats(j) {
 }
 async function loadPresets() {
   try {
-    const r = await fetch("/api/presets").then(r=>r.json());
+    const r = await afetch("/api/presets").then(r=>r.json());
     presetsMap = r;
     const sel = document.getElementById("preset");
     const names = Object.keys(r);
@@ -199,8 +200,8 @@ syncEngine();
 let statusFilter = "all";
 async function refresh() {
   const [s, jobs] = await Promise.all([
-    fetch("/api/status").then(r=>r.json()),
-    fetch("/api/jobs?status="+(statusFilter==="all"?"":statusFilter)+"&limit=100").then(r=>r.json()),
+    afetch("/api/status").then(r=>r.json()),
+    afetch("/api/jobs?status="+(statusFilter==="all"?"":statusFilter)+"&limit=100").then(r=>r.json()),
   ]);
   document.getElementById("sysinfo").textContent =
     `队列 ${s.queue_len} · worker ${s.workers_running?"运行中":"停止"}`;
@@ -267,7 +268,7 @@ document.getElementById("submit").addEventListener("submit", async e => {
       err.style.display = "block"; return;
     }
   }
-  const r = await fetch("/api/jobs", { method:"POST",
+  const r = await afetch("/api/jobs", { method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({path, preset, overrides}) });
   if (!r.ok) {
@@ -281,7 +282,13 @@ document.getElementById("submit").addEventListener("submit", async e => {
 document.getElementById("jobs").addEventListener("click", async e => {
   const btn = e.target.closest("button[data-id]");
   const logBtn = e.target.closest("button[data-log]");
-  if (btn) { await fetch(`/api/jobs/${btn.dataset.id}/cancel`, {method:"POST"}); refresh(); }
+  if (btn) {
+    const r = await afetch(`/api/jobs/${btn.dataset.id}/cancel`, {method:"POST"});
+    // Cancel used to be fire-and-forget. Now that it is keyed, a silent
+    // no-op would look exactly like a job that refused to stop.
+    if (!r.ok) alert(authHint(r.status) || `取消失败 (HTTP ${r.status})`);
+    refresh();
+  }
   if (logBtn) { window.open(`/api/jobs/${logBtn.dataset.log}/log`, "_blank"); }
 });
 // ---- directory browser ----
@@ -298,8 +305,16 @@ async function openBrowser(path) {
 }
 async function renderBrowse() {
   let d;
-  try { d = await fetch("/api/browse?path="+encodeURIComponent(curPath)).then(r=>{ if(!r.ok) throw 0; return r.json(); }); }
-  catch(_) { bpath.textContent = "无法读取 " + curPath; btree.innerHTML = `<div class="empty">读取失败</div>`; return; }
+  try {
+    d = await afetch("/api/browse?path="+encodeURIComponent(curPath)).then(r=>{
+      if (!r.ok) throw new Error(authHint(r.status) || `读取失败 (HTTP ${r.status})`);
+      return r.json();
+    });
+  } catch(e) {
+    bpath.textContent = "无法读取 " + curPath;
+    btree.innerHTML = `<div class="empty">${esc(e.message || "读取失败")}</div>`;
+    return;
+  }
   bpath.textContent = d.path;
   let html = "";
   if (d.parent) html += `<div class="brow d" data-dir="${esc(d.parent)}"><span class="ico">↑</span>..</div>`;
@@ -329,7 +344,7 @@ document.getElementById("statusFilter").addEventListener("change", e => { status
 document.getElementById("pruneBtn").addEventListener("click", async () => {
   if (!confirm("删除所有已结束（完成/失败/取消/跳过）的任务记录？此操作不可恢复。")) return;
   try {
-    const r = await fetch("/api/jobs/prune", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+    const r = await afetch("/api/jobs/prune", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     refresh();
   } catch(err) { alert("清除失败: " + err.message); }
