@@ -268,6 +268,29 @@ def test_deleting_a_user_preset_re_derives_from_the_builtin(settings, store):
     assert settings.transcode.video.crf == builtin_crf
 
 
+def test_av1an_is_given_the_presets_own_extra_split_sec(settings, monkeypatch):
+    """Every other flag build_av1an_cmd emits comes from the preset it was
+    handed; extra_split_sec read the global transcode.video instead, so a
+    preset could not set it at all - every preset got the default preset's."""
+    from app import transcoder
+
+    monkeypatch.setattr(transcoder.Settings, "tool_path",
+                        lambda self, n: f"/usr/bin/{n}")
+    settings.transcode.video.extra_split_sec = 60
+    video = settings.transcode.presets["quality"].model_copy(
+        update={"extra_split_sec": 77})
+
+    cmd = transcoder.build_av1an_cmd(settings, video, Path("/in.mkv"),
+                                     Path("/out.mkv"), Path("/tmp"))
+    assert cmd[cmd.index("--extra-split-sec") + 1] == "77"
+
+    # and a preset that turns it off must actually turn it off
+    off = video.model_copy(update={"extra_split_sec": 0})
+    cmd = transcoder.build_av1an_cmd(settings, off, Path("/in.mkv"),
+                                     Path("/out.mkv"), Path("/tmp"))
+    assert "--extra-split-sec" not in cmd
+
+
 # ------------------------------------------------------------- API auth ----
 
 # Every mutating route, plus the one read that walks the host filesystem

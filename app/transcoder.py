@@ -98,8 +98,12 @@ def build_av1an_cmd(
             cmd += ["--probe-video-params", _to_svt_flags(video.probe_video_params)]
     if workers:
         cmd += ["--workers", str(workers)]
-    if settings.transcode.video.extra_split_sec:
-        cmd += ["--extra-split-sec", str(settings.transcode.video.extra_split_sec)]
+    # `video`, not settings.transcode.video: every other flag here comes from
+    # the preset this job was given, and reading the global one meant a
+    # preset's own extra_split_sec was never applied - the default preset's
+    # value was used for every preset.
+    if video.extra_split_sec:
+        cmd += ["--extra-split-sec", str(video.extra_split_sec)]
     if scenes:
         cmd += ["--scenes", scenes]
     if video.passes > 1:
