@@ -546,6 +546,50 @@ def run_full_transcode(
         _cleanup_temp(tmp_files, keep=settings.transcode.keep_temp)
 
 
+# What run_full_transcode creates under dirs.work. A sweep only ever removes
+# these patterns: dirs.work is a directory the operator configured and may well
+# hold things this program did not put there.
+_WORK_ARTEFACTS = ("av1an_*", "*.dv_p5.mkv", "*.dv_bl.mkv")
+
+
+def sweep_stale_work(settings: Settings) -> int:
+    """Remove working files a job left behind by never reaching its `finally`.
+
+    _cleanup_temp runs in a finally, which covers a job that fails or is
+    cancelled but NOT a process that is killed outright - a container restart,
+    an OOM kill, a SIGKILL. Everything abandoned that way is source-sized or
+    larger (the per-shot encodes of a 4K feature run to tens of GB, a lossless
+    P5 convert to ~100GB), and nothing ever looks at dirs.work again, so the
+    only thing that noticed was the disk filling up.
+
+    Called once at startup, before any worker thread exists, so nothing matched
+    here can be a tempdir a live job is still writing into. That ordering IS
+    the safety argument, and it only holds for one scheduler per dirs.work:
+    do not move this into a periodic loop, and do not point two running
+    instances at the same work directory, without first giving this a way to
+    tell a live job's tempdir from an abandoned one.
+    """
+    if settings.transcode.keep_temp:
+        return 0
+    work = settings.dirs.work
+    if not work.is_dir():
+        return 0
+    removed = 0
+    for pattern in _WORK_ARTEFACTS:
+        for path in sorted(work.glob(pattern)):
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError as e:  # noqa: PERF203
+                logger.warning("could not remove stale work file {}: {}", path, e)
+                continue
+            removed += 1
+            logger.info("Removed {} left by an interrupted job", path)
+    return removed
+
+
 def _cleanup_temp(tmp_files: List[Path], keep: bool) -> None:
     """Remove the working files of a finished (or failed) job.
 

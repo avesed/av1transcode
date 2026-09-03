@@ -111,3 +111,54 @@ def test_enqueue_allows_a_requeue_once_the_job_is_done(settings, store, tmp_path
 
     second = manager.enqueue_file(str(src))
     assert second is not None and second != first
+
+
+# ------------------------------------------------------- work-dir sweep ----
+
+def test_sweep_removes_what_an_interrupted_job_left(settings):
+    """_cleanup_temp runs in a finally, which a SIGKILL never reaches."""
+    from app.transcoder import sweep_stale_work
+
+    work = settings.dirs.work
+    stale_dir = work / "av1an_1234567890"
+    (stale_dir / "probes").mkdir(parents=True)
+    (stale_dir / "probes" / "enc_00000.ivf").write_bytes(b"x" * 32)
+    (work / "Some Movie.dv_p5.mkv").write_bytes(b"x" * 32)
+    (work / "Some Movie.dv_bl.mkv").write_bytes(b"x" * 32)
+
+    assert sweep_stale_work(settings) == 3
+    assert not stale_dir.exists()
+    assert not (work / "Some Movie.dv_p5.mkv").exists()
+    assert not (work / "Some Movie.dv_bl.mkv").exists()
+
+
+def test_sweep_leaves_everything_else_alone(settings):
+    """dirs.work is operator-configured and may hold things we did not put
+    there, so the sweep matches only the names this program creates."""
+    from app.transcoder import sweep_stale_work
+
+    work = settings.dirs.work
+    (work / "notes.txt").write_text("keep me")
+    (work / "av1an").mkdir()               # no trailing id: not one of ours
+    (work / "holiday.mkv").write_bytes(b"x")
+
+    assert sweep_stale_work(settings) == 0
+    assert (work / "notes.txt").exists()
+    assert (work / "av1an").is_dir()
+    assert (work / "holiday.mkv").exists()
+
+
+def test_sweep_honours_keep_temp(settings):
+    from app.transcoder import sweep_stale_work
+
+    (settings.dirs.work / "av1an_42").mkdir()
+    settings.transcode.keep_temp = True
+    assert sweep_stale_work(settings) == 0
+    assert (settings.dirs.work / "av1an_42").is_dir()
+
+
+def test_sweep_tolerates_a_missing_work_dir(settings):
+    from app.transcoder import sweep_stale_work
+
+    settings.dirs.work = settings.dirs.work / "does" / "not" / "exist"
+    assert sweep_stale_work(settings) == 0

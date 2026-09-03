@@ -41,6 +41,18 @@ def run(
     store = db.JobStore(settings)
     manager = TranscodeManager(settings, store)
 
+    # Reclaim what a killed process could not: this runs before manager.start(),
+    # so every temp tree still on disk belongs to a job that is already over.
+    from app.transcoder import sweep_stale_work
+
+    try:
+        n = sweep_stale_work(settings)
+        if n:
+            logger.info("Reclaimed {} stale work file(s)/dir(s) from {}",
+                        n, settings.dirs.work)
+    except OSError as e:
+        logger.warning("stale work sweep failed: {}", e)
+
     # prune old job logs at startup and periodically
     try:
         n = cleanup_old_job_logs(settings)
