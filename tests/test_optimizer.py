@@ -2586,6 +2586,24 @@ def test_ffmpeg_mux_fallback_delays_the_video_too(settings, info, plan, tmp_path
     assert final[i + 2] == "-i" and final[i + 3].endswith("video_only.mkv")
 
 
+def test_audio_detection_survives_ffprobes_trailing_csv_fields(settings, info, plan, tmp_path):
+    """An eac3 track in an mp4 carries "Audio Service Type" side data, and
+    ffprobe's csv then prints the stream as "audio," - which used to read as
+    no audio at all: the mux went video-only and the output check failed the
+    job. Measured on every ATVP/DSNP mp4 tried."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._run = (lambda self, args, timeout=None: "video,\naudio,\naudio,\n").__get__(enc)
+    assert enc._has_audio_or_subs("x.mp4") is True
+    enc._run = (lambda self, args, timeout=None: "video,\n").__get__(enc)
+    assert enc._has_audio_or_subs("x.mp4") is False
+
+
+def test_subtitle_codecs_survive_trailing_csv_fields_too(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._run = (lambda self, args, timeout=None: "mov_text,\nhdmv_pgs_subtitle\n").__get__(enc)
+    assert enc._subtitle_codec_args("x.mp4") == ["-c:s:0", "srt", "-c:s:1", "copy"]
+
+
 def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,
                                             monkeypatch):
     enc = make_encoder(settings, info, plan, tmp_path)

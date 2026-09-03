@@ -104,6 +104,20 @@ def pick_crf(samples: List[Tuple[int, float]], target: float) -> float:
     return float(min(pts, key=lambda p: abs(p[1] - target))[0])
 
 
+def _csv_first(line: str) -> str:
+    """The first field of one ffprobe `-of csv=p=0` line.
+
+    ffprobe prints a stream's child sections as extra fields even when only
+    one entry was asked for, so a stream with side data comes out as
+    "audio," rather than "audio". Every eac3 track in an mp4 carries an
+    "Audio Service Type" side data, so on the ATVP and DSNP WEB-DLs this
+    library is made of, `stream=codec_type` reads "video," "audio," - and a
+    membership test against "audio" said the file had no audio, the mux ran
+    video-only, and the output check failed every one of those jobs.
+    """
+    return line.split(",", 1)[0].strip()
+
+
 def concat_quote(path: Path) -> str:
     """`path` as one field of an ffmpeg concat demuxer list.
 
@@ -2947,7 +2961,7 @@ class ShotEncoder:
         except TranscodeError as e:
             logger.warning("could not probe subtitle codecs ({}); copying", e)
             return ["-c:s", "copy"]
-        codecs = [c.strip() for c in out.splitlines() if c.strip()]
+        codecs = [_csv_first(c) for c in out.splitlines() if _csv_first(c)]
         if not codecs:
             return ["-c:s", "copy"]
         args: List[str] = []
@@ -3057,7 +3071,7 @@ class ShotEncoder:
             logger.warning("could not probe {} for audio/subtitle streams ({}); "
                            "assuming there are some", Path(source).name, e)
             return True
-        kinds = {line.strip() for line in out.splitlines()}
+        kinds = {_csv_first(line) for line in out.splitlines()}
         return bool(kinds & {"audio", "subtitle"})
 
     def _mux_lead(self, audio_subs: Optional[Path]) -> float:
