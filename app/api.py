@@ -154,8 +154,12 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         user[name] = params
         config.save_user_presets(settings, user)
         settings.transcode.presets[name] = params
+        # transcode.video is derived from the default preset, so editing THAT
+        # preset has to re-derive it or preset="custom" keeps starting from the
+        # values this call just replaced.
+        config.apply_default_preset(settings)
         logger.info("Saved user preset '{}'", name)
-        return {"name": name, "params": params.model_dump(),
+        return {"name": name, "params": params.model_dump(mode="json"),
                 "_builtin": name in settings.transcode.builtin_presets}
 
     @router.delete("/presets/{name}")
@@ -169,6 +173,7 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         # restore builtin definition if one exists
         if name in settings.transcode.builtin_presets:
             settings.transcode.presets[name] = settings.transcode.builtin_presets[name]
+        config.apply_default_preset(settings)
         logger.info("Deleted preset '{}' (had user override: {})", name, removed is not None)
         return {"deleted": name}
 

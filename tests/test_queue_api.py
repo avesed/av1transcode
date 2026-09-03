@@ -35,6 +35,8 @@ def settings(tmp_path):
     s.dirs.db = tmp_path / "jobs.db"
     s.dirs.work = tmp_path / "work"
     s.dirs.work.mkdir()
+    s.dirs.presets_file = tmp_path / "presets.json"
+    s.dirs.settings_file = tmp_path / "settings.json"
     return s
 
 
@@ -211,6 +213,59 @@ def test_optimizer_settings_save_keeps_unposted_fields(settings, store, tmp_path
     r = client.put("/api/settings/optimizer", json={"probe_preset": 7})
     assert r.status_code == 200, r.text
     assert r.json()["optimizer"]["verify_shots"] == 3
+
+
+# ------------------------------------------------ derived config values ----
+
+def _settings_with_user_preset(monkeypatch, tmp_path, name, **fields):
+    """load_settings() with a user preset already on disk, i.e. what a restart
+    sees after someone edited a preset in the web UI."""
+    import json
+
+    from app.config import VideoParams
+
+    pf = tmp_path / "presets.json"
+    pf.write_text(json.dumps({name: VideoParams(**fields).model_dump(mode="json")}))
+    monkeypatch.setenv("AV1TC_DIRS_PRESETS_FILE", str(pf))
+    monkeypatch.setenv("AV1TC_DIRS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    return load_settings()
+
+
+def test_a_user_edited_default_preset_reaches_transcode_video(monkeypatch, tmp_path):
+    """transcode.video is what preset="custom" starts from, and it is derived
+    from the default preset. It used to be derived BEFORE user presets were
+    applied, so editing the default preset left it on config.yaml's values and
+    a restart did not help."""
+    s = _settings_with_user_preset(monkeypatch, tmp_path, "balanced",
+                                   crf=19, preset=2)
+    assert s.transcode.default_preset == "balanced"
+    assert s.transcode.presets["balanced"].crf == 19
+    assert s.transcode.video.crf == 19
+    assert s.transcode.video.preset == 2
+
+
+def test_the_builtin_snapshot_survives_a_user_override(monkeypatch, tmp_path):
+    """builtin_presets is what `_builtin` reports and what deleting a user
+    preset restores, so it must stay config.yaml's version."""
+    s = _settings_with_user_preset(monkeypatch, tmp_path, "balanced", crf=19)
+    assert s.transcode.builtin_presets["balanced"].crf != 19
+
+
+def test_editing_the_default_preset_is_live_without_a_restart(settings, store):
+    client = _client(settings, store)
+    assert settings.transcode.default_preset == "balanced"
+    assert settings.transcode.video.crf != 19
+    assert client.put("/api/presets/balanced",
+                      json={"crf": 19, "preset": 2}).status_code == 200
+    assert settings.transcode.video.crf == 19
+
+
+def test_deleting_a_user_preset_re_derives_from_the_builtin(settings, store):
+    client = _client(settings, store)
+    builtin_crf = settings.transcode.builtin_presets["balanced"].crf
+    client.put("/api/presets/balanced", json={"crf": 19})
+    client.delete("/api/presets/balanced")
+    assert settings.transcode.video.crf == builtin_crf
 
 
 # ------------------------------------------------------------- API auth ----

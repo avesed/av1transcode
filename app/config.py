@@ -555,6 +555,29 @@ def _merge_env(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def apply_default_preset(settings: Settings) -> None:
+    """Point transcode.video at whatever the default preset currently holds.
+
+    transcode.video is the parameter set a job gets when no preset supplies
+    one - most visibly preset="custom", which starts from it and applies the
+    custom overrides on top.
+
+    It used to be snapshotted from the default preset BEFORE user presets were
+    loaded, so editing the default preset in the web UI updated
+    transcode.presets[name] and left transcode.video on config.yaml's values.
+    Measured: saving crf=19/preset=2 onto "balanced" (the default preset) and
+    reloading gave presets["balanced"].crf == 19 and transcode.video.crf == 28.
+    A restart did not help, because the order was wrong in load_settings rather
+    than merely stale in memory.
+
+    Called again by the preset write/delete routes so the live object tracks an
+    edit without waiting for one.
+    """
+    name = settings.transcode.default_preset
+    if name in settings.transcode.presets:
+        settings.transcode.video = settings.transcode.presets[name].model_copy(deep=True)
+
+
 def load_settings(config_path: Optional[Path] = None) -> Settings:
     path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     cfg = _load_config_dict(path)
@@ -566,15 +589,17 @@ def load_settings(config_path: Optional[Path] = None) -> Settings:
     for name in ("balanced", "quality", "compact"):
         if name not in presets:
             presets[name] = default_video.model_copy(deep=True)
-    if settings.transcode.default_preset in presets:
-        settings.transcode.video = presets[settings.transcode.default_preset].model_copy(deep=True)
-    # Snapshot builtin presets, then apply user presets (web UI persisted).
+    # Snapshot builtin presets BEFORE the user's overrides land on them - that
+    # snapshot is what `_builtin` reports and what deleting a user preset
+    # restores, so it has to be config.yaml's version.
     settings.transcode.builtin_presets = {
         name: v.model_copy(deep=True) for name, v in presets.items()
     }
     user = load_user_presets(settings)
     for name, params in user.items():
         presets[name] = params
+    # ...and derive transcode.video only AFTER them. See apply_default_preset.
+    apply_default_preset(settings)
     # Apply user workers settings (persisted by the web UI)
     usettings = load_user_settings(settings)
     user_workers = usettings.get("workers") or {}
