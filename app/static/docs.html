@@ -107,7 +107,7 @@
 <h2>Shot-based 优化器引擎（engine=optimizer）</h2>
 <p>Netflix 风格的逐镜头（shot-based）编码。av1an 的 <code>--target-quality</code> 是<b>串行</b>探测：先完整探测完一个 chunk 再探测下一个。optimizer 引擎改为<b>所有镜头并行探测</b>，并用插值获得比 av1an 4 次二分更精细的每镜头 CRF：</p>
 <ol>
-  <li><b>分镜</b>：PySceneDetect ContentDetector 把源切成若干镜头（shot）。</li>
+  <li><b>分镜</b>：默认用 ffmpeg 的 <code>scdet</code> 滤镜单趟扫描源，不落任何中间文件（<code>scenedetect_engine: scdet</code>）。实测对三个 4K 源，切点与旧的 PySceneDetect 路径一处完全一致、另两处各多一个；整个阶段从 44.7s / 255s CPU 降到 12.2s / 8s。<code>scenedetect_engine: pyscenedetect</code> 可切回旧路径（写一份降采样副本再用 OpenCV 逐帧读）。</li>
   <li><b>并行探测</b>：用 <code>probe_workers</code> 个 worker 同时探测每个镜头的一串 CRF（<code>probe_crfs</code>），每个探测点按<b>源分辨率、源位深、与正式编码相同的编码参数</b>（仅 preset 更快）编码，再算 VMAF/SSIMULACRA2。送进 libvmaf 前两路统一缩到 <code>vmaf_width</code>（默认 1920，只缩不放、保持比例），因为 vmaf_v0.6.1 是按 1080p 训练的。镜头过长时按 <code>probe_max_frames</code> 取中间一段<b>连续</b>帧。</li>
   <li><b>选 CRF</b>：对每个镜头在 (CRF, 分数) 曲线上插值，取命中 <code>target_quality</code> 下限的 CRF（区间超出探测范围时钳制到边界）。</li>
   <li><b>并行编码</b>：所有镜头按各自 CRF 并行正式编码，最后拼接并重新复用源音频/字幕。</li>
@@ -146,7 +146,7 @@
 <h2>Dolby Vision / HDR</h2>
 <table>
   <tr><th>来源</th><th>处理</th></tr>
-  <tr><td>P5（ICtCp）</td><td>libplacebo（Vulkan）转 HDR10 BT.2020+PQ；zscale 为近似备用方案。</td></tr>
+  <tr><td>P5（ICtCp）</td><td>libplacebo（Vulkan）转 HDR10 BT.2020+PQ。它是 ffmpeg 里唯一能<b>应用</b> RPU 的滤镜，没有备用方案（旧的 zscale 已退役）。</td></tr>
   <tr><td>P7 / P8</td><td>剥离 RPU/EL 后编码基底层；RPU 单独保存为 <code>.rpu.bin</code>。</td></tr>
   <tr><td>HDR10 / HLG</td><td>保留 mastering display / CLL 元数据（hdr.preserve）原样编码。</td></tr>
   <tr><td>SDR</td><td>BT.709 直接编码。</td></tr>
@@ -171,7 +171,7 @@
   <tr><td><code>transcode</code></td><td><code>skip_existing_av1 / min_height_to_transcode</code></td><td>已是 AV1 且分辨率 ≥ 阈值时跳过；阈值 0 = 永不跳过。</td></tr>
   <tr><td><code>transcode</code></td><td><code>keep_temp / delete_source</code></td><td>保留 av1an 临时文件 / 成功后删除源文件。</td></tr>
   <tr><td><code>transcode.dovi</code></td><td><code>enabled / save_rpu</code></td><td>DV 转换开关 / 是否把 RPU 另存为 <code>.rpu.bin</code>。P7·P8 送进编码器前一律剥掉 DV 层，没有开关。</td></tr>
-  <tr><td><code>transcode.dovi</code></td><td><code>p5_method</code></td><td><code>libplacebo</code>（准确，需 Vulkan）或 <code>zscale</code>（近似，纯软件）。</td></tr>
+  <tr><td><code>transcode.dovi</code></td><td><code>p5_method</code></td><td>只有 <code>libplacebo</code>（它是 ffmpeg 里唯一能<b>应用</b> DV RPU 的滤镜，需 Vulkan）。旧的 <code>zscale</code> 已退役——那条链路把 bt2020/PQ 转成 bt2020/PQ，等于只给 ICtCp 信号换了个标签而没做转换，而且 zscale 也没编进本镜像的 ffmpeg。配置里写 zscale 仍会被接受，但会记一条警告并按 libplacebo 处理。</td></tr>
   <tr><td><code>transcode.hdr</code></td><td><code>preserve</code></td><td>输出保留 mastering display / CLL 元数据。</td></tr>
   <tr><td><code>transcode.optimizer</code></td><td>—</td><td>Shot-based 优化器引擎的管线参数（见上节），设置页可改并持久化。</td></tr>
   <tr><td><code>web</code></td><td><code>enabled / host / port</code></td><td>Web UI 与 API 服务。</td></tr>

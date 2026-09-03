@@ -25,7 +25,7 @@
 | 队列 | 内置多 worker 线程池 + SQLite（WAL），无需 Redis |
 | 转码 | av1an + SVT-AV1 v4.2 (SvtAv1EncApp) + ffmpeg v9 |
 | DV | dovi_tool (RPU提取) + ffmpeg 内建 dovi_split/dovi_rpu BSF + libplacebo |
-| 容器 | Debian + Docker multi-stage 编译 |
+| 容器 | Ubuntu 24.04 + Docker multi-stage 编译（10 个构建阶段；dovi_tool 那一阶段用 rust:1-bookworm）|
 
 ## 运行方式
 
@@ -81,7 +81,9 @@ python -m pytest tests/
 | balanced | 28 | 4 | 存档平衡（默认） |
 | compact | 34 | 6 | 文件更小（略损） |
 
-其他常用配置：`transcode.video.film_grain`（胶片类内容 8-10）、`transcode.dovi.p5_method`（libplacebo/zscale）、`workers.concurrency`、`workers.av1an_workers`（0=auto）。
+其他常用配置：`transcode.video.film_grain`（胶片类内容 8-10）、`workers.concurrency`、`workers.av1an_workers`（0=auto）。
+
+Web 界面的写操作（提交/取消任务、改预设与设置）和目录浏览受 `web.api_key` 保护；设了之后需在「设置 → API 密钥」里填一次，密钥只存在浏览器本地。空值（默认）= 全部开放。
 
 ## 已核实的技术要点
 
