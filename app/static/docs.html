@@ -170,7 +170,7 @@
   <tr><td><code>transcode</code></td><td><code>default_preset</code></td><td>未指定预设时的默认值。</td></tr>
   <tr><td><code>transcode</code></td><td><code>skip_existing_av1 / min_height_to_transcode</code></td><td>已是 AV1 且分辨率 ≥ 阈值时跳过；阈值 0 = 永不跳过。</td></tr>
   <tr><td><code>transcode</code></td><td><code>keep_temp / delete_source</code></td><td>保留 av1an 临时文件 / 成功后删除源文件。</td></tr>
-  <tr><td><code>transcode.dovi</code></td><td><code>enabled / save_rpu / strip_rpu</code></td><td>DV 转换开关 / 是否保存 RPU / P7·P8 剥离 RPU。</td></tr>
+  <tr><td><code>transcode.dovi</code></td><td><code>enabled / save_rpu</code></td><td>DV 转换开关 / 是否把 RPU 另存为 <code>.rpu.bin</code>。P7·P8 送进编码器前一律剥掉 DV 层，没有开关。</td></tr>
   <tr><td><code>transcode.dovi</code></td><td><code>p5_method</code></td><td><code>libplacebo</code>（准确，需 Vulkan）或 <code>zscale</code>（近似，纯软件）。</td></tr>
   <tr><td><code>transcode.hdr</code></td><td><code>preserve</code></td><td>输出保留 mastering display / CLL 元数据。</td></tr>
   <tr><td><code>transcode.optimizer</code></td><td>—</td><td>Shot-based 优化器引擎的管线参数（见上节），设置页可改并持久化。</td></tr>

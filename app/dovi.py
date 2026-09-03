@@ -122,16 +122,24 @@ def convert_p5_to_hdr10(settings: Settings, source: str, out: str,
     return str(out)
 
 
-def strip_dv_from_hevc(settings: Settings, source: str, out: str,
-                       keep_el: bool = False) -> Optional[str]:
-    """For P7/P8: copy the BL (or BL+RPU) to a plain HEVC file without DV layers.
+def strip_dv_from_hevc(settings: Settings, source: str, out: str) -> Optional[str]:
+    """For P7/P8: copy the base layer to a plain HEVC file without DV layers.
 
-    - P7: uses dovi_split bitstream filter (base/bl_rpu).
-    - P8: uses dovi_rpu strip filter to drop RPU while keeping HDR10 video.
+    One path for both profiles: `dovi_split=bl` keeps the base layer and drops
+    the enhancement layer and the RPU. The BL is already HDR10, so what comes
+    out is a valid HDR10 stream the encoder can read, and the RPU is preserved
+    separately by extract_rpu rather than in this file.
+
+    The docstring here used to claim P8 went through the `dovi_rpu` strip
+    filter instead. It never did - there has only ever been the one branch -
+    and the other branch that did exist (`dovi_split=bl_rpu`, behind a
+    `keep_el` parameter that also named the wrong layer: bl_rpu keeps the RPU,
+    not the EL) had no caller. Both are gone; this describes what runs.
+
     Returns the interim HEVC path or None.
     """
     ffmpeg = settings.tool_path("ffmpeg")
-    bsf = "dovi_split=bl_rpu" if keep_el else "dovi_split=bl"
+    bsf = "dovi_split=bl"
     if Path(out).exists():
         Path(out).unlink()
     cmd = [

@@ -79,7 +79,11 @@ transcode:
                                # 空=自动：有 GPU 用 GPU，没有退回 llvmpipe 软件渲染
     p5_cache_dir: /dev/shm     # optimizer 引擎逐镜头转换的分片存放处(tmpfs=不落盘)。
                                # 放不下的镜头自动退回 dirs.work
-    strip_rpu: true            # strip RPU/EL from P7/P8 streams before encode
+    # 这里没有 strip_rpu 开关。P7/P8 源在送进编码器前一律剥掉 DV 层，
+    # RPU 由 save_rpu 单独另存。曾经有个 strip_rpu 字段写在这里、也写在
+    # 文档里，但代码从来没读过它；选择删掉而不是接上，因为接上会改变
+    # 那些已经设了 strip_rpu: false 并（正确地）观察到毫无影响的人的行为。
+    # 旧配置里留着这一行也没关系，未知键会被忽略。
 
   # Netflix-style shot-based encoding engine (select per preset via
   # VideoParams.engine = "optimizer"). Uses PySceneDetect for shot detection,

@@ -378,8 +378,14 @@ class DolbyVision(BaseModel):
     # passed into the container and falls back to Mesa's llvmpipe software
     # renderer when there is none. Pin it to "llvmpipe" only to force software.
     vulkan_device: str = ""
-    # For Profile 7/8: strip RPU/EL from the stream fed to the encoder.
-    strip_rpu: bool = True
+    # NB there is no strip_rpu knob. Profile 7/8 sources always have their DV
+    # layers stripped before the encoder sees them (dovi.strip_dv_from_hevc),
+    # and the RPU is saved separately when save_rpu is set. A `strip_rpu` field
+    # sat here for a long time, documented in config.yaml, read by nothing at
+    # all; it was removed rather than wired up, because wiring it would have
+    # changed the pipeline for anyone who had already set it to false and
+    # (correctly) observed no effect. Unknown keys are ignored, so an existing
+    # config.yaml carrying it still loads.
 
     @field_validator("p5_method", mode="before")
     @classmethod
