@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source);
 """
 
 # statuses
@@ -184,6 +185,32 @@ class JobStore:
         with self._cursor() as cur:
             cur.execute(q, args)
             return [dict(r) for r in cur.fetchall()]
+
+    def find_active(self, source: str) -> Optional[str]:
+        """Id of the active (pending/analyzing/running) job for `source`, if any.
+
+        A targeted query rather than a scan of whatever list() returns. The
+        caller is de-duplication, and list() defaults to the 100 NEWEST jobs -
+        so once the queue was longer than that, the oldest pending jobs were
+        invisible to it and the same file could be enqueued twice.
+
+        That is not a corner case: a restart resets every running/analyzing job
+        to pending (see reset_interrupted) and the watcher's in-memory seen-set
+        starts empty, so the next scan re-submits the whole input directory.
+        Any library with more than 100 files waiting therefore duplicated its
+        tail on every restart - two jobs encoding the same source to the same
+        output path, and with delete_source the second one failing its analysis
+        because the first had already removed the file.
+        """
+        ph = ",".join("?" * len(ACTIVE))
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT id FROM jobs WHERE source=? AND status IN ({ph}) "
+                "ORDER BY created_at ASC LIMIT 1",
+                (source, *ACTIVE),
+            )
+            row = cur.fetchone()
+            return row["id"] if row else None
 
     def next_pending(self) -> Optional[str]:
         """Atomically claim the oldest pending job (sets it analyzing) so

@@ -12,8 +12,6 @@ from app import db, decisions
 from app.config import Settings
 from app.transcoder import run_full_transcode
 
-ACTIVE = db.ACTIVE
-
 
 class TranscodeManager:
     """Owns the job queue, spawns worker threads, tracks status in DB."""
@@ -91,11 +89,13 @@ class TranscodeManager:
         return p.is_file() and p.suffix.lower().lstrip(".") in self.settings.watcher.extensions
 
     def _enqueue_single(self, src: Path, preset: str, overrides: Optional[dict] = None) -> Optional[str]:
-        # de-duplicate: only one active job per source
-        for existing in self.store.list(status=None):
-            if existing["source"] == str(src) and existing["status"] in ACTIVE:
-                logger.info("File already queued/active: {}", src)
-                return existing["id"]
+        # de-duplicate: only one active job per source. Asked of the DB rather
+        # than filtered out of a page of recent jobs - see JobStore.find_active
+        # for what the paged version silently missed.
+        existing = self.store.find_active(str(src))
+        if existing:
+            logger.info("File already queued/active: {}", src)
+            return existing
         jid = self.store.create(
             source=str(src), preset=preset or self.settings.transcode.default_preset,
             overrides=overrides,
