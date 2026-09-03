@@ -32,7 +32,13 @@ class FileWatcher:
         self.submit = submit
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._pending: set[str] = set()
+        # Paths this process has already handed to submit(). In-process only;
+        # the durable answer to "have we seen this file" is the job table, via
+        # TranscodeManager.enqueue_new_file.
+        self._submitted: set[str] = set()
+        # Last (size, mtime) each candidate was seen with, so the next scan can
+        # be the second observation instead of a sleep. See _maybe_submit.
+        self._last_seen: dict[str, tuple[int, float]] = {}
         self._lock = threading.Lock()
         try:
             from watchdog.observers import Observer
@@ -93,24 +99,42 @@ class FileWatcher:
         return results
 
     def _maybe_submit(self, p: Path) -> None:
-        try:
-            if p.stat().st_size < self.settings.watcher.min_size_mb * 1024 * 1024:
-                return
-        except OSError:
-            return
+        """Submit `p` once it has stopped changing.
+
+        Stability is two observations that agree, and the second one is the
+        NEXT scan rather than a sleep inside this call. The old version slept
+        two seconds between its two stats, with the scan loop blocked behind
+        it - one file at a time, so a batch of fifty cost a hundred seconds of
+        a thread doing nothing. Comparing across scan cycles is both free and a
+        longer settling window than the two seconds it replaces.
+        """
         key = str(p)
         with self._lock:
-            if key in self._pending:
+            if key in self._submitted:
                 return
-            self._pending.add(key)
+        seen = analyzer.fingerprint(key)
+        if seen is None:
+            return
+        size, mtime = seen
+        if size < self.settings.watcher.min_size_mb * 1024 * 1024:
+            return
+        if not analyzer.settled_for(mtime, self.settings.watcher.stable_seconds):
+            with self._lock:
+                self._last_seen[key] = seen
+            return
+        with self._lock:
+            previous = self._last_seen.get(key)
+            if previous != seen:
+                # First sighting, or it changed since the last scan. Either way
+                # this scan is observation one; the next is observation two.
+                self._last_seen[key] = seen
+                return
+            self._submitted.add(key)
+            self._last_seen.pop(key, None)
         try:
-            if analyzer.is_stable(key, self.settings.watcher.stable_seconds):
-                logger.info("New stable media file detected: {}", p)
-                self.submit(key)
-            else:
-                with self._lock:
-                    self._pending.discard(key)
+            logger.info("New stable media file detected: {}", p)
+            self.submit(key)
         except Exception as e:  # noqa: BLE001
             logger.debug("watcher submit error: {}", e)
             with self._lock:
-                self._pending.discard(key)
+                self._submitted.discard(key)

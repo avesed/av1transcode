@@ -219,20 +219,30 @@ def analyze(settings: Settings, path: str) -> Optional[MediaInfo]:
     return info
 
 
-def is_stable(path: str, window_sec: float) -> bool:
-    """True if file exists, is old enough, and size has not changed twice."""
+def fingerprint(path: str) -> Optional[tuple[int, float]]:
+    """(size, mtime) of `path`, or None when it cannot be stat'ed.
+
+    The watcher decides a file has finished being written by taking this twice
+    and comparing. It used to do that inside a single call, with a hard
+    time.sleep(2) between the two stats - and since the scan submits files one
+    at a time, that cost two seconds PER FILE with the whole scan loop blocked
+    behind it: fifty new files meant a hundred seconds during which nothing
+    else in the watcher thread ran.
+
+    Nothing needs to be slept through. The scan already repeats every few
+    seconds, so the NEXT scan is the second observation, and comparing across
+    cycles is a longer settling window than the two seconds it replaces.
+    """
     try:
-        p = Path(path)
-        if not p.exists():
-            return False
-        if time.time() - p.stat().st_mtime < window_sec:
-            return False
-        s1 = p.stat().st_size
-        time.sleep(2)
-        s2 = p.stat().st_size if p.exists() else s1
-        return s1 == s2
+        st = Path(path).stat()
     except OSError:
-        return False
+        return None
+    return st.st_size, st.st_mtime
+
+
+def settled_for(mtime: float, window_sec: float) -> bool:
+    """Whether `mtime` is far enough in the past to count as settled."""
+    return time.time() - mtime >= window_sec
 
 
 def safe_stem(path: str) -> str:

@@ -131,8 +131,11 @@ def _watched(settings, store, tmp_path):
 
 
 def _scan_once(watcher):
-    for p in watcher._scan():
-        watcher._maybe_submit(p)
+    """Two scan cycles, because stability now needs two agreeing observations
+    and the second one is the next scan rather than a sleep."""
+    for _ in range(2):
+        for p in watcher._scan():
+            watcher._maybe_submit(p)
 
 
 def test_the_watcher_does_not_resubmit_after_a_restart(settings, store, tmp_path):
@@ -199,6 +202,62 @@ def test_a_person_can_still_resubmit_what_the_watcher_will_not(settings, store, 
 
     assert manager.enqueue_new_file(str(src)) is None
     assert manager.enqueue_file(str(src)) is not None
+
+
+def test_a_file_still_being_written_is_not_submitted(settings, store, tmp_path):
+    """Two observations that agree, or it waits. The second one is the next
+    scan, so a file growing between cycles never qualifies."""
+    _, watcher = _watched(settings, store, tmp_path)
+    src = settings.dirs.input / "copying.mkv"
+
+    for chunk in range(4):                  # four scans, four sizes
+        src.write_bytes(b"x" * (1024 * (chunk + 1)))
+        for p in watcher._scan():
+            watcher._maybe_submit(p)
+    assert store.list(status=None, limit=10) == []
+
+    # it stops growing: the next two scans agree and it goes in
+    _scan_once(watcher)
+    assert len(store.list(status=None, limit=10)) == 1
+
+
+def test_a_freshly_touched_file_waits_for_stable_seconds(settings, store, tmp_path):
+    _, watcher = _watched(settings, store, tmp_path)
+    settings.watcher.stable_seconds = 3600          # nothing is old enough
+    (settings.dirs.input / "movie.mkv").write_bytes(b"x" * 1024)
+
+    _scan_once(watcher)
+    assert store.list(status=None, limit=10) == []
+
+    settings.watcher.stable_seconds = 0
+    _scan_once(watcher)
+    assert len(store.list(status=None, limit=10)) == 1
+
+
+def test_a_file_under_min_size_is_ignored(settings, store, tmp_path):
+    _, watcher = _watched(settings, store, tmp_path)
+    settings.watcher.min_size_mb = 1
+    (settings.dirs.input / "sidecar.mkv").write_bytes(b"x" * 1024)
+
+    _scan_once(watcher)
+    assert store.list(status=None, limit=10) == []
+
+
+def test_a_batch_of_files_does_not_serialise_the_scan(settings, store, tmp_path):
+    """The stability check used to sleep two seconds per file with the scan
+    loop blocked behind it, so this batch would have taken about 80 seconds."""
+    import time
+
+    _, watcher = _watched(settings, store, tmp_path)
+    for i in range(20):
+        (settings.dirs.input / f"m{i:02d}.mkv").write_bytes(b"x" * 1024)
+
+    t0 = time.monotonic()
+    _scan_once(watcher)
+    elapsed = time.monotonic() - t0
+
+    assert len(store.list(status=None, limit=100)) == 20
+    assert elapsed < 2.0, f"20 files took {elapsed:.1f}s; the sleep is back"
 
 
 def test_has_job_is_broader_than_find_active(store):
