@@ -5,7 +5,6 @@ import re
 import shutil
 import signal
 import subprocess
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -136,7 +135,6 @@ def run_av1an(
     reported as (chunks probed / total chunks). Once the real encode progress
     bar appears the probe phase ends and normal frame-based progress resumes.
     """
-    import fcntl  # noqa: PLC0415
     import pty  # noqa: PLC0415
 
     env = dict(os.environ)
@@ -349,7 +347,7 @@ def run_av1an(
                             )
                     error_msg = f"av1an exited with code {rc}; log: {log_path}"
                     if tail:
-                        error_msg += f"\nLast log lines:\n" + "\n".join(tail[-10:])
+                        error_msg += "\nLast log lines:\n" + "\n".join(tail[-10:])
                     raise TranscodeError(error_msg)
                 break
             # watchdog: no output for 90s => log a warning (scene detection
@@ -398,21 +396,6 @@ def _terminate_proc(proc: "subprocess.Popen") -> None:
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences (colours, cursor movement) from a line."""
     return re.sub(r"\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|\(B|\)[0-9A-B])", "", text)
-
-
-def parse_progress(line: str) -> Optional[float]:
-    """Extract the most recent percentage from av1an output.
-
-    Matches both plain log lines ("40% ...") and av1an's terminal progress bar
-    ("▐██▌ 64% 700/1000 (80 fps, eta)") once ANSI codes are stripped. Returns
-    the LAST percentage found in the text (in-place bar redraws accumulate).
-    """
-    hits = re.findall(r"([\d.]+)\s*%", line)
-    for raw in reversed(hits):
-        val = float(raw)
-        if 0 <= val <= 100:
-            return val
-    return None
 
 
 def parse_progress_stats(line: str) -> Optional[dict]:

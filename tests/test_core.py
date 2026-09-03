@@ -91,14 +91,6 @@ def test_hdr_passthrough_tags(settings):
     assert plan.color_primaries == "bt2020"
 
 
-def test_parse_progress():
-    from app.transcoder import parse_progress
-
-    assert parse_progress("Encoding: 45% done") == 45.0
-    assert parse_progress("worker 100%") == 100.0
-    assert parse_progress("no percent here") is None
-
-
 def test_optimizer_engine_requires_target_quality(settings):
     info = MediaInfo(path=Path("/tmp/o.mkv"))
     info.video_codec = "hevc"

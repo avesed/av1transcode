@@ -149,20 +149,3 @@ def memory_available_gb() -> float:
     if avail is not None:
         return max(0.5, avail)
     return max(0.5, (_meminfo_gb("MemTotal:") or 8.0) * 0.75)
-
-
-def memory_high_events() -> Optional[int]:
-    """Times this cgroup was throttled at memory.high, for backpressure.
-
-    None when unavailable (cgroup v1, or no limit configured).
-    """
-    v2 = _cgroup_v2_dir()
-    if v2 is None:
-        return None
-    for line in (_read(v2 / "memory.events") or "").splitlines():
-        if line.startswith("high "):
-            try:
-                return int(line.split()[1])
-            except (IndexError, ValueError):
-                return None
-    return None

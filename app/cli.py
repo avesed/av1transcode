@@ -9,7 +9,7 @@ from typing import List, Optional
 import typer
 from loguru import logger
 
-from app import __version__, analyzer, decisions, db
+from app import db
 from app.config import Settings, load_settings
 
 app = typer.Typer(help="AV1 auto-transcoding archive system (Python scheduler + frontend)")

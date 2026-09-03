@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import queue as queue_mod
 import threading
-import time
 from pathlib import Path
 from typing import Callable, Optional
 

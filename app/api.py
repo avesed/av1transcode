@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
-from app import config, db, decisions
+from app import config, db
 from app.config import Settings
 from app.queue import TranscodeManager
 
