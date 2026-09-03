@@ -913,6 +913,7 @@ def test_probe_forwards_ffmpeg_style_vmaf_features(settings, info, plan, tmp_pat
 def test_feature_warning_logged_once(settings, info, plan, tmp_path, monkeypatch):
     plan.params.probing_vmaf_features = "default motionless"
     enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0      # the fixture file is empty; ffprobe would warn
     warnings = []
     monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
 
@@ -1700,6 +1701,51 @@ def test_encode_shot_never_seeks_before_the_start(settings, info, plan, tmp_path
     assert float(cmd[cmd.index("-ss") + 1]) == 0.0
 
 
+def test_seek_adds_the_video_streams_lead(settings, info, plan, tmp_path):
+    """ffmpeg seeks relative to the container start, and the frame numbers
+    here count from the first video frame; those differ by the video's lead.
+    Proven by frame hashes: video at 0.066 / audio at 0 returned frame 17 for
+    _seek(19); a Better Call Saul remux (video 1.955) returned 953 for 1000."""
+    enc = make_encoder(settings, info, plan, tmp_path)          # 30fps
+    enc._lead_of = lambda path: 1.955
+    assert float(enc._seek(1000)) == pytest.approx(1.955 + 999.5 / 30.0, abs=1e-6)
+    assert float(enc._seek(0)) == pytest.approx(1.955 - 0.5 / 30.0, abs=1e-6)
+    # a lead smaller than the half-frame margin still cannot go negative
+    enc._lead_of = lambda path: 0.010
+    assert float(enc._seek(0)) == 0.0
+
+
+def test_lead_of_reads_ffprobe_and_tolerates_failure(settings, info, plan, tmp_path,
+                                                     monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    calls = []
+
+    def fake_run(cmd, capture_output=False, text=False, timeout=None):
+        calls.append(cmd)
+        if cmd[-1].endswith("bcs.mkv"):
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                {"streams": [{"start_time": "1.955000"}],
+                 "format": {"start_time": "0.008000"}}))
+        return types.SimpleNamespace(returncode=1, stderr="no such file", stdout="")
+
+    monkeypatch.setattr(opt.subprocess, "run", fake_run)
+    assert enc._lead_of(Path("/x/bcs.mkv")) == pytest.approx(1.947)
+    assert enc._lead_of(Path("/x/missing.mkv")) == 0.0          # falls back, no raise
+    # video-first files (audio later) have no lead: never negative
+    fake = fake_run
+
+    def audio_later(cmd, **kw):
+        return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+            {"streams": [{"start_time": "0.000000"}],
+             "format": {"start_time": "0.000000"}}))
+    monkeypatch.setattr(opt.subprocess, "run", audio_later)
+    assert enc._lead_of(Path("/x/plain.mkv")) == 0.0
+    # and it is probed once per file
+    n = len(calls)
+    enc._lead_of(Path("/x/bcs.mkv"))
+    assert len(calls) == n
+
+
 # ---- the shot list must cover the source exactly once ----
 def _enc_for_shots(settings, info, plan, tmp_path, total=1800):
     enc = make_encoder(settings, info, plan, tmp_path)
@@ -1892,6 +1938,25 @@ def test_verify_pairs_frames_by_index_too(settings, info, plan, tmp_path):
     for cmd in metric_cmds:
         lavfi = cmd[cmd.index("-lavfi") + 1]
         assert lavfi.count("setpts=PTS-STARTPTS") == 2, lavfi
+
+
+def test_verify_seeks_each_file_by_its_own_lead(settings, info, plan, tmp_path):
+    """The source's video may start after its container, the output's where
+    the mux put it. Same frame number, two different -ss values."""
+    enc, seen = _verifying_encoder(settings, info, plan, tmp_path, 76.0)
+    leads = {str(enc.source): 0.066, str(enc.output): 0.0}
+    enc._lead_of = lambda path: leads[str(path)]
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0},
+                         {0: {26: 80.0}, 1: {26: 80.0}})
+    metric = [a for a in seen if any("libvmaf=" in x for x in a)]
+    assert len(metric) == 2
+    seeks = [[float(c[i + 1]) for i, a in enumerate(c) if a == "-ss"] for c in metric]
+    # input 0 is the output (lead 0), input 1 the source (lead 0.066)
+    assert seeks[0] == [0.0, pytest.approx(0.066 - 0.5 / 30.0, abs=1e-6)]   # shot 0 clamps
+    assert seeks[1] == [pytest.approx(89.5 / 30.0, abs=1e-6),
+                        pytest.approx(0.066 + 89.5 / 30.0, abs=1e-6)]
+
+
 def test_verify_still_stages_when_the_reference_needs_building(
         settings, info, plan, tmp_path):
     """Dolby Vision P5 and SSIMULACRA2 cannot read the source in place - the
@@ -2374,6 +2439,58 @@ def test_source_with_audio_still_gets_remuxed(settings, info, plan, tmp_path,
     assert any("audio_subs.mkv" in " ".join(a) for a in muxes)
     final = muxes[-1]
     assert "1:a?" in final and "1:s?" in final
+
+
+def test_mkvmerge_mux_delays_the_video_by_the_sources_lead(settings, info, plan,
+                                                            tmp_path, monkeypatch):
+    """Every shot ivf starts at 0 while the audio keeps the original's
+    timestamps, so a picture that began 1.955s after the sound would come out
+    1.955s early. Measured on a 0.066s case: source v=0.066/a=0, output v=0/a=0."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 1.955 if str(path) == str(enc.info.path) else 0.0
+    video_only = tmp_path / "video_only.mkv"
+    audio_subs = tmp_path / "audio_subs.mkv"
+    video_only.touch(); audio_subs.touch()
+    seen = {}
+
+    def fake_run(cmd, capture_output=False, text=False, timeout=None):
+        seen["cmd"] = cmd
+        enc.output.write_bytes(b"\x1aE\xdf\xa3")
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(opt.subprocess, "run", fake_run)
+    assert enc._mkvmerge_mux("mkvmerge", video_only, audio_subs) is True
+    cmd = seen["cmd"]
+    # --sync binds to the input that follows it, which must be the video
+    assert cmd[cmd.index("--sync") + 1] == "0:1955"
+    assert cmd[cmd.index("--sync") + 2] == str(video_only)
+    # nothing to align against when the file is video only
+    assert enc._mkvmerge_mux("mkvmerge", video_only, None) is True
+    assert "--sync" not in seen["cmd"]
+
+
+def test_ffmpeg_mux_fallback_delays_the_video_too(settings, info, plan, tmp_path,
+                                                  monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(opt.shutil, "which",
+                        lambda n, *a, **k: None if "mkvmerge" in n else f"/usr/bin/{n}")
+    enc._lead_of = lambda path: 0.066
+    ran = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "ffprobe" in args[0]:
+            return "video\naudio\n" if "stream=codec_type" in args else ""
+        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc.concat_shots([tmp_path / "enc_00000.ivf"])
+    final = [a for a in ran if "ffprobe" not in a[0]][-1]
+    i = final.index("-itsoffset")
+    assert float(final[i + 1]) == pytest.approx(0.066)
+    assert final[i + 2] == "-i" and final[i + 3].endswith("video_only.mkv")
 
 
 def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,

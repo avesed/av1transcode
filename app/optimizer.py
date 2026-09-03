@@ -531,6 +531,9 @@ class ShotEncoder:
         self._p5 = bool(plan.p5 and settings.transcode.dovi.enabled)
         self._shards: Dict[int, Path] = {}
         self._shard_lock = threading.Lock()
+        # seconds each file's video starts after its container, by path; see
+        # _lead_of. Probed once per file, so the source and the output.
+        self._leads: Dict[str, float] = {}
         # (peak_mb, command) of the heaviest child this phase, for diagnostics
         self._heaviest_cmd: Tuple[float, str] = (0.0, "")
 
@@ -1559,8 +1562,62 @@ class ShotEncoder:
                 pass
         return self.tempdir
 
-    def _seek(self, frame: int) -> str:
-        """-ss value that reliably lands ON `frame`, never past it.
+    def _lead_of(self, path: Path) -> float:
+        """Seconds `path`'s video stream starts after its container does.
+
+        ffmpeg adds the CONTAINER's start_time (its earliest stream) to an
+        input -ss, and the frame numbers this class works in count from the
+        first VIDEO frame. Those coincide only while the picture is the first
+        thing in the file. When audio or subtitles begin earlier, every seek
+        lands `lead * fps` frames early - proven by frame hashes: a clip with
+        video at 0.066 and audio at 0 returned frame 17 for _seek(19), and a
+        Better Call Saul remux (video 1.955, audio 0.008, PGS 0) returned frame
+        953 for _seek(1000). Shot 0 still started right (the seek clamps at
+        0), so what came out was every later shot shifted, the shifted-over
+        frames encoded twice at the first cut, the tail never encoded, probe
+        windows describing the previous shot, and verification comparing
+        frames that were never meant to match. -frames:v kept every count
+        exact, so none of the checks fired. Of 100 library files sampled, 11
+        have such a lead - every Better Call Saul episode, 0.96-1.96s.
+
+        Probed with ffprobe rather than taken from MediaInfo because the encode
+        input is not always the analysed file: the Dolby Vision paths read a
+        video-only intermediate whose lead is 0 whatever the original's was,
+        and verification reads the finished output, which has its own.
+
+        Falls back to 0 - today's behaviour - if ffprobe cannot answer, and
+        says so.
+        """
+        key = str(path)
+        if key in self._leads:
+            return self._leads[key]
+        lead = 0.0
+        try:
+            proc = subprocess.run(
+                [self.settings.tool_path("ffprobe"), "-v", "error",
+                 "-select_streams", "v:0",
+                 "-show_entries", "format=start_time:stream=start_time",
+                 "-of", "json", key],
+                capture_output=True, text=True, timeout=120)
+            data = json.loads(proc.stdout or "")
+            fmt = float(data.get("format", {}).get("start_time") or 0.0)
+            streams = data.get("streams") or [{}]
+            vid = float(streams[0].get("start_time") or 0.0)
+            lead = max(0.0, vid - fmt)
+        except (OSError, ValueError, subprocess.SubprocessError, AttributeError) as e:
+            logger.warning("optimizer: could not read the video start time of "
+                           "{} ({}); assuming the video starts with the "
+                           "container", Path(key).name, e)
+        if lead > 0:
+            logger.info("optimizer: {} video starts {:.3f}s after the "
+                        "container; seeks and the final mux account for it",
+                        Path(key).name, lead)
+        self._leads[key] = lead
+        return lead
+
+    def _seek(self, frame: int, path: Optional[Path] = None) -> str:
+        """-ss value that reliably lands ON `frame` of `path` (default: the
+        encode input), never past it.
 
         -ss discards frames whose timestamp is below the one asked for, and
         containers store those rounded - Matroska keeps whole milliseconds
@@ -1571,8 +1628,12 @@ class ShotEncoder:
         overshoot: the preceding frame is a whole period further back, against
         at most 0.5ms of rounding (8x the margin even at 119.88fps, 42x at
         23.976). Measured after the change: 0 of 16 shots slip.
+
+        Plus the file's lead (see _lead_of): frame 0 of a video that begins
+        1.955s into its container sits at -ss 1.955, not 0.
         """
-        return f"{max(0.0, (frame - 0.5) / self.fps):.6f}"
+        lead = self._lead_of(path or self.source)
+        return f"{max(0.0, lead + (frame - 0.5) / self.fps):.6f}"
 
     def _exact_frames(self, rate: float) -> Tuple[List[str], List[str]]:
         """(video filters, output options) that make an encoder read emit
@@ -1621,7 +1682,7 @@ class ShotEncoder:
         exact_vf, exact_out = self._exact_frames(rate or self.fps)
         chain += exact_vf
         args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
-                "-ss", self._seek(w0), "-i", str(source or self.source),
+                "-ss", self._seek(w0, source), "-i", str(source or self.source),
                 "-frames:v", str(w1 - w0), "-map", "0:v:0",
                 "-vf", ",".join(chain), *exact_out]
         args += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
@@ -2147,7 +2208,9 @@ class ShotEncoder:
         delivered against the source at native everything, and applying a probe
         filter to one side of that would be measuring the wrong thing.
         """
-        return ["-threads", str(max(1, threads)), "-ss", self._seek(w0),
+        # each file's own lead: the output's video begins where the mux put
+        # it, the source's where its container did
+        return ["-threads", str(max(1, threads)), "-ss", self._seek(w0, source),
                 "-t", f"{(w1 - w0) / self.fps:.6f}", "-i", str(source)]
 
     def _score_windows(self, w0: int, w1: int, idx: int, crf: int,
@@ -2800,7 +2863,11 @@ class ShotEncoder:
         # fallback: global metadata comes from the first input (video_only,
         # which has no title), stream language tags ride along with the
         # mapped streams, so no -map_metadata -1 needed here either.
-        base = [self.ffmpeg, "-hide_banner", "-y", "-i", str(video_only)]
+        base = [self.ffmpeg, "-hide_banner", "-y"]
+        lead = self._mux_lead(audio_subs)
+        if lead > 0:
+            base += ["-itsoffset", f"{lead:.6f}"]
+        base += ["-i", str(video_only)]
         if audio_subs is not None:
             base += ["-i", str(audio_subs)]
         base += ["-map", "0:v:0"]
@@ -2841,13 +2908,34 @@ class ShotEncoder:
         kinds = {line.strip() for line in out.splitlines()}
         return bool(kinds & {"audio", "subtitle"})
 
+    def _mux_lead(self, audio_subs: Optional[Path]) -> float:
+        """Seconds to delay the video track by in the final mux.
+
+        The encoded video starts at 0 - every shot ivf does - while the audio
+        and subtitles are copied from the ORIGINAL file with their timestamps
+        kept. So a source whose picture began after its sound would come out
+        with the picture that much early: measured on a clip with video at
+        0.066 and audio at 0, the finished file had both at 0. The original's
+        lead is the amount, and it applies whichever file was actually encoded
+        (the Dolby Vision intermediates start at 0 but the audio does not come
+        from them). Nothing to align when there is no audio.
+        """
+        if audio_subs is None:
+            return 0.0
+        return self._lead_of(self.info.path if self.info.path else self.source)
+
     def _mkvmerge_mux(self, mkvmerge: str, video_only: Path,
                       audio_subs: Optional[Path]) -> bool:
         """Final mux with mkvmerge. Returns True on a valid output file."""
         try:
             if self.output.exists():
                 self.output.unlink()
-            inputs = [str(video_only)]
+            inputs: List[str] = []
+            lead_ms = int(round(self._mux_lead(audio_subs) * 1000))
+            if lead_ms > 0:
+                # --sync applies to the track of the input that FOLLOWS it
+                inputs += ["--sync", f"0:{lead_ms}"]
+            inputs.append(str(video_only))
             if audio_subs is not None:
                 inputs.append(str(audio_subs))
             proc = subprocess.run(
@@ -2871,6 +2959,9 @@ class ShotEncoder:
                           f"~{self.total_frames} frames")
             shots = self.detect_shots()
             self._log(f"{len(shots)} shot(s) from scene detection")
+            # Probe the source's video lead once, here, rather than letting
+            # the first few probe workers all discover it at the same time.
+            self._lead_of(self.source)
 
             self._stage("probing", 0.0)
             self._report(0.0, 0, len(shots))  # surface the shot count to the UI

@@ -453,3 +453,34 @@ def test_run_full_transcode_keeps_a_verified_output(settings, monkeypatch, tmp_p
     transcoder.run_full_transcode(settings, info, plan, src, out)
     assert out.exists()
     assert list(settings.dirs.work.iterdir()) == []
+
+
+def test_analyze_records_the_video_streams_lead(settings, monkeypatch, tmp_path):
+    """ffmpeg seeks relative to the container start, the optimizer counts
+    frames from the first video frame; the analyzer has to expose the gap."""
+    from app import analyzer
+
+    f = tmp_path / "bcs.mkv"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(analyzer, "_ffprobe", lambda s, p: {
+        "format": {"format_name": "matroska", "duration": "2700.0",
+                   "start_time": "0.000000"},
+        "streams": [
+            {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+             "start_time": "0.000000"},
+            {"codec_type": "video", "codec_name": "hevc", "width": 3840,
+             "height": 2160, "start_time": "1.955000", "r_frame_rate": "24000/1001"},
+            {"codec_type": "audio", "codec_name": "dts", "start_time": "0.008000"},
+        ]})
+    info = analyzer.analyze(settings, str(f))
+    assert info.video_start == pytest.approx(1.955)
+    assert info.format_start == 0.0
+    assert info.video_lead == pytest.approx(1.955)
+    # "N/A" and a missing field both read as 0, never as an exception
+    monkeypatch.setattr(analyzer, "_ffprobe", lambda s, p: {
+        "format": {"start_time": "N/A"},
+        "streams": [{"codec_type": "video", "codec_name": "hevc",
+                     "r_frame_rate": "24/1"}]})
+    info = analyzer.analyze(settings, str(f))
+    assert info.video_lead == 0.0
+

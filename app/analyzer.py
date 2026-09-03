@@ -52,6 +52,19 @@ class MediaInfo:
     is_hdr: bool = False
     is_hlg: bool = False
     is_av1: bool = False
+    # Where the container and its video stream start, in seconds. They differ
+    # when another stream begins first - all the Better Call Saul remuxes in
+    # the library open with subtitles/audio 0.96-1.96s before the picture.
+    # Anything that maps a video frame number to a -ss time has to add the
+    # difference (see video_lead), because ffmpeg seeks relative to the
+    # container start, not the video's.
+    format_start: float = 0.0
+    video_start: float = 0.0
+
+    @property
+    def video_lead(self) -> float:
+        """Seconds the video stream starts after the container does (>= 0)."""
+        return max(0.0, self.video_start - self.format_start)
 
     @property
     def display(self) -> str:
@@ -82,6 +95,14 @@ def run_command(cmd: List[str], timeout: int = 600) -> tuple[int, str]:
         return 124, f"command timed out after {timeout}s: {cmd[0]}"
     except Exception as e:  # noqa: BLE001
         return 1, str(e)
+
+
+def _seconds(value) -> float:
+    """An ffprobe time field as float; "N/A", None and junk all read as 0."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _ffprobe(settings: Settings, path: str) -> Optional[dict]:
@@ -163,6 +184,7 @@ def analyze(settings: Settings, path: str) -> Optional[MediaInfo]:
     info.size = p.stat().st_size
     info.duration = float(fmt.get("duration") or 0.0)
     info.bitrate = int(float(fmt.get("bit_rate") or fmt.get("bit_rate", 0) or 0))
+    info.format_start = _seconds(fmt.get("start_time"))
 
     video_picked = False
     for st in data.get("streams", []):
@@ -173,6 +195,7 @@ def analyze(settings: Settings, path: str) -> Optional[MediaInfo]:
             info.height = int(st.get("height") or 0)
             info.video_codec = st.get("codec_name") or ""
             info.is_av1 = info.video_codec == "av1"
+            info.video_start = _seconds(st.get("start_time"))
             info.color.pix_fmt = st.get("pix_fmt")
             info.color.primaries = st.get("color_primaries")
             info.color.transfer = st.get("color_transfer")
