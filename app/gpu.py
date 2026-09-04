@@ -124,10 +124,11 @@ def probe(settings: Settings, force: bool = False) -> Dict[str, Any]:
                 try:
                     r = _run(_score_cmd(ffmpeg, _model_cfg(settings), dev, "/dev/null"), timeout=60)
                     parsed = parse_sycl(r.stdout + r.stderr)
-                    if parsed.get("device") is None and parsed.get("count") is None:
-                        # ask for an index no box has, to learn the count
+                    if parsed.get("count") is None:
+                        # the backend only states how many devices it sees when
+                        # refusing an index; ask for one no box has
                         r2 = _run(_score_cmd(ffmpeg, _model_cfg(settings), 999, "/dev/null"), timeout=60)
-                        parsed.setdefault("count", parse_sycl(r2.stdout + r2.stderr).get("count"))
+                        parsed["count"] = parse_sycl(r2.stdout + r2.stderr).get("count")
                     out["sycl"].update({k: parsed.get(k) for k in ("device", "count", "error")})
                 except (OSError, subprocess.SubprocessError) as e:
                     out["sycl"]["error"] = str(e)
