@@ -2991,3 +2991,17 @@ def test_concat_quote_matches_shell_word_splitting():
         out = subprocess.run(["bash", "-c", f"printf %s {quoted}"],
                              capture_output=True, text=True).stdout
         assert out == raw, f"{raw!r} -> {quoted} -> {out!r}"
+
+
+def test_probe_scale_treats_zero_as_none(settings, info, plan, tmp_path):
+    """A preset with probe_res "0" used to put scale=0 in the probe chain,
+    which ffmpeg refuses ("Invalid size '0'")."""
+    for v in ("0", " none ", "OFF", ""):
+        plan.params.probe_res = v
+        assert make_encoder(settings, info, plan, tmp_path)._probe_scale() == ""
+    plan.params.probe_res = "960x540"
+    assert make_encoder(settings, info, plan, tmp_path)._probe_scale() == "960x540"
+    plan.params.probe_res = "0"
+    settings.transcode.optimizer.probe_scale = "-2:720"
+    assert make_encoder(settings, info, plan, tmp_path)._probe_scale() == "-2:720"
+

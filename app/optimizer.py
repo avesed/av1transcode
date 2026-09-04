@@ -1653,7 +1653,15 @@ class ShotEncoder:
         return self.opt.probe_preset
 
     def _probe_scale(self) -> str:
-        return self.video.probe_res or self.opt.probe_scale or ""
+        """The probe-side scale spec, or "" for none. "0", "none" and "off"
+        read as none too: the settings page's placeholder shows 960x540, and
+        someone clearing it typed 0, which ffmpeg's scale filter rejects as
+        an invalid size - every probe of the job would have failed."""
+        for v in (self.video.probe_res, self.opt.probe_scale):
+            v = str(v or "").strip()
+            if v and v.lower() not in ("0", "none", "off"):
+                return v
+        return ""
 
     def _probing_rate(self) -> int:
         rate = self.video.probing_rate or self.opt.probing_rate
