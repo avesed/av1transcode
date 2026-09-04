@@ -122,15 +122,39 @@ def memory_limit_gb() -> Optional[float]:
 
 
 def memory_in_use_gb() -> Optional[float]:
-    """Memory currently charged to this cgroup (page cache included)."""
+    """Memory charged to this cgroup that could NOT be given back on demand.
+
+    memory.current counts page cache, and a 4K job reads its 28GB source
+    into exactly that: measured mid-episode, a 64GB container showed 61.9GB
+    current of which 49.5GB was inactive file cache and 8.3GB anonymous. Read
+    as "in use", that left an 11.8GB budget and cut the probe pool from 10
+    workers to 5 - and it only gets worse as the job reads on. The kernel's
+    own MemAvailable adds reclaimable cache back; so does this, by
+    subtracting the cgroup's inactive file pages (memory.stat's
+    inactive_file, total_inactive_file on v1).
+    """
     v2 = _cgroup_v2_dir()
-    path = (v2 / "memory.current") if v2 is not None \
-        else (_CGROUP_ROOT / "memory" / "memory.usage_in_bytes")
-    raw = _read(path)
+    if v2 is not None:
+        current, stat = _read(v2 / "memory.current"), _read(v2 / "memory.stat")
+        key = "inactive_file"
+    else:
+        base = _CGROUP_ROOT / "memory"
+        current, stat = _read(base / "memory.usage_in_bytes"), _read(base / "memory.stat")
+        key = "total_inactive_file"
     try:
-        return int(raw) / _GB if raw is not None else None
+        used = int(current)
     except (TypeError, ValueError):
         return None
+    reclaimable = 0
+    for line in (stat or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == key:
+            try:
+                reclaimable = int(parts[1])
+            except ValueError:
+                pass
+            break
+    return max(0, used - reclaimable) / _GB
 
 
 def memory_available_gb() -> float:
