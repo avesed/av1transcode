@@ -516,13 +516,14 @@ def test_cgroup_memory_in_use_discounts_reclaimable_page_cache(monkeypatch, tmp_
     workers down to 5 on a 64GB container, 49.5GB of it inactive cache)."""
     from app import sysres
 
-    (tmp_path / "memory.current").write_text(str(62 * 1024 ** 3))
-    (tmp_path / "memory.stat").write_text("anon 8912896000\nfile 53000000000\ninactive_file 53150220288\nactive_file 200000000\n")
+    current, inactive = 61_944_049_664, 53_150_220_288          # the production reading
+    (tmp_path / "memory.current").write_text(str(current))
+    (tmp_path / "memory.stat").write_text(f"anon 8912896000\nfile 53350220288\ninactive_file {inactive}\nactive_file 200000000\n")
     monkeypatch.setattr(sysres, "_cgroup_v2_dir", lambda: tmp_path)
     used = sysres.memory_in_use_gb()
-    assert used == pytest.approx((62 * 1024 ** 3 - 53150220288) / sysres._GB, rel=1e-6)
-    assert used < 9                                  # ~8.3GB anonymous, not 62
+    assert used == pytest.approx((current - inactive) / sysres._GB, rel=1e-6)
+    assert used < 9                                  # ~8.2GB that cannot be reclaimed, not 58
     # no memory.stat: fall back to the raw figure rather than fail
     (tmp_path / "memory.stat").unlink()
-    assert sysres.memory_in_use_gb() == pytest.approx(62 * 1024 ** 3 / sysres._GB)
+    assert sysres.memory_in_use_gb() == pytest.approx(current / sysres._GB)
 
