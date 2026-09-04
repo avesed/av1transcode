@@ -596,7 +596,7 @@ def test_probe_encode_matches_final_encode_config(settings, info, plan, tmp_path
     encode_cmd = _capture_probe(enc, tmp_path)[0]
 
     # no probe downscale: the only filters are the timestamp regeneration
-    assert encode_cmd[encode_cmd.index("-vf") + 1] == "settb=AVTB,setpts=N/30.000000/TB"
+    assert encode_cmd[encode_cmd.index("-vf") + 1] == "settb=AVTB,setpts=PTS-STARTPTS"
     assert encode_cmd[encode_cmd.index("-pix_fmt") + 1] == "yuv420p10le"
     svt = encode_cmd[encode_cmd.index("-svtav1-params") + 1]
     assert "tune=0" in svt and "lp=4" in svt
@@ -619,7 +619,7 @@ def test_encoder_reads_emit_exactly_one_frame_per_decoded_frame(settings, info, 
     final_cmd = _encode_cmd(make_encoder(settings, info, plan, tmp_path), 30.0)
     for cmd in (probe_cmd, final_cmd):
         assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
-        assert cmd[cmd.index("-vf") + 1].endswith("settb=AVTB,setpts=N/30.000000/TB")
+        assert cmd[cmd.index("-vf") + 1].endswith("settb=AVTB,setpts=PTS-STARTPTS")
         # an output option: after the input, before the encoder
         assert cmd.index("-i") < cmd.index("-fps_mode") < cmd.index("-c:v")
 
@@ -631,7 +631,7 @@ def test_probe_regeneration_follows_the_subsampling(settings, info, plan, tmp_pa
     enc = make_encoder(settings, info, plan, tmp_path)
     vf = _capture_probe(enc, tmp_path)[0]
     vf = vf[vf.index("-vf") + 1]
-    assert vf.index("fps=15") < vf.index("setpts=N/15.000000/TB")
+    assert vf.index("fps=15") < vf.index("setpts=PTS-STARTPTS")
 
 
 def test_staged_window_is_frame_exact_too(settings, info, plan, tmp_path):
@@ -648,7 +648,7 @@ def test_staged_window_is_frame_exact_too(settings, info, plan, tmp_path):
     enc._extract_window(100, 220, tmp_path / "w.mkv")
     cmd = seen[0]
     assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
-    assert cmd[cmd.index("-vf") + 1] == "settb=AVTB,setpts=N/30.000000/TB"
+    assert cmd[cmd.index("-vf") + 1] == "settb=AVTB,setpts=PTS-STARTPTS"
     assert cmd[cmd.index("-frames:v") + 1] == "120"
 
 
@@ -2796,32 +2796,66 @@ def test_cfr_check_accepts_millisecond_jitter(settings, info, plan, tmp_path):
     enc._assert_constant_frame_rate([round(i * 1001 / 24000, 3) for i in range(2000)])
 
 
-def test_cfr_check_refuses_a_dropped_frame(settings, info, plan, tmp_path):
-    """One missing frame is a 2-period interval; from there every seek lands a
-    frame early and the output runs ahead of its audio. Measured on a 30s clip
-    with every 7th frame dropped: delivered VMAF median 54, video 4.2s short."""
-    enc = make_encoder(settings, info, plan, tmp_path)
+def test_cfr_check_keeps_a_dropped_frames_slot(settings, info, plan, tmp_path, monkeypatch):
+    """One missing frame is a 2-period interval. A 4K Blu-ray remux had two
+    of them in 68686 intervals, so they cannot be a reason to refuse; instead
+    the timeline keeps the hole: every later frame sits one slot further on,
+    and seeks, window durations and the output follow the slot."""
+    enc = make_encoder(settings, info, plan, tmp_path)          # 30fps
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
     pts = _cfr_pts(300)
     del pts[120]                                                # frame 120 never existed
+    enc._assert_constant_frame_rate(pts)                        # accepted
+    assert any("frame(s) missing" in str(w[0]) and w[2] == 1 for w in warnings)   # loguru: format, args
+    enc._slots = enc._slots_from_pts(pts)
+    assert enc._slot(119) == 119 and enc._slot(120) == 121 and enc._slot(298) == 299
+    assert enc._slot(299) == 300                                # one past the table: extrapolated
+    enc._lead_of = lambda path: 0.0
+    assert float(enc._seek(120)) == pytest.approx(120.5 / 30.0, abs=1e-6)   # slot 121, half a frame early
+    assert enc._span(100, 140) == pytest.approx(41 / 30.0)                  # the hole is inside the window
+    assert enc._span(0, 100) == pytest.approx(100 / 30.0)
+
+
+def test_cfr_check_refuses_real_variable_frame_rate(settings, info, plan, tmp_path):
+    """Every 7th frame dropped (16% of intervals) is the VFR clip that ran
+    14% fast against its audio and delivered VMAF median 54."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    pts = [t for i, t in enumerate(_cfr_pts(700)) if i % 7 != 6]
     with pytest.raises(opt.TranscodeError) as e:
         enc._assert_constant_frame_rate(pts)
-    msg = str(e.value)
-    assert "constant frame rate" in msg and "1 of 298" in msg
-    assert "frame 120" in msg and "66ms" in msg               # where, and how long
-    assert "engine=av1an" in msg
+    assert "longer than one frame" in str(e.value) and "engine=av1an" in str(e.value)
 
 
-def test_cfr_check_lets_a_gap_at_the_very_end_through(settings, info, plan, tmp_path):
-    """A cut at a non-keyframe leaves the last frame a period late; nothing
-    after it can be shifted, so it is not a reason to refuse the file."""
+def test_cfr_check_refuses_a_duplicated_timestamp(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     pts = _cfr_pts(300)
-    pts[-1] += 1 / 30.0                                         # 2-period gap before the last frame
-    enc._assert_constant_frame_rate(pts)                        # accepted
-    pts = _cfr_pts(300)
-    pts[-3:] = [x + 1 / 30.0 for x in pts[-3:]]                 # the gap sits 3 from the end
-    with pytest.raises(opt.TranscodeError):
+    pts[150] = pts[149]                                         # two frames on one timestamp
+    with pytest.raises(opt.TranscodeError) as e:
         enc._assert_constant_frame_rate(pts)
+    assert "shorter than half a frame" in str(e.value) and "frame 150" in str(e.value)
+
+
+def test_concat_list_carries_each_shots_slot_duration(settings, info, plan, tmp_path, monkeypatch):
+    """A hole at the very end of a shot has no frame to carry it into the
+    concat; the explicit duration does."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    pts = _cfr_pts(300); del pts[99]                            # frame 99 missing: shot 0 ends in a hole
+    enc._slots = enc._slots_from_pts(pts)
+    monkeypatch.setattr(opt.shutil, "which",
+                        lambda n, *a, **k: None if "mkvmerge" in n else f"/usr/bin/{n}")
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        if "ffprobe" in args[0]:
+            return "video\n"
+        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3"); return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc.concat_shots([tmp_path / "a.ivf", tmp_path / "b.ivf"], [(0, 100), (100, 299)])
+    text = (enc.tempdir / "concat.txt").read_text().splitlines()
+    assert text[1] == f"duration {101 / 30.0:.6f}"             # frames 0..99 span 101 slots: the hole is inside
+    assert text[3] == f"duration {199 / 30.0:.6f}"
 
 
 def test_cfr_check_refuses_a_container_rate_that_is_not_the_timestamps(

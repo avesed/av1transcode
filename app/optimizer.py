@@ -533,8 +533,10 @@ class ShotEncoder:
         self._sycl_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0
-        # every frame's pts_time from the scdet pass (see _run_scdet)
+        # every frame's pts_time from the scdet pass (see _run_scdet), and the
+        # timeline slot each frame sits in (see _slots_from_pts / _slot)
         self._frame_pts: List[float] = []
+        self._slots: List[int] = []
         # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads)
         self._probe_worker_count = 1
         # affinity slices currently taken (only used when encode_threads is set)
@@ -1351,36 +1353,45 @@ class ShotEncoder:
         return scores
 
     # How far a frame interval may stray from 1/fps before it counts as a
-    # dropped or duplicated frame. Matroska rounds timestamps to whole
+    # missing or a duplicated frame. Matroska rounds timestamps to whole
     # milliseconds, so at 23.976fps the intervals alternate 41 and 42ms
     # (0.98-1.01 periods); a dropped frame is 2.0. Half to one-and-a-half.
     _CFR_INTERVAL = (0.5, 1.5)
-    # and how far the timestamps' average rate may sit from the container's
+    # how far the timestamps' average rate may sit from the container's
     _CFR_RATE_TOLERANCE = 0.005
-    # Intervals at the very end are not judged: a cut made at a non-keyframe
-    # leaves the last frame a period late (every 150s test clip here had one,
-    # 83ms before frame 3605 of 3606), and a gap there shifts nothing that
-    # follows it. A gap anywhere earlier shifts every seek after it.
-    _CFR_TAIL_SLACK = 2
+    # Missing frames are tolerated up to this share of the intervals: the
+    # timeline is kept through them (see _slot), so what is lost is only the
+    # frame itself. Beyond it the source is variable frame rate in earnest -
+    # a clip with every 7th frame dropped is 16% - and refused.
+    _CFR_MAX_GAP_SHARE = 0.005
 
     def _assert_constant_frame_rate(self, pts: List[float]) -> None:
-        """Refuse a source whose timestamps are not one frame per 1/fps.
+        """Refuse a source whose timestamps this engine cannot follow.
 
-        Everything here maps frame numbers to time through fps: shot
-        boundaries come from a frame count, -ss is (frame - 0.5) / fps, and the
-        encoder reads emit one frame per decoded frame at that rate. On a
-        variable frame rate source all of that is quietly wrong. Measured on a
-        30s clip with every 7th frame dropped: the job reported success,
-        delivered VMAF median 54 (every seek after the first gap lands early),
-        and the video track ended 4.2s before its audio - a 14% speed-up
-        nothing checked, because the shot count matched the frame count and
-        the duration check tolerates 0.5%.
+        Everything here maps frame numbers to time: shot boundaries come from
+        a frame count, -ss is a frame's slot times 1/fps, and the encoder
+        reads emit one frame per decoded frame. The scdet pass prints every
+        frame's pts_time on its way past, so the timeline is judged from that
+        (the container cannot tell: an mkv with frames missing still reports
+        avg_frame_rate == r_frame_rate), and it is also what _slot uses to
+        keep seeks exact.
 
-        The container's frame rate cannot tell: an mkv with frames missing
-        still reports avg_frame_rate == r_frame_rate. The scdet pass already
-        prints every frame's pts_time, so the timeline is judged from that,
-        for free. Only the scdet engine has it; the PySceneDetect path sees no
-        timestamps and gets no check.
+        Three faults, two of them fatal. An interval shorter than half a
+        frame is a duplicated or out-of-order timestamp: nothing downstream
+        can place that frame, refuse. An average rate away from the
+        container's is a wrong period on every frame number, refuse. A gap -
+        a frame missing from an otherwise regular timeline - is what real
+        files have: a 4K Blu-ray remux had 2 in 68686 intervals. Those are
+        kept: the missing frame's slot stays empty in the output so the
+        picture does not creep against the audio, and seeks are taken from
+        the real timestamps. Only a source with more than
+        _CFR_MAX_GAP_SHARE of its intervals missing is refused as variable
+        frame rate. Measured on a 30s clip with every 7th frame dropped,
+        before any of this: the job reported success, delivered VMAF median
+        54, and the video track ended 4.2s before its audio.
+
+        Only the scdet engine has the timestamps; the PySceneDetect path sees
+        none and gets no check.
         """
         n = len(pts)
         if n < 3:
@@ -1391,32 +1402,78 @@ class ShotEncoder:
             return
         period = 1.0 / self.fps
         lo, hi = self._CFR_INTERVAL
-        judged = pts[:max(2, n - self._CFR_TAIL_SLACK)]
-        bad = [(i + 1, b - a) for i, (a, b) in enumerate(zip(judged, judged[1:]))
-               if not (lo * period <= b - a <= hi * period)]
+        short, gaps = [], []
+        for i, (a, b) in enumerate(zip(pts, pts[1:])):
+            d = b - a
+            if d < lo * period:
+                short.append((i + 1, d))
+            elif d > hi * period:
+                gaps.append((i + 1, d))
         span = pts[-1] - pts[0]
         measured = (n - 1) / span if span > 0 else 0.0
         rate_off = abs(measured - self.fps) / self.fps
-        if not bad and rate_off <= self._CFR_RATE_TOLERANCE:
+        what = None
+        if short:
+            i, d = short[0]
+            what = (f"{len(short)} of {n - 1} frame intervals are shorter than half a "
+                    f"frame (the first is frame {i} at {pts[i]:.3f}s, {d * 1000:.1f}ms "
+                    f"after the previous one), which is a duplicated or out-of-order "
+                    f"timestamp")
+        elif len(gaps) > self._CFR_MAX_GAP_SHARE * (n - 1):
+            # judged before the rate: this many holes is what makes the rate
+            # wrong, and naming them is the useful message
+            i, d = gaps[0]
+            what = (f"{len(gaps)} of {n - 1} frame intervals are longer than one frame "
+                    f"(the first is frame {i} at {pts[i]:.3f}s, {d * 1000:.0f}ms where "
+                    f"{period * 1000:.1f}ms is one frame); the timestamps average "
+                    f"{measured:.3f} fps against the container's {self.fps:g} and the "
+                    f"picture would run {measured / self.fps * 100 - 100:+.1f}% against "
+                    f"the audio")
+        elif rate_off > self._CFR_RATE_TOLERANCE:
+            what = (f"its timestamps average {measured:.3f} fps against the container's "
+                    f"{self.fps:g}, so every frame number would be converted with the "
+                    f"wrong period")
+        if what:
+            raise TranscodeError(
+                f"engine=optimizer needs a constant frame rate and {self.source.name} "
+                f"does not have one: {what}. Use engine=av1an for it, or convert it to "
+                f"a constant frame rate first.")
+        if gaps:
+            where = ", ".join(f"frame {i} ({pts[i]:.1f}s, {d * 1000:.0f}ms)" for i, d in gaps[:5])
+            logger.warning(
+                "optimizer: {} has {} frame(s) missing from its timeline ({}{}); their "
+                "slots are kept empty in the output so the picture stays in step with "
+                "the audio, and seeks follow the real timestamps", self.source.name,
+                len(gaps), where, ", ..." if len(gaps) > 5 else "")
+            self._log(f"timeline: {n} frames at {measured:.4f} fps (container says "
+                      f"{self.fps:g}), {len(gaps)} gap(s): {where}")
+        else:
             self._log(f"timeline: {n} frames at a constant {measured:.4f} fps "
                       f"(container says {self.fps:g})")
-            return
-        if bad:
-            i, d = bad[0]
-            first = (f"; the first is frame {i} at {pts[i]:.3f}s, {d * 1000:.0f}ms "
-                     f"after the previous one where {period * 1000:.1f}ms is one frame")
-        else:
-            first = ""
-        raise TranscodeError(
-            f"engine=optimizer needs a constant frame rate and {self.source.name} "
-            f"does not have one: {len(bad)} of {n - 1} frame intervals are not "
-            f"one frame long{first}; the timestamps average {measured:.3f} fps "
-            f"against the container's {self.fps:g}. Shot boundaries, probe "
-            f"windows and every seek here are frame numbers times 1/fps, so on "
-            f"this source they would land on the wrong frames and the picture "
-            f"would run {measured / self.fps * 100 - 100:+.1f}% against the audio. "
-            f"Use engine=av1an for it, or convert it to a constant frame rate "
-            f"first.")
+
+    def _slots_from_pts(self, pts: List[float]) -> List[int]:
+        """Each frame's position on the 1/fps grid, counted from the first."""
+        if len(pts) < 2:
+            return []
+        p0 = pts[0]
+        return [int(round((t - p0) * self.fps)) for t in pts]
+
+    def _span(self, w0: int, w1: int) -> float:
+        """Seconds from frame w0's slot to frame w1's: the -t of a window."""
+        return (self._slot(w1) - self._slot(w0)) / self.fps
+
+    def _slot(self, frame: int) -> int:
+        """The timeline slot of `frame`: the frame number itself on a regular
+        timeline, one more for every missing frame before it (see
+        _assert_constant_frame_rate). What every -ss and -t here is made of,
+        for the source and the output alike - the output keeps the same
+        holes, by construction (see _exact_frames and concat_shots)."""
+        slots = self._slots
+        if not slots:
+            return frame
+        if frame < len(slots):
+            return slots[frame]
+        return slots[-1] + (frame - (len(slots) - 1))
 
     def _cuts_from_scores(self, scores: List[float]) -> List[int]:
         """Frames whose score clears the threshold, min_scene_len apart."""
@@ -1468,6 +1525,7 @@ class ShotEncoder:
             self._log(f"scdet saw {len(scores)} frames, "
                       f"fps x duration estimated {self.total_frames}")
         self._assert_constant_frame_rate(self._frame_pts)
+        self._slots = self._slots_from_pts(self._frame_pts)
         cuts = self._cuts_from_scores(scores)
         bounds = [0] + cuts + [len(scores)]
         return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
@@ -1727,14 +1785,16 @@ class ShotEncoder:
         23.976). Measured after the change: 0 of 16 shots slip.
 
         Plus the file's lead (see _lead_of): frame 0 of a video that begins
-        1.955s into its container sits at -ss 1.955, not 0.
+        1.955s into its container sits at -ss 1.955, not 0. And on the
+        frame's SLOT rather than its number (see _slot), so a frame missing
+        earlier in the file does not pull every later seek a frame early.
         """
         lead = self._lead_of(path or self.source)
-        return f"{max(0.0, lead + (frame - 0.5) / self.fps):.6f}"
+        return f"{max(0.0, lead + (self._slot(frame) - 0.5) / self.fps):.6f}"
 
-    def _exact_frames(self, rate: float) -> Tuple[List[str], List[str]]:
+    def _exact_frames(self) -> Tuple[List[str], List[str]]:
         """(video filters, output options) that make an encoder read emit
-        exactly one frame per decoded frame, with pts 0, 1, 2, ...
+        exactly one frame per decoded frame, each on its own timeline slot.
 
         ffmpeg's default constant-frame-rate sync duplicates frames on these
         reads. The half-frame seek lead leaves every decoded frame at +0.5
@@ -1748,21 +1808,22 @@ class ShotEncoder:
         -frames:v hides it completely: the count is right, one real frame is
         gone, and everything after it is a frame late.
 
-        So the timestamps are rebuilt from the frame index in a fine timebase
-        (AVTB is microseconds; the millisecond one would round again) and
-        frame sync is switched off. `rate` is the frame rate the frames arrive
-        at - the source's, or fps/probing_rate after the probe subsampling.
-        Appended AFTER the read's other filters, which is where the frames it
-        counts come out.
+        So frame sync is switched off and the timestamps are the source's
+        own, rebased to the first frame in a fine timebase (AVTB is
+        microseconds; the millisecond one would round again). Rescaled to the
+        encoder's 1/fps that is the frame's slot: the millisecond jitter
+        rounds away, and a frame missing from the source leaves its slot
+        empty - which is exactly the hole the audio expects. Regenerating
+        from the frame INDEX would close that hole and let the picture creep.
+        Appended AFTER the read's other filters, which is where the frames
+        come out.
         """
-        return (["settb=AVTB", f"setpts=N/{rate:.6f}/TB"],
-                ["-fps_mode", "passthrough"])
+        return (["settb=AVTB", "setpts=PTS-STARTPTS"], ["-fps_mode", "passthrough"])
 
     def _extract_window(self, w0: int, w1: int, dest: Path, *,
                         source: Optional[Path] = None,
                         vf: Optional[List[str]] = None,
-                        apply_dv: bool = False,
-                        rate: Optional[float] = None) -> None:
+                        apply_dv: bool = False) -> None:
         """Copy frames [w0, w1) of `source` (default: the encode input) into a
         lossless file.
 
@@ -1776,7 +1837,7 @@ class ShotEncoder:
 
             pre, dv = dovi.dv_apply_chain(self.settings)
             chain.append(dv)
-        exact_vf, exact_out = self._exact_frames(rate or self.fps)
+        exact_vf, exact_out = self._exact_frames()
         chain += exact_vf
         args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
                 "-ss", self._seek(w0, source), "-i", str(source or self.source),
@@ -1798,8 +1859,7 @@ class ShotEncoder:
         repeat reads in page cache.
         """
         try:
-            self._extract_window(w0, w1, dest, vf=vf, apply_dv=self._p5,
-                                 rate=self.fps / self._probing_rate())
+            self._extract_window(w0, w1, dest, vf=vf, apply_dv=self._p5)
         except TranscodeError as e:
             raise TranscodeError(f"DV shard for shot {idx}: {e}") from e
 
@@ -2099,7 +2159,7 @@ class ShotEncoder:
         # 0.14-0.36 VMAF per CRF (see pick_crf), so measuring a window the
         # encoder never sees is worth whole CRF steps.
         args = threads + ["-ss", self._seek(w0),
-                          "-t", f"{(w1 - w0) / self.fps:.6f}",
+                          "-t", f"{self._span(w0, w1):.6f}",
                           "-i", str(self.source)]
         vf: List[str] = []
         rate = self._probing_rate()
@@ -2257,9 +2317,7 @@ class ShotEncoder:
                                 lp: int, shard: Optional[Path]) -> Tuple[int, int, float]:
         ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
         in_args, vf = self._probe_input(w0, w1, shard, lp=lp)
-        # a shard already holds the subsampled frames, so the rate is the
-        # same either way: what the frames arrive at after probing_rate
-        exact_vf, exact_out = self._exact_frames(self.fps / self._probing_rate())
+        exact_vf, exact_out = self._exact_frames()
         args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
                 + in_args + ["-vf", ",".join(vf + exact_vf)] + exact_out)
         # the probe must use the same encoder configuration as the final encode
@@ -2309,7 +2367,7 @@ class ShotEncoder:
         # each file's own lead: the output's video begins where the mux put
         # it, the source's where its container did
         return ["-threads", str(max(1, threads)), "-ss", self._seek(w0, source),
-                "-t", f"{(w1 - w0) / self.fps:.6f}", "-i", str(source)]
+                "-t", f"{self._span(w0, w1):.6f}", "-i", str(source)]
 
     def _score_windows(self, w0: int, w1: int, idx: int, crf: int,
                        threads: int) -> float:
@@ -2708,7 +2766,7 @@ class ShotEncoder:
             pre, chain = dovi.dv_apply_chain(self.settings)
             args += pre
             vf.append(chain)
-        exact_vf, exact_out = self._exact_frames(self.fps)
+        exact_vf, exact_out = self._exact_frames()
         vf += exact_vf
         args += ["-ss", self._seek(s0), "-i", str(self.source),
                  "-frames:v", str(s1 - s0), "-map", "0:v:0",
@@ -2970,13 +3028,21 @@ class ShotEncoder:
             args += [f"-c:s:{i}", "srt" if convert else "copy"]
         return args
 
-    def concat_shots(self, ivf_paths: List[Path]) -> None:
+    def concat_shots(self, ivf_paths: List[Path],
+                     shots: Optional[List[Shot]] = None) -> None:
         if not ivf_paths:
             raise TranscodeError("no shot encodes to concatenate")
         list_file = self.tempdir / "concat.txt"
-        list_file.write_text(
-            "".join(f"file {concat_quote(p)}\n" for p in ivf_paths),
-            encoding="utf-8")
+        # Each entry carries its shot's duration in slots. The concat demuxer
+        # otherwise starts the next file where the previous one's last frame
+        # ended, and a frame missing at the very end of a shot (see _slot)
+        # would then pull every later shot a frame early.
+        lines = []
+        for i, p in enumerate(ivf_paths):
+            lines.append(f"file {concat_quote(p)}\n")
+            if shots is not None and i < len(shots):
+                lines.append(f"duration {self._span(*shots[i]):.6f}\n")
+        list_file.write_text("".join(lines), encoding="utf-8")
         video_only = self.tempdir / "video_only.mkv"
         args = [self.ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0",
                 "-i", str(list_file), "-c", "copy", "-fflags", "+genpts",
@@ -3147,7 +3213,7 @@ class ShotEncoder:
             ivf_paths = self.encode_all(shots, chosen)
             self._report(100.0, self.total_frames, self.total_frames)
 
-            self.concat_shots(ivf_paths)
+            self.concat_shots(ivf_paths, shots)
             self._report(100.0, self.total_frames, self.total_frames)
 
             self.verify_delivered(shots, chosen, samples)
