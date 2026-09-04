@@ -253,8 +253,9 @@ def test_settings_page_covers_every_editable_optimizer_field():
         .model_fields["optimizer"].annotation.model_fields
     )
     html = Path("app/static/settings.html").read_text()
-    body = html[html.index("const body = {"):]
-    posted = set(re.findall(r"^\s*(\w+):", body[:body.index("};")], re.M))
+    # the page renders its optimizer and GPU forms from one field table, and
+    # posts exactly the keys in it: F("<key>", ...)
+    posted = set(re.findall(r'F\("(\w+)"', html))
     missing = fields - posted - exempt
     assert not missing, f"not on the settings form and not exempt: {sorted(missing)}"
 

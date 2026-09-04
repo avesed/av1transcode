@@ -6,46 +6,120 @@
   <title>设置 - AV1 Transcode Archive</title>
   <style>
     :root {
-      --bg: #14161a; --panel: #1d2128; --border: #2c323c;
+      --bg: #14161a; --panel: #1d2128; --panel-2: #232830; --border: #2c323c;
       --text: #dfe3e9; --muted: #8b95a5; --accent: #4f9cf9;
       --ok: #3ecf6e; --warn: #e3b341; --err: #ef6b6b;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      --tag: rgba(79,156,249,.12);
     }
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-           background: var(--bg); color: var(--text); }
+    html { scroll-behavior: smooth; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+           background: var(--bg); color: var(--text); font-size: 13px; line-height: 1.5; }
     header { display: flex; align-items: center; gap: 16px; padding: 14px 22px;
-             background: var(--panel); border-bottom: 1px solid var(--border); }
+             background: var(--panel); border-bottom: 1px solid var(--border);
+             position: sticky; top: 0; z-index: 20; }
     header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    header nav { margin-left: auto; }
     header nav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-left: 14px; }
-    header nav a:hover { color: var(--text); }
-    main { padding: 20px 22px; max-width: 900px; margin: 0 auto; }
-    h2 { font-size: 15px; margin: 24px 0 12px; }
-    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-            padding: 14px 16px; margin-bottom: 10px; display: flex; align-items: center; gap: 14px; }
-    .card .name { font-weight: 600; font-size: 14px; min-width: 110px; }
-    .card .params { flex: 1; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    header nav a:hover, header nav a[aria-current] { color: var(--text); }
+    code, .mono { font-family: var(--mono); font-size: 12px; }
+
+    .wrap { display: grid; grid-template-columns: 200px minmax(0, 880px); gap: 28px;
+            padding: 22px; max-width: 1180px; margin: 0 auto; }
+    .rail { position: sticky; top: 72px; align-self: start; }
+    .rail a { display: flex; align-items: center; gap: 8px; color: var(--muted); text-decoration: none;
+              padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+    .rail a:hover { color: var(--text); background: var(--panel); }
+    .rail a.sub { padding-left: 24px; font-size: 12px; }
+    .rail a.on { color: var(--text); background: var(--panel); }
+    .rail .n { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--accent);
+               background: var(--tag); padding: 0 6px; border-radius: 99px; }
+    .rail .n:empty { display: none; }
+
+    section.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+                   padding: 18px 20px; margin-bottom: 18px; scroll-margin-top: 80px; }
+    section.card > h2 { font-size: 15px; margin: 0 0 4px; display: flex; align-items: baseline; gap: 10px; }
+    section.card > h2 small { font-weight: 400; color: var(--muted); font-size: 12px; }
+    .lede { color: var(--muted); margin: 0 0 14px; }
+    .lede b { color: var(--text); font-weight: 500; }
+    h3.group { font-size: 12px; font-weight: 600; letter-spacing: .04em; color: var(--muted);
+               margin: 18px 0 8px; padding-top: 14px; border-top: 1px solid var(--border);
+               scroll-margin-top: 80px; display: flex; gap: 10px; align-items: baseline; }
+    h3.group:first-of-type { border-top: 0; padding-top: 0; margin-top: 6px; }
+    h3.group span { font-weight: 400; letter-spacing: 0; }
+
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; }
+    .field { display: flex; flex-direction: column; gap: 4px; padding-left: 10px; border-left: 2px solid transparent; }
+    .field.changed { border-left-color: var(--accent); }
+    .field.full { grid-column: 1 / -1; }
+    .field label { display: flex; align-items: baseline; gap: 8px; font-size: 12px; font-weight: 500; }
+    .field label code { color: var(--muted); font-weight: 400; }
+    .field .ctl { display: flex; align-items: center; gap: 8px; }
+    .field input, .field select { background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 7px 10px; color: var(--text); font-size: 13px; width: 100%;
+      font-family: var(--mono); }
+    .field select { font-family: inherit; }
+    .field input:focus, .field select:focus, button:focus-visible, .rail a:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 1px; }
+    .field .unit { color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+    .field .meta { display: flex; gap: 10px; align-items: baseline; }
+    .field .help { color: var(--muted); font-size: 12px; flex: 1; }
+    .field .dflt { flex: none; font-family: var(--mono); font-size: 11px; color: var(--muted);
+                   background: transparent; border: 1px dashed var(--border); border-radius: 4px;
+                   padding: 1px 6px; cursor: pointer; white-space: nowrap; }
+    .field.changed .dflt { color: var(--accent); border-color: var(--accent); border-style: solid; background: var(--tag); }
+    .field .dflt:hover { color: var(--text); }
+
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+             padding: 7px 14px; cursor: pointer; font-size: 13px; font-family: inherit; }
+    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    button.ghost:hover { color: var(--text); border-color: var(--muted); }
+    button.danger { background: transparent; border: 1px solid var(--err); color: var(--err); }
+    button:disabled { opacity: .5; cursor: default; }
+    .actions { margin-top: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .actions .state { color: var(--muted); font-size: 12px; }
+    .actions .state.ok { color: var(--ok); } .actions .state.err { color: var(--err); } .actions .state.warn { color: var(--warn); }
+
+    /* GPU readout */
+    .devices { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin: 6px 0 14px; }
+    .dev { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+    .dev .k { color: var(--muted); font-size: 11px; letter-spacing: .04em; display: flex; align-items: center; gap: 6px; }
+    .dev .v { font-family: var(--mono); font-size: 12px; margin-top: 4px; word-break: break-word; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+    .dot.ok { background: var(--ok); } .dot.err { background: var(--err); } .dot.warn { background: var(--warn); }
+    .paths { display: flex; flex-direction: column; gap: 4px; margin: 0 0 14px; font-size: 12px; }
+    .paths div { display: flex; gap: 10px; align-items: baseline; }
+    .paths .k { color: var(--muted); min-width: 92px; }
+    .paths .v { font-family: var(--mono); }
+    .check { margin-top: 10px; font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+    .check.ok { color: var(--ok); } .check.err { color: var(--err); }
+
+    /* presets */
+    .plist .card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+                   padding: 12px 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 14px; }
+    .plist .name { font-weight: 600; font-size: 14px; min-width: 110px; }
+    .plist .params { flex: 1; color: var(--muted); font-size: 12px; font-family: var(--mono); line-height: 1.5; }
     .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; }
     .badge.builtin { background: rgba(139,149,165,.15); color: var(--muted); }
-    .badge.user { background: rgba(79,156,249,.15); color: var(--accent); }
-    .card button { margin-left: 4px; }
-    button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
-             padding: 6px 12px; cursor: pointer; font-size: 12px; }
-    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
-    button.danger { background: transparent; border: 1px solid var(--err); color: var(--err); }
-    form.editor { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-                  padding: 16px; margin-bottom: 14px; display: none; }
+    .badge.user { background: var(--tag); color: var(--accent); }
+    form.editor { display: none; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 12px 0; }
     form.editor.open { display: block; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 14px; }
-    .field { display: flex; flex-direction: column; gap: 4px; }
-    .field label { color: var(--muted); font-size: 11px; }
-    .field input, .field select { background: var(--bg); border: 1px solid var(--border);
-      border-radius: 6px; padding: 7px 10px; color: var(--text); font-size: 13px; width: 100%; }
-    .field.full { grid-column: 1 / -1; }
-    .editor-actions { margin-top: 14px; display: flex; gap: 8px; align-items: center; }
-    #msg { margin: 10px 0; font-size: 13px; min-height: 18px; }
-    #msg.ok { color: var(--ok); } #msg.err { color: var(--err); }
-    .empty { text-align: center; color: var(--muted); padding: 20px; font-size: 13px; }
-    .hint { color: var(--muted); font-size: 12px; margin: 4px 0 14px; }
+    form.editor h4 { margin: 0 0 12px; font-size: 13px; }
+    .empty { text-align: center; color: var(--muted); padding: 20px; }
+
+    #toast { position: fixed; right: 22px; bottom: 22px; background: var(--panel-2); border: 1px solid var(--border);
+             border-radius: 8px; padding: 10px 14px; font-size: 13px; display: none; z-index: 30; max-width: 420px; }
+    #toast.ok { border-color: var(--ok); } #toast.err { border-color: var(--err); }
+
+    @media (max-width: 900px) {
+      .wrap { grid-template-columns: 1fr; padding: 14px; gap: 14px; }
+      .rail { position: sticky; top: 56px; display: flex; overflow-x: auto; gap: 4px; background: var(--bg);
+              padding: 6px 0; border-bottom: 1px solid var(--border); z-index: 10; }
+      .rail a { white-space: nowrap; } .rail a.sub { display: none; }
+      .grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -53,374 +127,454 @@
   <h1>AV1 Transcode Archive</h1>
   <nav>
     <a href="/">首页</a>
-    <a href="/static/settings.html">设置</a>
+    <a href="/static/settings.html" aria-current="page">设置</a>
     <a href="/static/docs.html">说明</a>
   </nav>
 </header>
-<main>
-  <h2>API 密钥</h2>
-  <p class="hint">仅当 config.yaml 里设置了 <code>web.api_key</code> 时才需要填。写操作（提交/取消任务、改预设与设置）和目录浏览都会校验它。密钥<b>只存在这台浏览器的 localStorage 里</b>，不会回传给服务端保存——服务端的密钥始终以 config.yaml 为准。留空 = 服务端也没设，全部开放。</p>
-  <form class="editor open" id="keyForm" style="margin-bottom:24px">
-    <div class="field">
-      <label>web.api_key</label>
-      <input type="password" id="apiKeyInput" placeholder="留空表示服务端未启用密钥" autocomplete="off">
-    </div>
-    <div class="editor-actions">
-      <button type="submit">保存到本浏览器</button>
-      <span class="hint" id="keyState" style="margin:0"></span>
-    </div>
-  </form>
+<div class="wrap">
+  <nav class="rail" id="rail">
+    <a href="#sec-key">API 密钥</a>
+    <a href="#sec-workers">并行处理</a>
+    <a href="#sec-gpu">GPU <span class="n" data-count="gpu"></span></a>
+    <a href="#sec-opt">优化器引擎 <span class="n" data-count="opt"></span></a>
+    <a href="#grp-detect" class="sub">分镜</a>
+    <a href="#grp-probe" class="sub">探测</a>
+    <a href="#grp-score" class="sub">打分</a>
+    <a href="#grp-res" class="sub">并发与内存</a>
+    <a href="#grp-verify" class="sub">校验与调试</a>
+    <a href="#sec-safety">危险操作</a>
+    <a href="#sec-presets">编码预设</a>
+  </nav>
+  <main>
 
-  <h2>并行处理</h2>
-  <p class="hint">同时转码的任务数（concurrency）与每个任务内部的 av1an 切片并行数（av1an_workers，0=自动吃满所有核心）。修改即时生效并持久化到 settings_file。</p>
-  <form class="editor open" id="workersForm" style="margin-bottom:24px">
-    <div class="grid">
-      <div class="field">
-        <label>concurrency（并行任务数）</label>
-        <input type="number" id="w-concurrency" min="1" max="64">
+  <section class="card" id="sec-key">
+    <h2>API 密钥</h2>
+    <p class="lede">只在 config.yaml 设置了 <code>web.api_key</code> 时需要。写操作和目录浏览都会校验它；密钥只存在<b>这台浏览器</b>的 localStorage 里，不会发给服务端保存。</p>
+    <form id="keyForm">
+      <div class="grid">
+        <div class="field full">
+          <label>密钥 <code>web.api_key</code></label>
+          <div class="ctl"><input type="password" id="apiKeyInput" placeholder="留空 = 服务端没启用密钥" autocomplete="off"></div>
+        </div>
       </div>
-      <div class="field">
-        <label>av1an_workers（任务内切片并行，0=自动）</label>
-        <input type="number" id="w-av1an_workers" min="0" max="128">
-      </div>
-    </div>
-    <div class="editor-actions">
-      <button type="submit" id="workersSaveBtn">保存并行设置</button>
-      <span class="hint" id="workersActive" style="margin:0"></span>
-    </div>
-  </form>
+      <div class="actions"><button type="submit">保存到本浏览器</button><span class="state" id="keyState"></span></div>
+    </form>
+  </section>
 
-  <h2>Shot-based 优化器引擎（engine=optimizer）</h2>
-  <p class="hint">Netflix 风格：PySceneDetect 分镜 → 所有片段<b>并行</b>探测一组 CRF → 插值出精细的每段 CRF → 并行编码 → 拼接。质量指标可选 VMAF（默认，按分辨率自动选 1080p/4K 模型）、SSIMULACRA2（最敏感但慢约 9 倍）或 XPSNR（为 UHD/HDR 设计，单位 dB）；后两者量纲与 VMAF 不同，切换后 target_quality 需重新定标。探测在<b>源分辨率</b>下进行（探测分辨率与正式编码不一致会让选出的 CRF 失真），送进 VMAF 前两路统一缩到 vmaf_width。probe_workers=0 时按内存自动。</p>
-  <form class="editor open" id="optimizerForm" style="margin-bottom:24px">
-    <div class="grid">
-      <div class="field">
-        <label>probe_crfs（探测 CRF 网格，逗号分隔）</label>
-        <input type="text" id="o-probe_crfs" placeholder="20,26,32,38,44">
+  <section class="card" id="sec-workers">
+    <h2>并行处理</h2>
+    <p class="lede">同时转码的任务数，以及每个 av1an 任务内部的切片并行数。保存后立即生效。</p>
+    <form id="workersForm">
+      <div class="grid">
+        <div class="field">
+          <label>并行任务数 <code>concurrency</code></label>
+          <div class="ctl"><input type="number" id="w-concurrency" min="1" max="64"></div>
+          <div class="help">同时跑几个转码任务。每个 optimizer 任务自己会吃满分给它的核。</div>
+        </div>
+        <div class="field">
+          <label>av1an 切片并行 <code>av1an_workers</code></label>
+          <div class="ctl"><input type="number" id="w-av1an_workers" min="0" max="128"></div>
+          <div class="help">0 = 自动，按核数分。只对 engine=av1an 有效。</div>
+        </div>
       </div>
-      <div class="field">
-        <label>probe_preset（探测编码速度，越快越失真）</label>
-        <input type="number" id="o-probe_preset" min="0" max="13">
-      </div>
-      <div class="field">
-        <label>probe_scale（留空=源分辨率，建议留空；填了 CRF 映射会失真）</label>
-        <input type="text" id="o-probe_scale">
-      </div>
-      <div class="field">
-        <label>probing_rate（每隔 n 帧探测）</label>
-        <input type="number" id="o-probing_rate" min="1" max="10">
-      </div>
-      <div class="field">
-        <label>probe_bracket_width（自适应探测：细分到目标所在区间不超过这么宽，0=跑完整网格）</label>
-        <input type="number" id="o-probe_bracket_width" min="0">
-      </div>
-      <div class="field">
-        <label>probe_max_frames（每镜头探测帧数上限，超长镜头取中间一段连续帧）</label>
-        <input type="number" id="o-probe_max_frames" min="24">
-      </div>
-      <div class="field">
-        <label>probe_workers（并行探测数，0=按内存自动）</label>
-        <input type="number" id="o-probe_workers" min="0" max="256">
-      </div>
-      <div class="field">
-        <label>encode_workers（并行正式编码数，0=按内存自动，防 4K OOM）</label>
-        <input type="number" id="o-encode_workers" min="0" max="128">
-      </div>
-      <div class="field">
-        <label>encode_threads（每个编码实例分配的 CPU 核数，0=自动=核数/实例数）</label>
-        <input type="number" id="o-encode_threads" min="0" max="512">
-      </div>
-      <div class="field">
-        <label>scenedetect_threshold（分镜灵敏度，越高分镜越少）</label>
-        <input type="number" id="o-scenedetect_threshold" min="0" step="0.5">
-      </div>
-      <div class="field">
-        <label>scenedetect_engine（scdet=ffmpeg 内建，快且无需落盘；pyscenedetect=旧路径）</label>
-        <select id="o-scenedetect_engine">
-          <option value="scdet">scdet</option>
-          <option value="pyscenedetect">pyscenedetect</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>scdet_threshold（切点判定门限 0-100，越低越敏感；ffmpeg 自己的默认是 10）</label>
-        <input type="number" id="o-scdet_threshold" min="0" max="100" step="0.1">
-      </div>
-      <div class="field">
-        <label>scenedetect_scale（检测前先降到此尺寸，仅为提速；空=原生）</label>
-        <input type="text" id="o-scenedetect_scale">
-      </div>
-      <div class="field">
-        <label>scenedetect_hwaccel（auto=有 QSV 就用它解码；off=一律软解）</label>
-        <select id="o-scenedetect_hwaccel">
-          <option value="auto">auto</option>
-          <option value="off">off</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>min_scene_len（最小镜头长度，帧）</label>
-        <input type="number" id="o-min_scene_len" min="0">
-      </div>
-      <div class="field">
-        <label>probe_cpu_charge（探测按 lp 的几成计入 CPU 预算，1.0=满额；调低放更多并发，代价是余量）</label>
-        <input type="number" id="o-probe_cpu_charge" min="0.1" max="1" step="0.05">
-      </div>
-      <div class="field">
-        <label>min_shot_frames（短于此帧数的镜头并入相邻镜头，0=不合并）</label>
-        <input type="number" id="o-min_shot_frames" min="0">
-      </div>
-      <div class="field">
-        <label>max_shots（镜头数量上限，超出合并最短镜头）</label>
-        <input type="number" id="o-max_shots" min="1">
-      </div>
-      <div class="field">
-        <label>max_crf_delta（相邻镜头 CRF 差上限，0=关闭平滑）</label>
-        <input type="number" id="o-max_crf_delta" min="0" step="0.5">
-      </div>
-      <div class="field">
-        <label>verify_shots（编码后抽样重新打分的镜头数，0=关闭）</label>
-        <input type="number" id="o-verify_shots" min="0">
-      </div>
-      <div class="field">
-        <label>min_crf（CRF 硬下限，0=用 probe_crfs 最小值。目标不可达时兜底防文件变大）</label>
-        <input type="number" id="o-min_crf" min="0" max="63">
-      </div>
-      <div class="field">
-        <label>probe_crf_offset（补偿探测 preset 比正式编码快造成的低估，正值=更省体积）</label>
-        <input type="number" id="o-probe_crf_offset" step="0.5">
-      </div>
-      <div class="field">
-        <label>vmaf_width（送进 VMAF 前缩到的宽度，只缩不放；0=原分辨率。仅用 1080p 模型时生效）</label>
-        <input type="number" id="o-vmaf_width" min="0" max="7680">
-      </div>
-      <div class="field">
-        <label>vmaf_model_4k（源宽 ≥ 下面阈值时改用它，且按原生分辨率测）</label>
-        <input type="text" id="o-vmaf_model_4k">
-      </div>
-      <div class="field">
-        <label>vmaf_4k_min_width（用 4K 模型的宽度阈值）</label>
-        <input type="number" id="o-vmaf_4k_min_width" min="0" max="7680">
-      </div>
-      <div class="field">
-        <label>vmaf_sycl_device（-1=关闭，用 CPU 打分；≥0=SYCL 设备号，需 Intel Arc）</label>
-        <input type="number" id="o-vmaf_sycl_device" min="-1" max="16">
-      </div>
-      <div class="field">
-        <label>vmaf_sycl_min_width（低于此宽度仍用 CPU；GPU 的收益随帧大小增长）</label>
-        <input type="number" id="o-vmaf_sycl_min_width" min="0" max="7680">
-      </div>
-      <div class="field">
-        <label>ssimulacra2_frame_step（打分侧每 n 帧取 1；逐帧度量抽帧成立，和 probing_rate 不同）</label>
-        <input type="number" id="o-ssimulacra2_frame_step" min="1" max="60">
-      </div>
-      <div class="field">
-        <label>vmaf_threads（VMAF 计算线程，0=自动）</label>
-        <input type="number" id="o-vmaf_threads" min="0">
-      </div>
-      <div class="field">
-        <label>vmaf_model（VMAF 模型路径）</label>
-        <input type="text" id="o-vmaf_model">
-      </div>
-      <div class="field">
-        <label>ssimulacra2_model（SSIMULACRA2 模型路径）</label>
-        <input type="text" id="o-ssimulacra2_model">
-      </div>
-      <div class="field">
-        <label>fractional_crf（传小数 CRF 给 SVT-AV1）</label>
-        <select id="o-fractional_crf">
-          <option value="false">false（整数 CRF，默认）</option>
-          <option value="true">true（小数 CRF，更精细）</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>keep_probes（保留探测临时文件便于调试）</label>
-        <select id="o-keep_probes">
-          <option value="false">false</option>
-          <option value="true">true</option>
-        </select>
-      </div>
-    </div>
-    <div class="editor-actions">
-      <button type="submit" id="optimizerSaveBtn">保存优化器设置</button>
-      <span class="hint" id="optimizerActive" style="margin:0"></span>
-    </div>
-  </form>
+      <div class="actions"><button type="submit">保存并行设置</button><span class="state" id="workersActive"></span></div>
+    </form>
+  </section>
 
-  <h2 style="color:#d33;margin-top:32px">危险操作</h2>
-  <p class="hint" style="color:#d33">以下开关会造成<b>不可逆的数据损失</b>，请谨慎操作。</p>
-  <form class="editor open" id="safetyForm" style="margin-bottom:24px">
-    <div class="grid">
-      <div class="field">
-        <label>转码成功后删除源文件</label>
-        <select id="s-delete_source">
-          <option value="false">false（保留源文件，推荐）</option>
-          <option value="true">true（删除源文件）</option>
-        </select>
-      </div>
+  <section class="card" id="sec-gpu">
+    <h2>GPU <small>容器里实际看得到的设备，以及现在的设置会怎么用它们</small></h2>
+    <div class="devices" id="devices"><div class="dev"><div class="k">正在检测…</div></div></div>
+    <div class="paths" id="paths"></div>
+    <div class="actions" style="margin-top:0">
+      <button type="button" class="ghost" id="gpuRefresh">重新检测</button>
+      <button type="button" class="ghost" id="gpuCheck">自检打分</button>
+      <span class="state" id="gpuNote"></span>
     </div>
-    <div class="editor-actions">
-      <button type="submit" id="safetySaveBtn">保存</button>
-      <span class="hint" id="safetyActive" style="margin:0"></span>
-    </div>
-  </form>
+    <div class="check" id="checkOut"></div>
+    <form id="gpuForm" style="margin-top:14px">
+      <div class="grid" id="gpuGrid"></div>
+      <div class="actions"><button type="submit">保存 GPU 设置</button><span class="state" id="gpuState"></span></div>
+    </form>
+  </section>
 
-  <h2>编码预设</h2>
-  <p class="hint">预设即一组编码参数（CRF、速度 preset、胶片颗粒等）。修改会持久化到 presets_file（不会改动 config.yaml）。同名自定义预设会覆盖内置预设。</p>
-  <button id="newBtn">＋ 新建预设</button>
-  <div id="msg"></div>
+  <section class="card" id="sec-opt">
+    <h2>优化器引擎 <small>engine=optimizer：分镜 → 每段并行探测 CRF → 插值 → 并行编码 → 拼接 → 抽样校验</small></h2>
+    <p class="lede">每一项都标着 config.yaml 的默认值；改过的项左侧有蓝线，点默认值标签可以单独恢复。保存只写入与默认不同的项，没改过的项会继续跟随 config.yaml。</p>
+    <form id="optimizerForm"><div id="optGroups"></div>
+      <div class="actions">
+        <button type="submit">保存优化器设置</button>
+        <button type="button" class="ghost" id="optReset">恢复 config.yaml 默认值</button>
+        <span class="state" id="optState"></span>
+      </div>
+    </form>
+  </section>
 
-  <form class="editor" id="editor">
-    <h2 id="editorTitle" style="margin-top:0">新建预设</h2>
-    <div class="grid">
-      <div class="field">
-        <label>名称（用于 CLI/API 的 --preset）</label>
-        <input type="text" id="f-name" placeholder="e.g. anime, film, speed">
+  <section class="card" id="sec-safety">
+    <h2 style="color:var(--err)">危险操作</h2>
+    <p class="lede">下面的开关会造成<b>不可逆的数据损失</b>。</p>
+    <form id="safetyForm">
+      <div class="grid">
+        <div class="field">
+          <label>转码成功后删除源文件 <code>delete_source</code></label>
+          <div class="ctl"><select id="s-delete_source">
+            <option value="false">关（保留源文件，推荐）</option>
+            <option value="true">开（删除源文件）</option>
+          </select></div>
+          <div class="help">即使输出有问题，源文件也已经没了。开启前会再确认一次。</div>
+        </div>
       </div>
-      <div class="field">
-        <label>引擎（av1an | optimizer）</label>
-        <select id="f-engine">
-          <option value="av1an">av1an（默认，串行探测）</option>
-          <option value="optimizer">optimizer（Shot-based 并行探测）</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>质量指标（optimizer 引擎）</label>
-        <select id="f-target_metric">
-          <option value="vmaf">VMAF（默认，按分辨率自动选模型）</option>
-          <option value="ssimulacra2">SSIMULACRA2（对模糊/色带最敏感，慢约 9 倍，目标值需重定标）</option>
-          <option value="xpsnr">XPSNR（ITU 标准，为 UHD/HDR 设计，单位 dB，约 42dB≈视觉无损）</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>CRF（码率质量，越低越清晰/越慢）</label>
-        <input type="number" id="f-crf" value="28" min="0" max="63">
-      </div>
-      <div class="field">
-        <label>SVT-AV1 preset（0=最慢最好, 13=最快）</label>
-        <input type="number" id="f-preset" value="4" min="0" max="13">
-      </div>
-      <div class="field">
-        <label>胶片颗粒合成（0=关, 8-10 适合颗粒电影）</label>
-        <input type="number" id="f-film_grain" value="0" min="0" max="50">
-      </div>
-      <div class="field">
-        <label>film_grain_denoise（去噪再合成颗粒）</label>
-        <select id="f-film_grain_denoise">
-          <option value="false">false</option>
-          <option value="true">true</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>passes（编码遍数）</label>
-        <input type="number" id="f-passes" value="1" min="1" max="2">
-      </div>
-      <div class="field">
-        <label>keyint（关键帧间隔）</label>
-        <input type="number" id="f-keyint" value="240" min="0">
-      </div>
-      <div class="field">
-        <label>extra_split_sec（秒，长场景再切分）</label>
-        <input type="number" id="f-extra_split_sec" value="60" min="0">
-      </div>
-      <div class="field">
-        <label>min_scene_len（最小场景长度）</label>
-        <input type="number" id="f-min_scene_len" value="24" min="0">
-      </div>
-      <div class="field">
-        <label>tune（0=VQ 1=PSNR 2=SSIM）</label>
-        <input type="number" id="f-tune" value="0" min="0" max="2">
-      </div>
-      <div class="field">
-        <label>pixel_format</label>
-        <select id="f-pixel_format">
-          <option value="yuv420p10le">yuv420p10le（默认）</option>
-          <option value="yuv420p8le">yuv420p8le</option>
-          <option value="yuv420p12le">yuv420p12le</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>target_quality（分场景质量，如 75-85，留空=固定 CRF）</label>
-        <input type="text" id="f-target_quality" placeholder="75-85">
-      </div>
-      <div class="field">
-        <label>probes（探测次数上限，0=默认4）</label>
-        <input type="number" id="f-probes" value="0" min="0" max="10">
-      </div>
-      <div class="field">
-        <label>probing_rate（每隔 n 帧探测，1=全部）</label>
-        <input type="number" id="f-probing_rate" value="0" min="0" max="4">
-      </div>
-      <div class="field">
-        <label>probe_res（探测分辨率，如 960x540）</label>
-        <input type="text" id="f-probe_res" placeholder="960x540">
-      </div>
-      <div class="field">
-        <label>probing_vmaf_features（仅 av1an 引擎生效；optimizer 忽略，如 default motionless）</label>
-        <input type="text" id="f-probing_vmaf_features" placeholder="av1an only: default motionless / weighted neg">
-      </div>
-      <div class="field">
-        <label>vmaf_threads（VMAF 计算线程数，0=自动）</label>
-        <input type="number" id="f-vmaf_threads" value="0" min="0">
-      </div>
-      <div class="field full">
-        <label>probe_video_params（探测时编码参数，建议更快 preset；copy=同正式编码）</label>
-        <input type="text" id="f-probe_video_params" placeholder="preset=10">
-      </div>
-      <div class="field full">
-        <label>additional_video_params（透传给 SVT-AV1 的额外参数，空格分隔）</label>
-        <input type="text" id="f-additional_video_params" placeholder="--sharpness 1 --enable-qm 1">
-      </div>
-    </div>
-    <div class="editor-actions">
-      <button type="submit" id="saveBtn">保存</button>
-      <button type="button" class="ghost" id="cancelBtn">取消</button>
-      <span class="hint" id="editingHint" style="margin:0"></span>
-    </div>
-  </form>
+      <div class="actions"><button type="submit" id="safetySaveBtn">保存</button><span class="state" id="safetyActive"></span></div>
+    </form>
+  </section>
 
-  <div id="list"></div>
-</main>
+  <section class="card" id="sec-presets">
+    <h2>编码预设 <small>一组编码参数；同名自定义预设覆盖内置预设</small></h2>
+    <p class="lede">修改持久化到 presets_file，不改 config.yaml。删除自定义的同名预设会恢复内置值。</p>
+    <button id="newBtn">＋ 新建预设</button>
+    <form class="editor" id="editor">
+      <h4 id="editorTitle">新建预设</h4>
+      <div class="grid">
+        <div class="field"><label>名称 <code>--preset</code></label><div class="ctl"><input type="text" id="f-name" placeholder="anime, film, speed…"></div></div>
+        <div class="field"><label>引擎 <code>engine</code></label><div class="ctl"><select id="f-engine"><option value="av1an">av1an（串行探测）</option><option value="optimizer">optimizer（分镜并行探测）</option></select></div></div>
+        <div class="field"><label>质量指标 <code>target_metric</code></label><div class="ctl"><select id="f-target_metric"><option value="vmaf">VMAF</option><option value="ssimulacra2">SSIMULACRA2（慢约 9 倍，目标值需重定标）</option><option value="xpsnr">XPSNR（dB，约 42 ≈ 视觉无损）</option></select></div><div class="help">只对 optimizer 引擎生效。</div></div>
+        <div class="field"><label>目标质量 <code>target_quality</code></label><div class="ctl"><input type="text" id="f-target_quality" placeholder="94-95"></div><div class="help">分场景目标，如 75-85；留空 = 固定 CRF。</div></div>
+        <div class="field"><label>CRF <code>crf</code></label><div class="ctl"><input type="number" id="f-crf" value="28" min="0" max="63"></div><div class="help">越低越清晰、越慢；有目标质量时只作兜底。</div></div>
+        <div class="field"><label>SVT-AV1 速度 <code>preset</code></label><div class="ctl"><input type="number" id="f-preset" value="4" min="0" max="13"></div><div class="help">0 最慢最好，13 最快。</div></div>
+        <div class="field"><label>胶片颗粒合成 <code>film_grain</code></label><div class="ctl"><input type="number" id="f-film_grain" value="0" min="0" max="50"></div><div class="help">0 关；颗粒电影 8-10。</div></div>
+        <div class="field"><label>先去噪再合成颗粒 <code>film_grain_denoise</code></label><div class="ctl"><select id="f-film_grain_denoise"><option value="false">关</option><option value="true">开</option></select></div></div>
+        <div class="field"><label>编码遍数 <code>passes</code></label><div class="ctl"><input type="number" id="f-passes" value="1" min="1" max="2"></div></div>
+        <div class="field"><label>关键帧间隔 <code>keyint</code></label><div class="ctl"><input type="number" id="f-keyint" value="240" min="0"><span class="unit">帧</span></div></div>
+        <div class="field"><label>长场景再切分 <code>extra_split_sec</code></label><div class="ctl"><input type="number" id="f-extra_split_sec" value="60" min="0"><span class="unit">秒</span></div></div>
+        <div class="field"><label>最小场景长度 <code>min_scene_len</code></label><div class="ctl"><input type="number" id="f-min_scene_len" value="24" min="0"><span class="unit">帧</span></div></div>
+        <div class="field"><label>tune <code>tune</code></label><div class="ctl"><input type="number" id="f-tune" value="0" min="0" max="2"></div><div class="help">0 = VQ，1 = PSNR，2 = SSIM。</div></div>
+        <div class="field"><label>像素格式 <code>pixel_format</code></label><div class="ctl"><select id="f-pixel_format"><option value="yuv420p10le">yuv420p10le</option><option value="yuv420p8le">yuv420p8le</option><option value="yuv420p12le">yuv420p12le</option></select></div></div>
+        <div class="field"><label>探测次数上限 <code>probes</code></label><div class="ctl"><input type="number" id="f-probes" value="0" min="0" max="10"></div><div class="help">av1an 引擎；0 = 默认 4。</div></div>
+        <div class="field"><label>探测抽帧 <code>probing_rate</code></label><div class="ctl"><input type="number" id="f-probing_rate" value="0" min="0" max="4"></div><div class="help">每隔 n 帧探测一帧；0 = 用优化器设置。</div></div>
+        <div class="field"><label>探测分辨率 <code>probe_res</code></label><div class="ctl"><input type="text" id="f-probe_res" placeholder="960x540"></div><div class="help">av1an 引擎。</div></div>
+        <div class="field"><label>VMAF 特征 <code>probing_vmaf_features</code></label><div class="ctl"><input type="text" id="f-probing_vmaf_features" placeholder="default motionless"></div><div class="help">只对 av1an 引擎生效，optimizer 忽略。</div></div>
+        <div class="field"><label>VMAF 线程 <code>vmaf_threads</code></label><div class="ctl"><input type="number" id="f-vmaf_threads" value="0" min="0"></div><div class="help">0 = 自动。写了会盖过优化器设置里的值，包括校验阶段。</div></div>
+        <div class="field full"><label>探测编码参数 <code>probe_video_params</code></label><div class="ctl"><input type="text" id="f-probe_video_params" placeholder="preset=10"></div><div class="help">copy = 与正式编码相同。</div></div>
+        <div class="field full"><label>SVT-AV1 额外参数 <code>additional_video_params</code></label><div class="ctl"><input type="text" id="f-additional_video_params" placeholder="--sharpness 1 --enable-qm 1"></div></div>
+      </div>
+      <div class="actions"><button type="submit" id="saveBtn">保存预设</button><button type="button" class="ghost" id="cancelBtn">取消</button><span class="state" id="editingHint"></span></div>
+    </form>
+    <div class="plist" id="list"></div>
+  </section>
+  </main>
+</div>
+<div id="toast"></div>
 <script src="/static/apikey.js"></script>
 <script>
-const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const $ = id => document.getElementById(id);
-let msgTimer = null;
-function showMsg(text, ok) {
-  const m = $("msg");
-  m.textContent = text; m.className = ok ? "ok" : "err";
-  clearTimeout(msgTimer); msgTimer = setTimeout(() => { m.textContent = ""; m.className = ""; }, 4000);
+let toastTimer = null;
+function toast(text, ok) {
+  const t = $("toast");
+  t.textContent = text; t.className = ok ? "ok" : "err"; t.style.display = "block";
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.style.display = "none"; }, ok ? 3500 : 7000);
 }
 async function api(url, opts) {
   const r = await afetch(url, opts);
   if (!r.ok) {
-    // A 401 has a specific remedy, and "HTTP 401" does not name it.
     let msg = authHint(r.status) || `HTTP ${r.status}`;
     if (r.status !== 401) {
-      try { const b = await r.json(); if (b && b.detail) msg = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch(_) {}
+      try { const b = await r.json(); if (b && b.detail) msg = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch (_) {}
     }
     throw new Error(msg);
   }
   return r.json();
 }
+const jsonPut = body => ({ method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+/* ------------------------------------------------------------------ fields
+ * One table drives the optimizer and GPU forms: key, short name, one line of
+ * help, control type. Values come from /api/settings/optimizer, defaults from
+ * /api/settings/optimizer/defaults; a field whose value is not the default is
+ * marked, counted in the rail, and can be put back with one click.
+ */
+const F = (key, label, help, o = {}) => ({ key, label, help, type: "number", ...o });
+const OPT_GROUPS = [
+  { id: "grp-detect", name: "分镜", note: "先把源切成镜头，后面所有探测和编码都按镜头进行", fields: [
+    F("scenedetect_engine", "分镜引擎", "scdet 是 ffmpeg 内建滤镜，一趟读完不落盘；pyscenedetect 是旧路径。", { type: "select", options: [["scdet", "scdet"], ["pyscenedetect", "pyscenedetect"]] }),
+    F("scdet_threshold", "切点门限", "scdet 的场景变化分数，0-100，越低越敏感；ffmpeg 自己的默认是 10。", { step: 0.1, min: 0, max: 100 }),
+    F("scenedetect_threshold", "灵敏度", "pyscenedetect 的内容差分阈值，越高分镜越少。", { step: 0.5, min: 0 }),
+    F("scenedetect_scale", "检测前缩放", "只为提速；空 = 原生分辨率。实测 540p 和原生选出的切点一样。", { type: "text" }),
+    F("min_scene_len", "最小镜头", "短于此帧数不切。", { min: 0, unit: "帧" }),
+    F("min_shot_frames", "合并短镜头", "短于此帧数并入相邻镜头；0 = 不合并。", { min: 0, unit: "帧" }),
+    F("max_shots", "镜头数上限", "超出时合并最短的镜头。", { min: 1 }),
+  ]},
+  { id: "grp-probe", name: "探测", note: "每个镜头在源分辨率下用快速 preset 编几个 CRF，量出它自己的质量曲线", fields: [
+    F("probe_crfs", "CRF 网格", "逗号分隔的整数，从这里出发二分。", { type: "csv" , wide: true}),
+    F("probe_bracket_width", "二分停止宽度", "目标所在区间窄于此就停；0 = 跑完整网格。", { min: 0 }),
+    F("probe_preset", "探测速度", "SVT-AV1 preset，比正式编码快；4K 下 SVT 自动降到 9。", { min: 0, max: 13 }),
+    F("probe_max_frames", "探测窗口", "每镜头最多探测这么多连续帧，超长镜头取中间一段。", { min: 24, unit: "帧" }),
+    F("probing_rate", "抽帧", "每隔 n 帧探测一帧。大于 1 会低估质量，建议 1。", { min: 1, max: 10 }),
+    F("probe_scale", "探测分辨率", "留空 = 源分辨率。填了等于在另一个分辨率上量曲线，CRF 会失真。", { type: "text" }),
+    F("probe_crf_offset", "CRF 补偿", "探测 preset 快、会低估成品质量，正值把这部分换回体积。校验阶段会报出实际偏差。", { step: 0.5 }),
+    F("min_crf", "CRF 下限", "目标达不到时兜底，防文件变大；0 = 网格最小值。", { min: 0, max: 63 }),
+    F("max_crf_delta", "相邻镜头 CRF 差上限", "平滑相邻镜头的 CRF；0 = 不平滑。", { step: 0.5, min: 0 }),
+    F("fractional_crf", "小数 CRF", "把插值出来的小数 CRF 传给 SVT-AV1。", { type: "bool" }),
+  ]},
+  { id: "grp-score", name: "打分", note: "用什么模型、在什么分辨率上比较探测编码和源", fields: [
+    F("vmaf_model", "VMAF 模型", "1080p 模型的路径。", { type: "text" , wide: true}),
+    F("vmaf_model_4k", "4K 模型", "源宽度达到下面的阈值时改用它，并按原生分辨率打分。", { type: "text" , wide: true}),
+    F("vmaf_4k_min_width", "用 4K 模型的宽度", "低于此宽度用 1080p 模型。", { min: 0, max: 7680, unit: "px" }),
+    F("vmaf_width", "送入 VMAF 的宽度", "只缩不放；0 = 原分辨率。只在用 1080p 模型时生效。", { min: 0, max: 7680, unit: "px" }),
+    F("vmaf_threads", "VMAF 线程", "0 = 自动：探测按每个 worker 分到的核，校验按核数一半。显式值会两边都用，实测 4K 上 40 比自动慢 30%、内存翻倍。", { min: 0 }),
+    F("ssimulacra2_model", "SSIMULACRA2 模型", "", { type: "text" , wide: true}),
+    F("ssimulacra2_frame_step", "SSIMULACRA2 抽帧", "打分侧每 n 帧取 1；逐帧度量抽帧成立，和探测抽帧不同。", { min: 1, max: 60 }),
+  ]},
+  { id: "grp-res", name: "并发与内存", note: "0 都是按容器的 cgroup 预算自动算", fields: [
+    F("probe_workers", "并行探测数", "0 = 按内存自动。", { min: 0, max: 256 }),
+    F("encode_workers", "并行正式编码数", "0 = 按内存自动；每个 4K 实例持有几 GB 帧池。", { min: 0, max: 128 }),
+    F("encode_threads", "每个编码实例的核数", "0 = 自动 = 核数 / 实例数。", { min: 0, max: 512 }),
+    F("probe_cpu_charge", "探测的 CPU 计费", "探测按 lp 的几成计入 CPU 预算，1.0 = 满额；调低放更多并发，代价是余量。", { step: 0.05, min: 0.1, max: 1 }),
+  ]},
+  { id: "grp-verify", name: "校验与调试", note: "编码完成后抽几个镜头重新打分，对账探测预测和实际交付", fields: [
+    F("verify_shots", "抽验镜头数", "0 = 关闭。这是全流程唯一的对账机制。", { min: 0 }),
+    F("keep_probes", "保留探测文件", "调试用。", { type: "bool" }),
+  ]},
+];
+const GPU_FIELDS = [
+  F("vmaf_sycl_device", "VMAF 打分设备", "用 libvmaf 的 SYCL 后端在 GPU 上打分。关闭 = CPU。作业开始时会先自检一次，设备不可用则整个作业退回 CPU。", { type: "sycl" }),
+  F("vmaf_sycl_min_width", "GPU 打分的最小宽度", "源窄于此仍用 CPU：GPU 的收益随帧大小增长，1080p 上 CPU 本来就只要两秒。", { min: 0, max: 7680, unit: "px" }),
+  F("scenedetect_hwaccel", "分镜解码", "auto = 有 QSV 就用它解码分镜那一趟；off = 一律软解。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
+  F("vulkan_device", "Dolby Vision P5 转换设备", "libplacebo 应用 RPU 用的 Vulkan 设备，ffmpeg 的 -init_hw_device 选择器：序号或名字片段。空 = 让 ffmpeg 挑，有 GPU 就用 GPU；写 llvmpipe 强制软件渲染。", { type: "vulkan", wide: true }),
+];
+const GPU_KEYS = new Set(["vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel"]);
+
+let optDefaults = {}, optValues = {};
+const fieldEl = new Map();   // key -> .field element
+
+function control(f, id) {
+  if (f.type === "select" || f.type === "bool") {
+    const opts = f.type === "bool" ? [["false", "关"], ["true", "开"]] : f.options;
+    return `<select id="${id}" data-key="${f.key}">${opts.map(([v, t]) => `<option value="${esc(v)}">${esc(t)}</option>`).join("")}</select>`;
+  }
+  if (f.type === "sycl") return `<select id="${id}" data-key="${f.key}"><option value="-1">关闭：用 CPU 打分</option></select>`;
+  if (f.type === "vulkan") return `<input type="text" id="${id}" data-key="${f.key}" list="vkList" placeholder="空 = 自动">` + `<datalist id="vkList"></datalist>`;
+  if (f.type === "text" || f.type === "csv") return `<input type="text" id="${id}" data-key="${f.key}">`;
+  const a = [f.min !== undefined ? `min="${f.min}"` : "", f.max !== undefined ? `max="${f.max}"` : "", f.step !== undefined ? `step="${f.step}"` : ""].join(" ");
+  return `<input type="number" id="${id}" data-key="${f.key}" ${a}>`;
+}
+function renderField(f, prefix) {
+  const id = `${prefix}-${f.key}`;
+  const div = document.createElement("div");
+  div.className = "field" + (f.wide ? " full" : "");
+  div.innerHTML = `<label for="${id}">${esc(f.label)} <code>${esc(f.key)}</code></label>
+    <div class="ctl">${control(f, id)}${f.unit ? `<span class="unit">${esc(f.unit)}</span>` : ""}</div>
+    <div class="meta"><div class="help">${esc(f.help || "")}</div>
+    <button type="button" class="dflt" data-reset="${f.key}" title="恢复 config.yaml 的值"></button></div>`;
+  fieldEl.set(f.key, div);
+  return div;
+}
+function fmt(v) { return Array.isArray(v) ? v.join(",") : (v === true ? "开" : v === false ? "关" : (v === "" || v === null || v === undefined) ? "空" : String(v)); }
+function readValue(key, el) {
+  const f = [...OPT_GROUPS.flatMap(g => g.fields), ...GPU_FIELDS].find(x => x.key === key);
+  const raw = el.value;
+  if (f.type === "bool") return raw === "true";
+  if (f.type === "csv") return String(raw).split(",").map(s => parseInt(s.trim(), 10)).filter(Number.isInteger);
+  if (f.type === "text" || f.type === "vulkan" || f.type === "select") return String(raw).trim();
+  if (f.type === "sycl") return parseInt(raw, 10);
+  const n = f.step && String(f.step).includes(".") ? parseFloat(raw) : parseInt(raw, 10);
+  return Number.isFinite(n) ? n : optDefaults[key];
+}
+function writeValue(key, el, v) {
+  const f = [...OPT_GROUPS.flatMap(g => g.fields), ...GPU_FIELDS].find(x => x.key === key);
+  if (f.type === "bool") el.value = String(!!v);
+  else if (f.type === "csv") el.value = (v || []).join(",");
+  else el.value = v === null || v === undefined ? "" : String(v);
+}
+function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+function refreshMarks() {
+  let nOpt = 0, nGpu = 0;
+  for (const [key, div] of fieldEl) {
+    if (!(key in optDefaults)) { div.querySelector(".dflt").style.display = "none"; continue; }
+    const el = div.querySelector("[data-key]");
+    const changed = !same(readValue(key, el), optDefaults[key]);
+    div.classList.toggle("changed", changed);
+    div.querySelector(".dflt").textContent = `默认 ${fmt(optDefaults[key])}`;
+    if (changed) { if (GPU_KEYS.has(key)) nGpu++; else nOpt++; }
+  }
+  document.querySelector('[data-count="opt"]').textContent = nOpt || "";
+  document.querySelector('[data-count="gpu"]').textContent = nGpu || "";
+  $("optState").textContent = nOpt ? `${nOpt} 项与 config.yaml 不同` : "与 config.yaml 一致";
+  $("optState").className = "state";
+  return { nOpt, nGpu };
+}
+function buildForms() {
+  const host = $("optGroups");
+  for (const g of OPT_GROUPS) {
+    const h = document.createElement("h3"); h.className = "group"; h.id = g.id;
+    h.innerHTML = `${esc(g.name)} <span>${esc(g.note)}</span>`;
+    const grid = document.createElement("div"); grid.className = "grid";
+    for (const f of g.fields) grid.appendChild(renderField(f, "o"));
+    host.appendChild(h); host.appendChild(grid);
+  }
+  for (const f of GPU_FIELDS) $("gpuGrid").appendChild(renderField(f, "g"));
+  document.addEventListener("input", e => { if (e.target.matches("[data-key]")) refreshMarks(); });
+  document.addEventListener("click", e => {
+    const b = e.target.closest("button[data-reset]");
+    if (!b) return;
+    const key = b.dataset.reset;
+    if (!(key in optDefaults)) return;
+    writeValue(key, fieldEl.get(key).querySelector("[data-key]"), optDefaults[key]);
+    refreshMarks();
+  });
+}
+async function loadOptimizer() {
+  try {
+    const [values, d] = await Promise.all([api("/api/settings/optimizer"), api("/api/settings/optimizer/defaults")]);
+    optValues = values; optDefaults = d.defaults;
+    // the GPU form owns its keys: reloading this form must not discard an
+    // edit sitting unsaved over there
+    for (const [key, div] of fieldEl) if (key in values && !GPU_KEYS.has(key)) writeValue(key, div.querySelector("[data-key]"), values[key]);
+    refreshMarks();
+  } catch (err) { $("optState").textContent = `读取失败：${err.message}`; $("optState").className = "state err"; }
+}
+$("optimizerForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const body = {};
+  for (const g of OPT_GROUPS) for (const f of g.fields) body[f.key] = readValue(f.key, fieldEl.get(f.key).querySelector("[data-key]"));
+  if (!body.probe_crfs.length) { toast("CRF 网格至少要一个整数", false); return; }
+  try {
+    const r = await api("/api/settings/optimizer", jsonPut(body));
+    const n = Object.keys(r.overrides || {}).length;
+    toast(n ? `已保存，${n} 项写入 settings.json` : "已保存，与 config.yaml 一致，settings.json 里不再有 optimizer 块", true);
+    await loadOptimizer();
+  } catch (err) { toast(`保存失败：${err.message}`, false); }
+});
+$("optReset").addEventListener("click", async () => {
+  const { nOpt, nGpu } = refreshMarks();
+  if (!confirm(`把优化器和 GPU 的 ${nOpt + nGpu} 项改动全部恢复为 config.yaml 的值？`)) return;
+  try {
+    await api("/api/settings/optimizer", { method: "DELETE" });
+    toast("已恢复 config.yaml 默认值", true);
+    await loadOptimizer(); await loadGpu();
+  } catch (err) { toast(`恢复失败：${err.message}`, false); }
+});
+
+/* ------------------------------------------------------------------ GPU */
+let gpuStatus = null;
+function dev(k, v, state) {
+  return `<div class="dev"><div class="k"><span class="dot ${state || ""}"></span>${esc(k)}</div><div class="v">${v}</div></div>`;
+}
+function renderGpu(data) {
+  const s = data.status, g = data.settings; gpuStatus = s;
+  const nodes = s.render_nodes || [];
+  const cards = [];
+  cards.push(dev("渲染节点", nodes.length ? nodes.map(esc).join("<br>") : "没有 /dev/dri/renderD*：容器里看不到 GPU", nodes.length ? "ok" : "err"));
+  if (!s.sycl_built) cards.push(dev("SYCL 打分", "这个镜像的 libvmaf 没有 SYCL 后端", "err"));
+  else if (s.sycl.device) cards.push(dev("SYCL 打分", `${esc(s.sycl.device)}${s.sycl.count ? `<br><span style="color:var(--muted)">${s.sycl.count} 个设备</span>` : ""}`, "ok"));
+  else cards.push(dev("SYCL 打分", esc(s.sycl.error || "后端在，但没有可用设备") + (s.sycl.count !== null && s.sycl.count !== undefined ? `<br><span style="color:var(--muted)">${s.sycl.count} 个设备</span>` : ""), s.sycl.count ? "warn" : "err"));
+  const vk = s.vulkan.devices || [];
+  cards.push(dev("Vulkan（P5 转换）", vk.length ? vk.map((d, i) => `${i}: ${esc(d)}`).join("<br>") : esc(s.vulkan.error || "没有 Vulkan 设备"), vk.some(d => !/llvmpipe|\(cpu\)/i.test(d)) ? "ok" : vk.length ? "warn" : "err"));
+  cards.push(dev("硬件解码", `QSV ${s.qsv ? "可用" : "不可用"} · VA-API ${s.vaapi ? "可用" : "不可用"}`, s.qsv || s.vaapi ? "ok" : "warn"));
+  $("devices").innerHTML = cards.join("");
+  // what the current settings make of it
+  const paths = [];
+  const scoringGpu = g.vmaf_sycl_device >= 0 && s.sycl_built && s.sycl.device;
+  paths.push(["VMAF 打分", g.vmaf_sycl_device < 0 ? "CPU（关闭）" : scoringGpu ? `GPU · ${esc(s.sycl.device)}，源宽 ≥ ${g.vmaf_sycl_min_width}px 时` : `设置为设备 ${g.vmaf_sycl_device}，但现在不可用 → 作业会退回 CPU`]);
+  const vkPick = g.vulkan_device ? `按选择器 "${esc(g.vulkan_device)}"` : (vk.length ? `自动 → ${esc(vk[0])}` : "自动，但没有设备");
+  paths.push(["P5 转换", vkPick]);
+  paths.push(["分镜解码", g.scenedetect_hwaccel === "off" ? "软解" : s.qsv ? "QSV" : "auto，但 QSV 不可用 → 软解"]);
+  $("paths").innerHTML = paths.map(([k, v]) => `<div><span class="k">${esc(k)}</span><span class="v">${v}</span></div>`).join("");
+  $("gpuNote").textContent = `检测于 ${new Date(s.checked_at * 1000).toLocaleTimeString()}`;
+  // SYCL device picker
+  const sel = fieldEl.get("vmaf_sycl_device").querySelector("select");
+  const count = s.sycl.count || (s.sycl.device ? 1 : 0);
+  let html = `<option value="-1">关闭：用 CPU 打分</option>`;
+  for (let i = 0; i < Math.max(count, g.vmaf_sycl_device >= 0 ? g.vmaf_sycl_device + 1 : 0); i++)
+    html += `<option value="${i}">设备 ${i}${i === Math.max(0, g.vmaf_sycl_device) && s.sycl.device ? `：${esc(s.sycl.device)}` : ""}</option>`;
+  sel.innerHTML = html;
+  const dl = $("vkList");
+  if (dl) dl.innerHTML = [...vk.map((d, i) => `<option value="${i}">${esc(d)}</option>`), `<option value="llvmpipe">软件渲染</option>`].join("");
+  for (const f of GPU_FIELDS) writeValue(f.key, fieldEl.get(f.key).querySelector("[data-key]"), g[f.key]);
+  refreshMarks();
+}
+async function loadGpu(refresh) {
+  try { renderGpu(await api(`/api/gpu${refresh ? "?refresh=true" : ""}`)); }
+  catch (err) { $("devices").innerHTML = dev("检测失败", esc(err.message), "err"); }
+}
+$("gpuRefresh").addEventListener("click", async () => { $("gpuRefresh").disabled = true; await loadGpu(true); $("gpuRefresh").disabled = false; });
+$("gpuCheck").addEventListener("click", async () => {
+  const dev = parseInt(fieldEl.get("vmaf_sycl_device").querySelector("select").value, 10);
+  const out = $("checkOut"); out.className = "check"; out.textContent = `正在设备 ${Math.max(0, dev)} 和 CPU 上各打一遍分…`;
+  $("gpuCheck").disabled = true;
+  try {
+    const r = await api("/api/gpu/selfcheck", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: Math.max(0, dev) }) });
+    if (r.ok) { out.className = "check ok"; out.textContent = `GPU ${r.gpu.toFixed(4)} · CPU ${r.cpu.toFixed(4)} · 差 ${r.delta.toExponential(1)} · ${r.device} · ${r.elapsed}s\n和优化器开工前的自检完全一样：后端自报了设备，两边分数一致。`; }
+    else { out.className = "check err"; out.textContent = `未通过：${r.error || (!r.announced ? "后端没有自报 SYCL，可能是在 CPU 上算的" : `GPU ${r.gpu} 与 CPU ${r.cpu} 相差 ${r.delta}`)}\n作业会自动退回 CPU 打分。`; }
+  } catch (err) { out.className = "check err"; out.textContent = `自检失败：${err.message}`; }
+  $("gpuCheck").disabled = false;
+});
+$("gpuForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const body = {};
+  for (const f of GPU_FIELDS) body[f.key] = readValue(f.key, fieldEl.get(f.key).querySelector("[data-key]"));
+  try {
+    await api("/api/settings/gpu", jsonPut(body));
+    toast(body.vmaf_sycl_device >= 0 ? "已保存 GPU 设置：VMAF 将在 GPU 上打分，每个作业开工前自检一次" : "已保存 GPU 设置", true);
+    await loadGpu(); await loadOptimizer();
+  } catch (err) { toast(`保存失败：${err.message}`, false); }
+});
+
+/* ------------------------------------------------------------- workers */
+async function loadWorkers() {
+  try {
+    const w = await api("/api/workers");
+    $("w-concurrency").value = w.concurrency; $("w-av1an_workers").value = w.av1an_workers;
+    $("workersActive").textContent = `运行中的 worker：${w.active_worker_count}`;
+  } catch (err) { $("workersActive").textContent = `读取失败：${err.message}`; $("workersActive").className = "state err"; }
+}
+$("workersForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const concurrency = parseInt($("w-concurrency").value, 10), av1an_workers = parseInt($("w-av1an_workers").value, 10);
+  if (!concurrency || concurrency < 1) { toast("并行任务数至少为 1", false); return; }
+  try {
+    const r = await api("/api/settings/workers", jsonPut({ concurrency, av1an_workers }));
+    toast(`已保存并行设置：${r.workers.concurrency} 个任务，av1an 切片 ${r.workers.av1an_workers || "自动"}`, true);
+    loadWorkers();
+  } catch (err) { toast(`保存失败：${err.message}`, false); }
+});
+
+/* -------------------------------------------------------------- safety */
+async function loadSafety() {
+  try {
+    const s = await api("/api/settings/safety");
+    $("s-delete_source").value = String(s.delete_source);
+    $("safetyActive").textContent = s.delete_source ? "已开启：转码成功后源文件会被删除" : "关闭：保留源文件";
+    $("safetyActive").className = "state" + (s.delete_source ? " warn" : "");
+  } catch (err) { $("safetyActive").textContent = `读取失败：${err.message}`; }
+}
+$("safetyForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const enabled = $("s-delete_source").value === "true";
+  if (enabled && !confirm("开启后，每个转码成功的任务都会删除原始源文件。\n\n这一步不可逆：即使输出有问题，源文件也已经没了。\n\n确定开启？")) { $("s-delete_source").value = "false"; return; }
+  try {
+    await api("/api/settings/delete_source", jsonPut({ enabled, confirm: enabled }));
+    toast(enabled ? "已开启删除源文件" : "已关闭删除源文件", true);
+    loadSafety();
+  } catch (err) { toast(`保存失败：${err.message}`, false); }
+});
+
+/* ------------------------------------------------------------- presets */
 async function loadList() {
   const presets = await api("/api/presets");
-  const list = $("list");
-  const names = Object.keys(presets);
-  if (!names.length) { list.innerHTML = `<div class="empty">暂无预设</div>`; return; }
+  const list = $("list"), names = Object.keys(presets);
+  if (!names.length) { list.innerHTML = `<div class="empty">还没有预设</div>`; return; }
   list.innerHTML = "";
   for (const name of names.sort()) {
     const p = presets[name];
-    const lines = [
-      `crf=${p.crf} · preset=${p.preset} · passes=${p.passes}`,
-      `pix_fmt=${p.pixel_format}`,
-    ];
-    if (p.engine === "optimizer") lines.push(`engine=optimizer · metric=${p.target_metric}`);
+    const lines = [`crf=${p.crf} · preset=${p.preset} · passes=${p.passes} · ${p.pixel_format}`];
+    if (p.engine === "optimizer") lines.push(`engine=optimizer · metric=${p.target_metric}${p.target_quality ? ` · target=${p.target_quality}` : ""}`);
+    else if (p.target_quality) lines.push(`target_quality=${p.target_quality}`);
     if (p.film_grain) lines.push(`film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
-    if (p.target_quality) lines.push(`target_quality=${p.target_quality}`);
-    if (p.additional_video_params) lines.push(p.additional_video_params);
+    if (p.vmaf_threads) lines.push(`vmaf_threads=${p.vmaf_threads}`);
+    if (p.additional_video_params) lines.push(esc(p.additional_video_params));
     const card = document.createElement("div");
     card.className = "card";
-    card.innerHTML = `
-      <div class="name">${esc(name)}</div>
+    card.innerHTML = `<div class="name">${esc(name)}</div>
       <span class="badge ${p._builtin ? "builtin" : "user"}">${p._builtin ? "内置" : "自定义"}</span>
       <div class="params">${lines.join("<br>")}</div>
       <button class="ghost" data-edit="${esc(name)}">编辑</button>
@@ -428,264 +582,83 @@ async function loadList() {
     list.appendChild(card);
   }
 }
+const PRESET_KEYS = ["engine", "target_metric", "crf", "preset", "film_grain", "film_grain_denoise", "passes", "keyint", "extra_split_sec",
+  "min_scene_len", "tune", "pixel_format", "target_quality", "probes", "probing_rate", "probe_res", "probing_vmaf_features",
+  "vmaf_threads", "probe_video_params", "additional_video_params"];
+const PRESET_INT = new Set(["crf", "preset", "film_grain", "passes", "keyint", "extra_split_sec", "min_scene_len", "tune", "probes", "probing_rate", "vmaf_threads"]);
 function fillForm(name, p) {
-  $("f-name").value = name;
-  $("f-name").disabled = !!name;
-  $("f-engine").value = p?.engine ?? "av1an";
-  $("f-target_metric").value = p?.target_metric ?? "vmaf";
-  $("f-crf").value = p?.crf ?? 28;
-  $("f-preset").value = p?.preset ?? 4;
-  $("f-film_grain").value = p?.film_grain ?? 0;
-  $("f-film_grain_denoise").value = String(!!p?.film_grain_denoise);
-  $("f-passes").value = p?.passes ?? 1;
-  $("f-keyint").value = p?.keyint ?? 240;
-  $("f-extra_split_sec").value = p?.extra_split_sec ?? 60;
-  $("f-min_scene_len").value = p?.min_scene_len ?? 24;
-  $("f-tune").value = p?.tune ?? 0;
-  $("f-pixel_format").value = p?.pixel_format ?? "yuv420p10le";
-  $("f-target_quality").value = p?.target_quality ?? "";
-  $("f-probes").value = p?.probes ?? 0;
-  $("f-probing_rate").value = p?.probing_rate ?? 0;
-  $("f-probe_res").value = p?.probe_res ?? "";
-  $("f-probing_vmaf_features").value = p?.probing_vmaf_features ?? "";
-  $("f-vmaf_threads").value = p?.vmaf_threads ?? 0;
-  $("f-probe_video_params").value = p?.probe_video_params ?? "";
-  $("f-additional_video_params").value = p?.additional_video_params ?? "";
+  $("f-name").value = name; $("f-name").disabled = !!name;
+  for (const k of PRESET_KEYS) {
+    const el = $(`f-${k}`); const v = p?.[k];
+    if (k === "film_grain_denoise") el.value = String(!!v);
+    else if (v === undefined || v === null) { /* keep the html default */ }
+    else el.value = String(v);
+  }
   $("editorTitle").textContent = name ? `编辑预设 ${name}` : "新建预设";
-  $("editingHint").textContent = name ? "保存将覆盖该预设并持久化。" : "";
+  $("editingHint").textContent = name ? "保存会覆盖这个预设。" : "";
   $("editor").classList.add("open");
+  $("editor").scrollIntoView({ block: "nearest" });
 }
 function collectForm() {
-  return {
-    engine: $("f-engine").value,
-    target_metric: $("f-target_metric").value,
-    crf: parseInt($("f-crf").value, 10),
-    preset: parseInt($("f-preset").value, 10),
-    film_grain: parseInt($("f-film_grain").value, 10),
-    film_grain_denoise: $("f-film_grain_denoise").value === "true",
-    passes: parseInt($("f-passes").value, 10),
-    keyint: parseInt($("f-keyint").value, 10),
-    extra_split_sec: parseInt($("f-extra_split_sec").value, 10),
-    min_scene_len: parseInt($("f-min_scene_len").value, 10),
-    tune: parseInt($("f-tune").value, 10),
-    pixel_format: $("f-pixel_format").value,
-    target_quality: $("f-target_quality").value.trim(),
-    probes: parseInt($("f-probes").value, 10) || 0,
-    probing_rate: parseInt($("f-probing_rate").value, 10) || 0,
-    probe_res: $("f-probe_res").value.trim(),
-    probing_vmaf_features: $("f-probing_vmaf_features").value.trim(),
-    vmaf_threads: parseInt($("f-vmaf_threads").value, 10) || 0,
-    probe_video_params: $("f-probe_video_params").value.trim(),
-    additional_video_params: $("f-additional_video_params").value.trim(),
-  };
+  const out = {};
+  for (const k of PRESET_KEYS) {
+    const el = $(`f-${k}`);
+    if (k === "film_grain_denoise") out[k] = el.value === "true";
+    else if (PRESET_INT.has(k)) out[k] = parseInt(el.value, 10) || 0;
+    else out[k] = String(el.value).trim();
+  }
+  return out;
 }
-$("newBtn").addEventListener("click", () => { fillForm("", null); });
+$("newBtn").addEventListener("click", () => fillForm("", null));
 $("cancelBtn").addEventListener("click", () => { $("editor").classList.remove("open"); $("f-name").disabled = false; });
 $("editor").addEventListener("submit", async e => {
   e.preventDefault();
   const name = $("f-name").value.trim();
-  if (!name) { showMsg("请填写预设名称", false); return; }
+  if (!name) { toast("请填写预设名称", false); return; }
   try {
-    const body = collectForm();
-    await api(`/api/presets/${encodeURIComponent(name)}`, {
-      method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    showMsg(`已保存预设 "${name}"`, true);
-    $("editor").classList.remove("open");
-    $("f-name").disabled = false;
+    await api(`/api/presets/${encodeURIComponent(name)}`, jsonPut(collectForm()));
+    toast(`已保存预设 ${name}`, true);
+    $("editor").classList.remove("open"); $("f-name").disabled = false;
     loadList();
-  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
+  } catch (err) { toast(`保存失败：${err.message}`, false); }
 });
 $("list").addEventListener("click", async e => {
-  const editBtn = e.target.closest("button[data-edit]");
-  const delBtn = e.target.closest("button[data-del]");
-  if (editBtn) {
-    const presets = await api("/api/presets");
-    fillForm(editBtn.dataset.edit, presets[editBtn.dataset.edit]);
-  }
+  const editBtn = e.target.closest("button[data-edit]"), delBtn = e.target.closest("button[data-del]");
+  if (editBtn) { const presets = await api("/api/presets"); fillForm(editBtn.dataset.edit, presets[editBtn.dataset.edit]); }
   if (delBtn) {
     const name = delBtn.dataset.del;
-    if (!confirm(`删除预设 "${name}"？${presetsBuiltin(name) ? "（内置预设将恢复为 config.yaml 默认值）" : ""}`)) return;
-    try {
-      await api(`/api/presets/${encodeURIComponent(name)}`, { method: "DELETE" });
-      showMsg(`已删除 "${name}"`, true);
-      loadList();
-    } catch (err) { showMsg(`删除失败: ${err.message}`, false); }
+    const presets = await api("/api/presets");
+    if (!confirm(`删除预设 ${name}？${presets[name]?._builtin ? "内置预设会恢复为 config.yaml 的值。" : ""}`)) return;
+    try { await api(`/api/presets/${encodeURIComponent(name)}`, { method: "DELETE" }); toast(`已删除 ${name}`, true); loadList(); }
+    catch (err) { toast(`删除失败：${err.message}`, false); }
   }
 });
 
-async function loadWorkers() {
-  try {
-    const w = await api("/api/workers");
-    $("w-concurrency").value = w.concurrency;
-    $("w-av1an_workers").value = w.av1an_workers;
-    $("workersActive").textContent = `当前运行中 worker: ${w.active_worker_count}`;
-  } catch (err) {
-    $("workersActive").textContent = `读取并行设置失败: ${err.message}`;
-  }
-}
-$("workersForm").addEventListener("submit", async e => {
-  e.preventDefault();
-  try {
-    const concurrency = parseInt($("w-concurrency").value, 10);
-    const av1an_workers = parseInt($("w-av1an_workers").value, 10);
-    if (!concurrency || concurrency < 1) { showMsg("concurrency 必须 >= 1", false); return; }
-    const r = await api("/api/settings/workers", {
-      method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ concurrency, av1an_workers }),
-    });
-    showMsg(`已保存并行设置（concurrency=${r.workers.concurrency}, av1an_workers=${r.workers.av1an_workers}）`, true);
-    loadWorkers();
-  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
-});
-
-async function loadOptimizer() {
-  try {
-    const o = await api("/api/settings/optimizer");
-    $("o-probe_crfs").value = (o.probe_crfs || []).join(",");
-    $("o-probe_preset").value = o.probe_preset;
-    $("o-probe_scale").value = o.probe_scale;
-    $("o-probing_rate").value = o.probing_rate;
-    $("o-probe_bracket_width").value = o.probe_bracket_width;
-    $("o-probe_max_frames").value = o.probe_max_frames;
-    $("o-probe_workers").value = o.probe_workers;
-    $("o-encode_workers").value = o.encode_workers;
-    $("o-encode_threads").value = o.encode_threads;
-    $("o-scenedetect_threshold").value = o.scenedetect_threshold;
-    $("o-scenedetect_engine").value = o.scenedetect_engine;
-    $("o-scdet_threshold").value = o.scdet_threshold;
-    $("o-scenedetect_scale").value = o.scenedetect_scale;
-    $("o-scenedetect_hwaccel").value = o.scenedetect_hwaccel;
-    $("o-min_scene_len").value = o.min_scene_len;
-    $("o-probe_cpu_charge").value = o.probe_cpu_charge;
-    $("o-min_shot_frames").value = o.min_shot_frames;
-    $("o-max_shots").value = o.max_shots;
-    $("o-max_crf_delta").value = o.max_crf_delta;
-    $("o-verify_shots").value = o.verify_shots;
-    $("o-min_crf").value = o.min_crf;
-    $("o-probe_crf_offset").value = o.probe_crf_offset;
-    $("o-vmaf_width").value = o.vmaf_width;
-    $("o-vmaf_model_4k").value = o.vmaf_model_4k;
-    $("o-vmaf_4k_min_width").value = o.vmaf_4k_min_width;
-    $("o-vmaf_sycl_device").value = o.vmaf_sycl_device;
-    $("o-vmaf_sycl_min_width").value = o.vmaf_sycl_min_width;
-    $("o-ssimulacra2_frame_step").value = o.ssimulacra2_frame_step;
-    $("o-vmaf_threads").value = o.vmaf_threads;
-    $("o-vmaf_model").value = o.vmaf_model;
-    $("o-ssimulacra2_model").value = o.ssimulacra2_model;
-    $("o-fractional_crf").value = String(!!o.fractional_crf);
-    $("o-keep_probes").value = String(!!o.keep_probes);
-    $("optimizerActive").textContent = `当前 metric 默认: ${o.probe_crfs.length} 个 CRF 探测点`;
-  } catch (err) {
-    $("optimizerActive").textContent = `读取优化器设置失败: ${err.message}`;
-  }
-}
-$("optimizerForm").addEventListener("submit", async e => {
-  e.preventDefault();
-  try {
-    const crfs = String($("o-probe_crfs").value).split(",").map(s => parseInt(s.trim(), 10)).filter(Number.isInteger);
-    if (!crfs.length) { showMsg("probe_crfs 至少需要一个整数", false); return; }
-    const body = {
-      probe_crfs: crfs,
-      probe_preset: parseInt($("o-probe_preset").value, 10),
-      probe_scale: $("o-probe_scale").value.trim(),
-      probing_rate: parseInt($("o-probing_rate").value, 10) || 1,
-      probe_bracket_width: parseInt($("o-probe_bracket_width").value, 10),
-      probe_max_frames: parseInt($("o-probe_max_frames").value, 10) || 120,
-      probe_workers: parseInt($("o-probe_workers").value, 10) || 0,
-      encode_workers: parseInt($("o-encode_workers").value, 10) || 0,
-      encode_threads: parseInt($("o-encode_threads").value, 10) || 0,
-      scenedetect_threshold: parseFloat($("o-scenedetect_threshold").value),
-      scenedetect_engine: $("o-scenedetect_engine").value,
-      scdet_threshold: parseFloat($("o-scdet_threshold").value),
-      scenedetect_scale: $("o-scenedetect_scale").value.trim(),
-      scenedetect_hwaccel: $("o-scenedetect_hwaccel").value,
-      min_scene_len: parseInt($("o-min_scene_len").value, 10),
-      probe_cpu_charge: parseFloat($("o-probe_cpu_charge").value) || 1.0,
-      min_shot_frames: parseInt($("o-min_shot_frames").value, 10),
-      max_shots: parseInt($("o-max_shots").value, 10),
-      max_crf_delta: parseFloat($("o-max_crf_delta").value),
-      verify_shots: parseInt($("o-verify_shots").value, 10),
-      min_crf: parseInt($("o-min_crf").value, 10) || 0,
-      probe_crf_offset: parseFloat($("o-probe_crf_offset").value) || 0,
-      vmaf_width: parseInt($("o-vmaf_width").value, 10) || 0,
-      vmaf_model_4k: $("o-vmaf_model_4k").value.trim(),
-      vmaf_4k_min_width: parseInt($("o-vmaf_4k_min_width").value, 10) || 0,
-      vmaf_sycl_device: parseInt($("o-vmaf_sycl_device").value, 10),
-      vmaf_sycl_min_width: parseInt($("o-vmaf_sycl_min_width").value, 10) || 0,
-      ssimulacra2_frame_step: parseInt($("o-ssimulacra2_frame_step").value, 10) || 1,
-      vmaf_threads: parseInt($("o-vmaf_threads").value, 10) || 0,
-      vmaf_model: $("o-vmaf_model").value.trim(),
-      ssimulacra2_model: $("o-ssimulacra2_model").value.trim(),
-      fractional_crf: $("o-fractional_crf").value === "true",
-      keep_probes: $("o-keep_probes").value === "true",
-    };
-    await api("/api/settings/optimizer", {
-      method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    showMsg("已保存优化器设置", true);
-    loadOptimizer();
-  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
-});
-
-async function loadSafety() {
-  try {
-    const s = await api("/api/settings/safety");
-    $("s-delete_source").value = String(s.delete_source);
-    $("safetyActive").textContent = s.delete_source ? "⚠ 已开启：源文件将被删除" : "当前：保留源文件";
-  } catch (err) {
-    $("safetyActive").textContent = `读取失败: ${err.message}`;
-  }
-}
-$("safetyForm").addEventListener("submit", async e => {
-  e.preventDefault();
-  const enabled = $("s-delete_source").value === "true";
-  if (enabled) {
-    // destructive action - require explicit confirmation
-    const msg = "⚠ 开启后，每个转码成功的任务都会删除原始源文件。\n\n"
-      + "此操作不可逆！即使转码失败或输出文件有问题，源文件也可能已经丢失。\n\n"
-      + "确定要开启吗？";
-    if (!confirm(msg)) { $("s-delete_source").value = "false"; return; }
-  }
-  try {
-    await api("/api/settings/delete_source", {
-      method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled, confirm: enabled }),
-    });
-    showMsg(enabled ? "已开启删除源文件（危险）" : "已关闭删除源文件", true);
-    loadSafety();
-  } catch (err) { showMsg(`保存失败: ${err.message}`, false); }
-});
-
-async function presetsBuiltin(name) {
-  const presets = await api("/api/presets");
-  return !!(presets[name] && presets[name]._builtin);
-}
+/* ------------------------------------------------------------- api key */
 function renderKeyState(note) {
-  // Reported in the span beside the button, not through showMsg: #msg lives
-  // down in the presets section and this form is at the top of the page, so
-  // the confirmation would land off-screen.
-  $("keyState").textContent = note || (apiKey()
-    ? "已保存（本浏览器）" : "未设置——服务端若启用了密钥，写操作会返回 401");
+  $("keyState").textContent = note || (apiKey() ? "已保存在本浏览器" : "未设置：服务端若启用了密钥，写操作会返回 401");
 }
 $("keyForm").addEventListener("submit", e => {
   e.preventDefault();
   setApiKey($("apiKeyInput").value.trim());
   renderKeyState("已保存到本浏览器");
   setTimeout(() => renderKeyState(), 3000);
-  // Everything on this page was loaded before the key existed; a save is
-  // usually someone fixing a 401, so re-run the reads that just failed.
-  loadWorkers(); loadOptimizer(); loadSafety(); loadList();
+  loadWorkers(); loadOptimizer(); loadGpu(); loadSafety(); loadList();
 });
 $("apiKeyInput").value = apiKey();
 renderKeyState();
 
-loadWorkers();
-loadOptimizer();
-loadSafety();
-loadList();
+/* --------------------------------------------------------- rail state */
+const railLinks = [...document.querySelectorAll(".rail a")];
+const io = new IntersectionObserver(entries => {
+  for (const en of entries) if (en.isIntersecting) {
+    railLinks.forEach(a => a.classList.toggle("on", a.getAttribute("href") === `#${en.target.id}`));
+  }
+}, { rootMargin: "-20% 0px -70% 0px" });
+document.querySelectorAll("section.card, h3.group").forEach(el => io.observe(el));
+
+buildForms();
+loadWorkers(); loadOptimizer(); loadGpu(); loadSafety(); loadList();
 </script>
 </body>
 </html>

@@ -422,6 +422,10 @@ class Transcode(BaseModel):
     dovi: DolbyVision = Field(default_factory=DolbyVision)
     hdr: Hdr = Field(default_factory=Hdr)
     optimizer: OptimizerSettings = Field(default_factory=OptimizerSettings)
+    # config.yaml's optimizer settings before the user's overrides land on
+    # them: what "restore defaults" restores, and what the settings page
+    # marks a field against. Excluded from dumps like builtin_presets.
+    optimizer_defaults: OptimizerSettings = Field(default_factory=OptimizerSettings, exclude=True)
     # Skip files that are already AV1 at >= this resolution height (0 = never skip)
     skip_existing_av1: bool = True
     min_height_to_transcode: int = 0
@@ -621,14 +625,59 @@ def load_settings(config_path: Optional[Path] = None) -> Settings:
             pass
     if "delete_source" in usettings and isinstance(usettings["delete_source"], bool):
         settings.transcode.delete_source = usettings["delete_source"]
+    settings.transcode.optimizer_defaults = settings.transcode.optimizer.model_copy(deep=True)
     user_opt = usettings.get("optimizer") or {}
     if user_opt:
+        # Merged OVER config.yaml, not validated on its own: a saved block used
+        # to replace the whole optimizer section, so every default that
+        # config.yaml changed after the save was silently pinned to whatever
+        # the page had dumped that day (a production box ran 360p probes,
+        # every other frame, 1200-frame windows and 40 VMAF threads that way
+        # for weeks). The page now saves only the keys that differ, and an
+        # old full block still merges to the same values it always had.
         try:
-            settings.transcode.optimizer = OptimizerSettings.model_validate(user_opt)
+            settings.transcode.optimizer = OptimizerSettings.model_validate(
+                {**settings.transcode.optimizer.model_dump(mode="json"), **user_opt})
         except Exception as e:  # noqa: BLE001
             logger = __import__("loguru").logger
             logger.warning("Ignoring invalid optimizer settings: {}", e)
+    user_dovi = usettings.get("dovi") or {}
+    if "vulkan_device" in user_dovi:
+        settings.transcode.dovi.vulkan_device = str(user_dovi["vulkan_device"] or "")
     return settings
+
+
+def optimizer_overrides(settings: Settings) -> Dict[str, Any]:
+    """The optimizer keys whose value is not config.yaml's, JSON-shaped."""
+    cur = settings.transcode.optimizer.model_dump(mode="json")
+    base = settings.transcode.optimizer_defaults.model_dump(mode="json")
+    return {k: v for k, v in cur.items() if base.get(k) != v}
+
+
+def save_optimizer_settings(settings: Settings) -> Dict[str, Any]:
+    """Persist the optimizer block as overrides only, dropping it when empty."""
+    over = optimizer_overrides(settings)
+    if over:
+        save_user_settings(settings, {"optimizer": over})
+    else:
+        delete_user_setting(settings, "optimizer")
+    return over
+
+
+def delete_user_setting(settings: Settings, key: str) -> bool:
+    """Remove one top-level key from the settings file. True if it was there."""
+    p = settings.dirs.settings_file
+    try:
+        existing = json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, ValueError):
+        existing = {}
+    if key not in existing:
+        return False
+    existing.pop(key)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(existing, indent=2, ensure_ascii=False, default=str))
+    tmp.replace(p)
+    return True
 
 
 def load_user_settings(settings: Settings) -> Dict[str, Any]:
@@ -645,6 +694,8 @@ def load_user_settings(settings: Settings) -> Dict[str, Any]:
             out["delete_source"] = data["delete_source"]
         if data.get("optimizer"):
             out["optimizer"] = data["optimizer"]
+        if isinstance(data.get("dovi"), dict):
+            out["dovi"] = data["dovi"]
         return out
     except (OSError, ValueError):
         return {}

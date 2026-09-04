@@ -213,6 +213,21 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
     def get_optimizer():
         return settings.transcode.optimizer.model_dump()
 
+    @router.get("/settings/optimizer/defaults")
+    def get_optimizer_defaults():
+        """config.yaml's values, and which keys the user has moved off them."""
+        return {"defaults": settings.transcode.optimizer_defaults.model_dump(mode="json"),
+                "overrides": config.optimizer_overrides(settings)}
+
+    @router.delete("/settings/optimizer")
+    def delete_optimizer(request: Request):
+        """Back to config.yaml: drop every override and forget the saved block."""
+        _auth(request)
+        settings.transcode.optimizer = settings.transcode.optimizer_defaults.model_copy(deep=True)
+        config.delete_user_setting(settings, "optimizer")
+        logger.info("Optimizer settings restored to config.yaml defaults")
+        return {"ok": True, "optimizer": settings.transcode.optimizer.model_dump(mode="json")}
+
     @router.put("/settings/optimizer")
     def put_optimizer(request: Request, body: dict):
         _auth(request)
@@ -228,16 +243,66 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
             params = OptimizerSettings.model_validate(merged)
         except Exception as e:  # noqa: BLE001
             raise HTTPException(422, f"invalid optimizer settings: {e}")
-        # persist (merge keeps workers / delete_source intact).
-        # mode="json", not a plain model_dump: vszip_plugin and
-        # bestsource_plugin are Path fields, and a bare dump hands
-        # save_user_settings a PosixPath that json cannot encode - which made
-        # every save from the settings page a 500 that persisted nothing.
-        config.save_user_settings(settings,
-                                  {"optimizer": params.model_dump(mode="json")})
         settings.transcode.optimizer = params
-        logger.info("Updated optimizer settings: {}", params.model_dump(mode="json"))
-        return {"ok": True, "optimizer": params.model_dump()}
+        # Only the keys that differ from config.yaml are written (JSON-shaped,
+        # so the Path fields encode). The block used to be the full dump, and
+        # a full dump pins every default at the moment of saving.
+        over = config.save_optimizer_settings(settings)
+        logger.info("Updated optimizer settings; overrides now {}", over)
+        return {"ok": True, "optimizer": params.model_dump(), "overrides": over}
+
+    # ---------- GPU ----------
+    _GPU_KEYS = ("vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel")
+
+    def _gpu_settings() -> dict:
+        o = settings.transcode.optimizer
+        return {"vmaf_sycl_device": o.vmaf_sycl_device,
+                "vmaf_sycl_min_width": o.vmaf_sycl_min_width,
+                "scenedetect_hwaccel": o.scenedetect_hwaccel,
+                "vulkan_device": settings.transcode.dovi.vulkan_device}
+
+    @router.get("/gpu")
+    def get_gpu(refresh: bool = False):
+        """What the container sees, and what the current settings make of it."""
+        from app import gpu
+
+        status = gpu.probe(settings, force=refresh)
+        return {"status": status, "settings": _gpu_settings()}
+
+    @router.post("/gpu/selfcheck")
+    def gpu_selfcheck(request: Request, body: Optional[dict] = None):
+        """The optimizer's own preflight: one pair on the GPU, one on the CPU."""
+        _auth(request)
+        from app import gpu
+
+        dev = int((body or {}).get("device", settings.transcode.optimizer.vmaf_sycl_device))
+        if dev < 0:
+            dev = 0
+        try:
+            return gpu.selfcheck(settings, dev)
+        except FileNotFoundError as e:
+            raise HTTPException(500, str(e))
+
+    @router.put("/settings/gpu")
+    def put_gpu(request: Request, body: dict):
+        _auth(request)
+        from app.config import OptimizerSettings
+
+        body = body or {}
+        merged = {**settings.transcode.optimizer.model_dump(),
+                  **{k: body[k] for k in _GPU_KEYS if k in body}}
+        try:
+            params = OptimizerSettings.model_validate(merged)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(422, f"invalid GPU settings: {e}")
+        settings.transcode.optimizer = params
+        over = config.save_optimizer_settings(settings)
+        if "vulkan_device" in body:
+            vk = str(body.get("vulkan_device") or "").strip()
+            settings.transcode.dovi.vulkan_device = vk
+            config.save_user_settings(settings, {"dovi": {"vulkan_device": vk}})
+        logger.info("Updated GPU settings: {}", _gpu_settings())
+        return {"ok": True, "settings": _gpu_settings(), "overrides": over}
 
     # ---------- safety settings (delete_source) ----------
     @router.get("/settings/safety")

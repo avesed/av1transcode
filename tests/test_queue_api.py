@@ -4,6 +4,7 @@ These areas had no coverage at all, which is where every defect exercised
 below was living.
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -350,11 +351,16 @@ def test_optimizer_settings_save_round_trips(settings, store, tmp_path):
     assert r.status_code == 200, r.text
     assert r.json()["optimizer"]["probe_preset"] == 7
 
-    # persisted, and in a shape load_settings can read back
+    # persisted, and in a shape load_settings can read back - and ONLY the
+    # key that moved, so config.yaml keeps owning everything else
     saved = load_user_settings(settings)
     assert saved["optimizer"]["probe_preset"] == 7
+    assert "probe_bracket_width" not in saved["optimizer"]     # never touched: not written
     assert settings.transcode.optimizer.probe_preset == 7
-    assert isinstance(saved["optimizer"]["vszip_plugin"], str)
+    # a Path field still encodes when it is the one overridden
+    r = client.put("/api/settings/optimizer", json={"vszip_plugin": "/opt/vszip.so"})
+    assert r.status_code == 200, r.text
+    assert isinstance(load_user_settings(settings)["optimizer"]["vszip_plugin"], str)
 
 
 def test_optimizer_settings_save_keeps_unposted_fields(settings, store, tmp_path):
@@ -527,3 +533,97 @@ def test_ui_pages_send_the_api_key():
         for bad in ('fetch("/api', "fetch(`/api"):
             assert bad not in text.replace("afetch(", ""), \
                 f"{page} calls {bad}...) without the key"
+
+
+def test_optimizer_overrides_merge_over_config_yaml(settings, store, tmp_path, monkeypatch):
+    """A saved block is overrides, not a replacement: a key it does not hold
+    keeps following config.yaml. A production box ran 360p probes every
+    other frame for weeks because a full dump from an old page had pinned
+    them."""
+    from app.config import load_settings
+
+    settings.dirs.settings_file = tmp_path / "settings.json"
+    (tmp_path / "settings.json").write_text('{"optimizer": {"probe_preset": 7}}')
+    fresh = load_settings()
+    fresh.dirs.settings_file = tmp_path / "settings.json"
+    from app.config import load_user_settings
+    assert load_user_settings(fresh)["optimizer"] == {"probe_preset": 7}
+    # re-run the merge the way load_settings does, against this file
+    monkeypatch.setenv("AV1TC_DIRS_SETTINGS_FILE", str(tmp_path / "settings.json"))
+    s2 = load_settings()
+    assert s2.transcode.optimizer.probe_preset == 7
+    assert s2.transcode.optimizer.probe_max_frames == s2.transcode.optimizer_defaults.probe_max_frames
+    assert s2.transcode.optimizer_defaults.probe_preset != 7
+
+
+def test_optimizer_defaults_and_restore(settings, store, tmp_path):
+    settings.dirs.settings_file = tmp_path / "settings.json"
+    client = _client(settings, store)
+    client.delete("/api/settings/optimizer")          # start from config.yaml, whatever earlier tests saved
+    base = settings.transcode.optimizer_defaults.probe_preset
+    client.put("/api/settings/optimizer", json={"probe_preset": base + 1, "verify_shots": 4})
+    r = client.get("/api/settings/optimizer/defaults")
+    assert r.json()["defaults"]["probe_preset"] == base
+    assert set(r.json()["overrides"]) == {"probe_preset", "verify_shots"}
+    r = client.delete("/api/settings/optimizer")
+    assert r.status_code == 200
+    assert settings.transcode.optimizer.probe_preset == base
+    assert "optimizer" not in (json.loads((tmp_path / "settings.json").read_text()))
+    # and saving a value back to its default drops it from the file again
+    client.put("/api/settings/optimizer", json={"probe_preset": base})
+    assert "optimizer" not in json.loads((tmp_path / "settings.json").read_text())
+
+
+def test_gpu_settings_persist_and_apply(settings, store, tmp_path, monkeypatch):
+    from app.config import load_user_settings
+
+    settings.dirs.settings_file = tmp_path / "settings.json"
+    client = _client(settings, store)
+    client.delete("/api/settings/optimizer")
+    r = client.put("/api/settings/gpu", json={"vmaf_sycl_device": 0, "vmaf_sycl_min_width": 1920,
+                                              "scenedetect_hwaccel": "off", "vulkan_device": "llvmpipe"})
+    assert r.status_code == 200, r.text
+    assert settings.transcode.optimizer.vmaf_sycl_device == 0
+    assert settings.transcode.dovi.vulkan_device == "llvmpipe"
+    saved = load_user_settings(settings)
+    assert saved["optimizer"] == {"vmaf_sycl_device": 0, "vmaf_sycl_min_width": 1920,
+                                  "scenedetect_hwaccel": "off"}
+    assert saved["dovi"] == {"vulkan_device": "llvmpipe"}
+    r = client.put("/api/settings/gpu", json={"vmaf_sycl_device": 7, "scenedetect_hwaccel": "maybe"})
+    assert r.status_code == 422
+
+
+def test_gpu_status_and_selfcheck_routes(settings, store, monkeypatch):
+    from app import gpu
+
+    monkeypatch.setattr(gpu, "probe", lambda s, force=False: {"render_nodes": ["/dev/dri/renderD129"],
+                                                               "sycl_built": True, "force": force})
+    monkeypatch.setattr(gpu, "selfcheck", lambda s, dev: {"device_index": dev, "ok": True, "delta": 5e-5})
+    client = _client(settings, store)
+    r = client.get("/api/gpu")
+    assert r.json()["status"]["render_nodes"] == ["/dev/dri/renderD129"]
+    assert r.json()["settings"]["vmaf_sycl_device"] == settings.transcode.optimizer.vmaf_sycl_device
+    assert client.get("/api/gpu?refresh=true").json()["status"]["force"] is True
+    r = client.post("/api/gpu/selfcheck", json={"device": 1})
+    assert r.json() == {"device_index": 1, "ok": True, "delta": 5e-5}
+    r = client.post("/api/gpu/selfcheck", json={})
+    assert r.json()["device_index"] == 0                    # -1 (off) probes device 0
+
+
+def test_gpu_parsers():
+    from app import gpu
+
+    vk = ("[Vulkan @ 0x1] Supported layers:\n[Vulkan @ 0x1] \tVK_LAYER_MESA_overlay\n"
+          "[Vulkan @ 0x1] GPU listing:\n"
+          "[Vulkan @ 0x1]     0: Intel(R) Arc(tm) B580 Graphics (BMG G21) (discrete) (0xe20b)\n"
+          "[Vulkan @ 0x1]     1: llvmpipe (LLVM 17.0.6, 256 bits) (cpu) (0x0)\n"
+          "[Vulkan @ 0x1] Using device extension VK_KHR_push_descriptor\n")
+    assert gpu.parse_vulkan_listing(vk) == [
+        "Intel(R) Arc(tm) B580 Graphics (BMG G21) (discrete) (0xe20b)",
+        "llvmpipe (LLVM 17.0.6, 256 bits) (cpu) (0x0)"]
+    assert gpu.parse_sycl("libvmaf INFO SYCL: using device: Intel(R) Arc(TM) B580 Graphics\n") == {
+        "device": "Intel(R) Arc(TM) B580 Graphics", "error": None}
+    p = gpu.parse_sycl("libvmaf ERROR SYCL: device_index 7 out of range (1 GPUs)\n[x] vmaf_sycl_state_init(7) failed: -19.")
+    assert p["count"] == 1 and p["device"] is None and "out of range" in p["error"]
+    assert gpu.parse_sycl("nothing here") == {"device": None, "error": None}
+
