@@ -82,10 +82,17 @@ class MediaInfo:
         return " ".join(parts)
 
 
-def run_command(cmd: List[str], timeout: int = 600) -> tuple[int, str]:
+def run_command(cmd: List[str], timeout: int = 600,
+                merge_stderr: bool = True) -> tuple[int, str]:
+    """(rc, output). stderr is folded into the output unless the caller
+    needs stdout clean - ffprobe's JSON is one such case: a decoder that
+    grumbles while probing (a DTS-HD track: "Residual encoded channels are
+    present without core") writes to stderr at -v error, and merged in front
+    of the JSON it made every analysis of that file fail."""
     try:
         proc = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cmd, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             timeout=timeout, text=True, errors="replace",
         )
         return proc.returncode, proc.stdout
@@ -114,14 +121,14 @@ def _ffprobe(settings: Settings, path: str) -> Optional[dict]:
         cmd.append("-probesize")
         cmd.append("100M")
     cmd.append(path)
-    rc, out = run_command(cmd, timeout=1200)
+    rc, out = run_command(cmd, timeout=1200, merge_stderr=False)
     if rc != 0 or not out:
         logger.warning("ffprobe failed ({}) for {}: {}", rc, path, out[-500:])
         return None
     try:
         return json.loads(out)
     except json.JSONDecodeError:
-        logger.warning("ffprobe returned non-JSON for {}", path)
+        logger.warning("ffprobe returned non-JSON for {}: {!r}", path, out[:200])
         return None
 
 

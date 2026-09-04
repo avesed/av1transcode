@@ -485,3 +485,27 @@ def test_analyze_records_the_video_streams_lead(settings, monkeypatch, tmp_path)
     info = analyzer.analyze(settings, str(f))
     assert info.video_lead == 0.0
 
+
+def test_ffprobe_json_survives_decoder_noise_on_stderr(settings, monkeypatch, tmp_path):
+    """A DTS-HD track makes ffprobe print "[dca @ ...] Residual encoded
+    channels are present without core" on stderr even at -v error. Merged
+    into stdout that sat in front of the JSON, and every analysis of the
+    file failed - a whole Stranger Things episode was 'analysis failed'."""
+    from app import analyzer
+    import subprocess as sp
+
+    def fake_run(cmd, stdout=None, stderr=None, timeout=None, text=None, errors=None):
+        class P:
+            returncode = 0
+            def __init__(self):
+                noise = "[dca @ 0x1] Residual encoded channels are present without core\n"
+                body = '{"format": {"format_name": "matroska"}, "streams": [{"codec_type": "video", "codec_name": "hevc", "r_frame_rate": "24000/1001"}]}'
+                self.stdout = (noise + body) if stderr == sp.STDOUT else body
+        return P()
+
+    monkeypatch.setattr(analyzer.subprocess, "run", fake_run)
+    monkeypatch.setattr(type(settings), "tool_path", lambda self, name: f"/usr/bin/{name}")
+    f = tmp_path / "x.mkv"; f.write_bytes(b"x")
+    info = analyzer.analyze(settings, str(f))
+    assert info is not None and info.video_codec == "hevc"
+
