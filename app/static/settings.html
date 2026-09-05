@@ -339,7 +339,7 @@ const GPU_FIELDS = [
   F("vmaf_sycl_device", "VMAF 打分设备", "用 libvmaf 的 SYCL 后端在 GPU 上打分。关闭 = CPU。作业开始时会先自检一次，设备不可用则整个作业退回 CPU。", { type: "sycl" }),
   F("vmaf_sycl_min_width", "GPU 打分的最小宽度", "源窄于此仍用 CPU：GPU 的收益随帧大小增长，1080p 上 CPU 本来就只要两秒。", { min: 0, max: 7680, unit: "px" }),
   F("scenedetect_hwaccel", "分镜解码", "auto = 有 QSV 就用它解码分镜那一趟；off = 一律软解。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
-  F("reference_hwaccel", "打分参考解码", "探测打分和验证时读源片的那一路是否用 QSV 解码。auto = 作业开始先解 4 帧自检，失败整个作业软解；off = 一律软解。只放这一路上 GPU：4K 帧回传 CPU 约 130 帧/秒封顶，探测池本来就吃到这个量。实测每次打分省 44% CPU、墙钟 -12%，分数不变。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
+  F("reference_hwaccel", "打分参考解码", "探测打分和验证时读源片的那一路是否用 QSV 解码。auto = 作业开始先各解 8 帧（带定位）做软解/硬解逐帧对比，不一致整个作业软解——B580 上 H.264 硬解定位会早 5 帧，因此 H.264 自动留在 CPU，HEVC 走 GPU；off = 一律软解。只放这一路上 GPU：4K 帧回传 CPU 约 130 帧/秒封顶，探测池本来就吃到这个量。实测每次打分省 44% CPU、墙钟 -12%，分数不变。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
   F("vulkan_device", "Dolby Vision P5 转换设备", "libplacebo 应用 RPU 用的 Vulkan 设备，ffmpeg 的 -init_hw_device 选择器：序号或名字片段。空 = 让 ffmpeg 挑，有 GPU 就用 GPU；写 llvmpipe 强制软件渲染。", { type: "vulkan", wide: true }),
 ];
 const GPU_KEYS = new Set(["vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel", "reference_hwaccel"]);

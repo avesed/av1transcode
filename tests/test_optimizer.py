@@ -3042,7 +3042,7 @@ def test_reference_read_decodes_the_source_on_qsv(settings, info, plan, tmp_path
     back from the GPU tops out near 130 frames/s pool-wide - about what the
     probe pool consumes - so a second read per probe would be GPU-bound.
     """
-    info.color.bit_depth = 10
+    info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
     enc = make_encoder(settings, info, plan, tmp_path)
     ran = []
     monkeypatch.setattr(enc, "_run", lambda args, timeout=None: (ran.append(args), _FRAMEMD5)[1])
@@ -3050,13 +3050,18 @@ def test_reference_read_decodes_the_source_on_qsv(settings, info, plan, tmp_path
     enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
     dist, ref, ref_vf = calls[-1]
     assert ref[:4] == _QSV and ref.index("-hwaccel") < ref.index("-i")
-    assert ref_vf[0] == "hwdownload,format=p010le"
+    # downloaded, then handed on in the format the software decoder gives
+    assert ref_vf[0] == "hwdownload,format=p010le,format=yuv420p10le"
     assert "-hwaccel" not in dist
-    # the preflight: four frames of the source to framemd5, once per job
-    assert len(ran) == 1 and "framemd5" in ran[0] and str(enc.source) in ran[0]
-    assert "-hwaccel" in ran[0] and ran[0][ran[0].index("-frames:v") + 1] == "4"
+    # the preflight: the same seeked frames read both ways, once per job
+    assert len(ran) == 2 and "-hwaccel" not in ran[0] and "-hwaccel" in ran[1]
+    for cmd in ran:
+        assert "framemd5" in cmd and str(enc.source) in cmd and "-ss" in cmd
+        assert cmd[cmd.index("-frames:v") + 1] == str(enc._HWDEC_PREFLIGHT_FRAMES)
+        assert cmd.index("-ss") < cmd.index("-i")
+    assert ran[0][ran[0].index("-ss") + 1] == ran[1][ran[1].index("-ss") + 1]
     enc._score_probe(720, 840, tmp_path / "d.ivf", 0, 30)
-    assert len(ran) == 1
+    assert len(ran) == 2
     # a DV shard read is left alone
     enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30, shard=tmp_path / "s.mkv")
     assert "-hwaccel" not in calls[-1][1] and calls[-1][2] == []
@@ -3065,37 +3070,59 @@ def test_reference_read_decodes_the_source_on_qsv(settings, info, plan, tmp_path
     dist, ref, ref_vf = calls[-1]
     assert "-hwaccel" not in dist and str(enc.output) in dist
     assert ref[:4] == _QSV and str(enc.source) in ref
-    assert ref_vf == ["hwdownload,format=p010le"]
+    assert ref_vf == ["hwdownload,format=p010le,format=yuv420p10le"]
 
 
 def test_reference_read_download_format_follows_the_bit_depth(settings, info, plan, tmp_path, monkeypatch):
-    info.color.bit_depth = 8
+    info.color.bit_depth, info.color.pix_fmt = 8, "yuv420p"
     enc = make_encoder(settings, info, plan, tmp_path)
     monkeypatch.setattr(enc, "_run", lambda args, timeout=None: _FRAMEMD5)
     _, vf = enc._reference_read(*enc._probe_input(600, 720))
-    assert vf[0] == "hwdownload,format=nv12"
+    assert vf[0] == "hwdownload,format=nv12,format=yuv420p"
 
 
-@pytest.mark.parametrize("outcome", ["error", "no frames"])
+def _md5_lines(sums):
+    return "#format: frame checksums\n" + "".join(
+        f"0, {i:10d}, {i:10d},        1,  3110400, {s}\n" for i, s in enumerate(sums))
+
+
+@pytest.mark.parametrize("outcome", ["error", "no frames", "offset", "different"])
 def test_reference_read_falls_back_to_software_for_the_job(
         settings, info, plan, tmp_path, monkeypatch, outcome):
     """A B580 decodes an unsupported stream to nothing and still exits 0, so
-    the preflight counts frames rather than trusting the exit code. Either
-    way the fallback is decided once, not once per score."""
+    the preflight cannot trust the exit code; and on an 8-bit H.264 WEB-DL
+    its seeked read began five frames before the software decoder's, every
+    frame bit-exact and every one wrong. So the seeked reads are compared
+    frame by frame. Whatever the reason, the fallback is decided once, not
+    once per score."""
     enc = make_encoder(settings, info, plan, tmp_path)
-    ran = []
+    ran, warnings = [], []
+    monkeypatch.setattr(opt.logger, "warning", lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    enc._lead_of = lambda path: 0.0      # the fixture file is empty; ffprobe would warn
+    sw = [f"{c}{c}{c}" for c in "abcdefgh"]
 
     def fake_run(args, timeout=None):
         ran.append(args)
         if outcome == "error":
             raise opt.TranscodeError("ffmpeg exited 1")
-        return "#format: frame checksums\n"
+        if "-hwaccel" not in args:
+            return _md5_lines(sw)
+        if outcome == "no frames":
+            return "#format: frame checksums\n"
+        if outcome == "offset":
+            return _md5_lines(["v1", "v2", "v3", "v4", "v5"] + sw[:3])
+        return _md5_lines([f"{c}{c}{c}" for c in "zyxwvuts"])
 
     monkeypatch.setattr(enc, "_run", fake_run)
     calls = _capture_scores(enc, monkeypatch)
     for _ in range(3):
         enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
-    assert len(ran) == 1
+    assert len(ran) == (1 if outcome == "error" else 2)
+    assert len(warnings) == 1 and "stay on the CPU" in warnings[0]
+    if outcome == "offset":
+        assert "offset by 5 frame(s)" in warnings[0]
+    if outcome == "different":
+        assert "different frames" in warnings[0]
     assert all("-hwaccel" not in ref and not any("hwdownload" in f for f in vf)
                for _, ref, vf in calls)
     args, _ = enc._probe_input(600, 720)

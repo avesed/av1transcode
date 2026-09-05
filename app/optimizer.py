@@ -2386,10 +2386,24 @@ class ShotEncoder:
                 "-t", f"{self._span(w0, w1):.6f}", "-i", str(source)]
 
     _HWDEC_ARGS = ("-hwaccel", "qsv", "-hwaccel_output_format", "qsv")
+    _HWDEC_PREFLIGHT_FRAMES = 8
 
     def _surface_format(self) -> str:
         """The pixel format a QSV decode of the source lands in."""
         return "p010le" if (self.info.color.bit_depth or 8) > 8 else "nv12"
+
+    def _native_format(self) -> str:
+        """What the software decoder would hand the chain."""
+        return self.info.color.pix_fmt or (
+            "yuv420p10le" if self._surface_format() == "p010le" else "yuv420p")
+
+    def _download_vf(self) -> str:
+        """hwdownload plus the conversion that hands the rest of the chain the
+        very pixel format the software decoder would have produced, so
+        everything downstream (fps=, scale=, setpts, the scorer's format=)
+        runs on identical input either way. p010le -> yuv420p10le is a shift
+        and nv12 -> yuv420p a plane split; both exact."""
+        return f"hwdownload,format={self._surface_format()},format={self._native_format()}"
 
     def _reference_read(self, args: List[str],
                         vf: List[str]) -> Tuple[List[str], List[str]]:
@@ -2397,13 +2411,12 @@ class ShotEncoder:
         allows it and the preflight passed.
 
         The hwaccel options precede the input they apply to, and the download
-        has to be the first filter in the chain: everything after it (fps=,
-        scale=, setpts, format) wants system-memory frames.
+        has to be the first filter in the chain: everything after it wants
+        system-memory frames.
         """
         if not self._hwdec():
             return args, vf
-        return ([*self._HWDEC_ARGS, *args],
-                [f"hwdownload,format={self._surface_format()}", *vf])
+        return [*self._HWDEC_ARGS, *args], [self._download_vf(), *vf]
 
     def _hwdec(self) -> bool:
         if (self.opt.reference_hwaccel or "auto").lower() == "off":
@@ -2414,33 +2427,59 @@ class ShotEncoder:
             return self._hwdec_ok
 
     def _hwdec_preflight(self) -> bool:
-        """Prove QSV decodes this source before any score depends on it.
+        """Prove a seeked QSV read of this source is frame-identical to the
+        software read before any score depends on it.
 
-        Not just "ffmpeg exits 0": on a B580 an unsupported stream decodes to
-        nothing and still exits cleanly (the scdet path learnt that on AV1),
-        and a scoring run with an empty reference would fail hundreds of
-        times over. framemd5 of the first frames says whether frames came out.
+        Two things go wrong, and both did on a B580. A stream the card cannot
+        decode still exits 0 with no frames (the scdet path learnt that on
+        AV1). And an input-side seek can land elsewhere than the software
+        decoder's: on an 8-bit H.264 WEB-DL the QSV read began five frames
+        BEFORE the seek target - every frame bit-exact, every one the wrong
+        frame - while HEVC seeks matched on three sources. A slip of one
+        frame in the reference window measured 66 VMAF against 92, so the
+        two reads are compared frame by frame after a seek, in the pixel
+        format the scorer sees. A mismatch keeps the job on the CPU and says
+        which kind it was.
         """
-        fmt = self._surface_format()
-        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats",
-               *self._HWDEC_ARGS, "-i", str(self.source),
-               "-map", "0:v:0", "-frames:v", "4",
-               "-vf", f"hwdownload,format={fmt}", "-f", "framemd5", "-"]
+        n = self._HWDEC_PREFLIGHT_FRAMES
+        # two seconds in, so the seek path is the one that is exercised, but
+        # never past the end of a short source
+        seek = self._seek(min(int(round(2 * self.fps)), max(self.total_frames - n, 0)))
+        common = ["-hide_banner", "-loglevel", "error", "-nostats"]
+        tail = ["-i", str(self.source), "-map", "0:v:0", "-frames:v", str(n)]
+        sw = [self.ffmpeg, *common, "-threads", "2", "-ss", seek, *tail,
+              "-vf", f"format={self._native_format()}", "-f", "framemd5", "-"]
+        hw = [self.ffmpeg, *common, *self._HWDEC_ARGS, "-ss", seek, *tail,
+              "-vf", self._download_vf(), "-f", "framemd5", "-"]
+
+        def sums(out: str) -> List[str]:
+            return [line.rsplit(",", 1)[-1].strip()
+                    for line in out.splitlines() if line.startswith("0,")]
+
         try:
-            out = self._run(cmd, timeout=120)
+            want = sums(self._run(sw, timeout=300))
+            got = sums(self._run(hw, timeout=300))
         except (TranscodeError, OSError) as e:
             logger.warning("reference_hwaccel: QSV cannot decode {} ({}); "
                            "scoring reads stay on the CPU for this job",
                            self.source.name, e)
             return False
-        frames = sum(1 for line in out.splitlines() if line.startswith("0,"))
-        if not frames:
-            logger.warning("reference_hwaccel: QSV decoded no frames of {}; "
+        if not want or not got:
+            logger.warning("reference_hwaccel: {} decoded no frames of {}; "
                            "scoring reads stay on the CPU for this job",
-                           self.source.name)
+                           "software" if not want else "QSV", self.source.name)
             return False
-        logger.info("reference_hwaccel: scoring reads of {} decode on QSV ({})",
-                    self.source.name, fmt)
+        if want != got:
+            shift = next((k for k in range(1, min(len(want), len(got)))
+                          if want[:-k] == got[k:] or got[:-k] == want[k:]), None)
+            logger.warning("reference_hwaccel: the QSV read of {} is not the "
+                           "software read after a seek ({}); scoring reads "
+                           "stay on the CPU for this job", self.source.name,
+                           f"offset by {shift} frame(s)" if shift else "different frames")
+            return False
+        logger.info("reference_hwaccel: scoring reads of {} decode on QSV "
+                    "({}); {} frames after a seek verified frame-identical",
+                    self.source.name, self._surface_format(), len(got))
         return True
 
     def _score_windows(self, w0: int, w1: int, idx: int, crf: int,

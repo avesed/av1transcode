@@ -308,9 +308,13 @@ class OptimizerSettings(BaseModel):
     # dominates and the wall clock gets worse, though CPU still drops ~5x.
     scenedetect_hwaccel: Literal["auto", "off"] = "auto"
     # Decode the VMAF *reference* read on the GPU (Intel QSV): the source side
-    # of every probe score and of every verification window. auto = try it
-    # once per job (4 frames to framemd5) and fall back to software for the
-    # whole job if that fails; off = never. Only this one read goes onto the
+    # of every probe score and of every verification window. auto = once per
+    # job, decode a few frames after a seek both ways and compare them frame
+    # by frame (framemd5); any difference keeps the whole job on software.
+    # That comparison is not paranoia: on the B580 an 8-bit H.264 WEB-DL
+    # decoded bit-exact but began five frames before the seek target, so
+    # H.264 sources stay on the CPU there while HEVC sources pass. off =
+    # never. Only this one read goes onto the
     # GPU on purpose: copying 4K frames back to the CPU tops out around 130
     # frames/s across the whole probe pool, which is about what the pool
     # already consumes, so a second read per probe would be GPU-bound and
