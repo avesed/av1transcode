@@ -569,6 +569,11 @@ def _capture_probe(enc, tmp_path):
 
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
+        if "framemd5" in args:
+            # the reference_hwaccel preflight; a fake ffmpeg decodes nothing,
+            # so the reads below stay on the CPU as they would on a host
+            # without QSV
+            return ""
         cmds.append(args)
         if any("libvmaf=" in a for a in args):
             lavfi = args[args.index("-lavfi") + 1]
@@ -1005,6 +1010,7 @@ def test_probe_forwards_ffmpeg_style_vmaf_features(settings, info, plan, tmp_pat
 
 def test_feature_warning_logged_once(settings, info, plan, tmp_path, monkeypatch):
     plan.params.probing_vmaf_features = "default motionless"
+    settings.transcode.optimizer.reference_hwaccel = "off"   # or its preflight warns too
     enc = make_encoder(settings, info, plan, tmp_path)
     enc._lead_of = lambda path: 0.0      # the fixture file is empty; ffprobe would warn
     warnings = []
@@ -3005,3 +3011,102 @@ def test_probe_scale_treats_zero_as_none(settings, info, plan, tmp_path):
     settings.transcode.optimizer.probe_scale = "-2:720"
     assert make_encoder(settings, info, plan, tmp_path)._probe_scale() == "-2:720"
 
+
+
+# ---------------------------------------------------------------- reference_hwaccel
+
+_FRAMEMD5 = ("#format: frame checksums\n"
+             "0,          0,          0,        1, 12441600, deadbeef\n"
+             "0,          1,          1,        1, 12441600, deadbeef\n")
+_QSV = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+
+
+def _capture_scores(enc, monkeypatch):
+    calls = []
+
+    def fake(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None):
+        calls.append((list(dist_args), list(ref_args), list(ref_vf)))
+        return 90.0
+
+    monkeypatch.setattr(enc, "_score_vmaf", fake)
+    return calls
+
+
+def test_reference_read_decodes_the_source_on_qsv(settings, info, plan, tmp_path, monkeypatch):
+    """Measured on 120 4K frames scored on SYCL: 39.4 -> 22.1 CPU-seconds and
+    wall -12%, decoded frames bit-exact (framemd5), scores unchanged.
+
+    Only the source read moves. The AV1 probe file decodes faster on dav1d
+    than on QSV plus a download (10.1s against 13.5s wall), a DV shard is a
+    small file already carrying the probe-side filters, and copying 4K frames
+    back from the GPU tops out near 130 frames/s pool-wide - about what the
+    probe pool consumes - so a second read per probe would be GPU-bound.
+    """
+    info.color.bit_depth = 10
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = []
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: (ran.append(args), _FRAMEMD5)[1])
+    calls = _capture_scores(enc, monkeypatch)
+    enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
+    dist, ref, ref_vf = calls[-1]
+    assert ref[:4] == _QSV and ref.index("-hwaccel") < ref.index("-i")
+    assert ref_vf[0] == "hwdownload,format=p010le"
+    assert "-hwaccel" not in dist
+    # the preflight: four frames of the source to framemd5, once per job
+    assert len(ran) == 1 and "framemd5" in ran[0] and str(enc.source) in ran[0]
+    assert "-hwaccel" in ran[0] and ran[0][ran[0].index("-frames:v") + 1] == "4"
+    enc._score_probe(720, 840, tmp_path / "d.ivf", 0, 30)
+    assert len(ran) == 1
+    # a DV shard read is left alone
+    enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30, shard=tmp_path / "s.mkv")
+    assert "-hwaccel" not in calls[-1][1] and calls[-1][2] == []
+    # verification: the delivered AV1 side stays on the CPU, the source moves
+    enc._score_windows(600, 720, 0, 30, 4)
+    dist, ref, ref_vf = calls[-1]
+    assert "-hwaccel" not in dist and str(enc.output) in dist
+    assert ref[:4] == _QSV and str(enc.source) in ref
+    assert ref_vf == ["hwdownload,format=p010le"]
+
+
+def test_reference_read_download_format_follows_the_bit_depth(settings, info, plan, tmp_path, monkeypatch):
+    info.color.bit_depth = 8
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: _FRAMEMD5)
+    _, vf = enc._reference_read(*enc._probe_input(600, 720))
+    assert vf[0] == "hwdownload,format=nv12"
+
+
+@pytest.mark.parametrize("outcome", ["error", "no frames"])
+def test_reference_read_falls_back_to_software_for_the_job(
+        settings, info, plan, tmp_path, monkeypatch, outcome):
+    """A B580 decodes an unsupported stream to nothing and still exits 0, so
+    the preflight counts frames rather than trusting the exit code. Either
+    way the fallback is decided once, not once per score."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = []
+
+    def fake_run(args, timeout=None):
+        ran.append(args)
+        if outcome == "error":
+            raise opt.TranscodeError("ffmpeg exited 1")
+        return "#format: frame checksums\n"
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    calls = _capture_scores(enc, monkeypatch)
+    for _ in range(3):
+        enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
+    assert len(ran) == 1
+    assert all("-hwaccel" not in ref and not any("hwdownload" in f for f in vf)
+               for _, ref, vf in calls)
+    args, _ = enc._probe_input(600, 720)
+    assert calls[-1][1] == args
+
+
+def test_reference_read_off_never_touches_the_gpu(settings, info, plan, tmp_path, monkeypatch):
+    settings.transcode.optimizer.reference_hwaccel = "off"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(enc, "_run", lambda *a, **k: pytest.fail("no preflight when off"))
+    calls = _capture_scores(enc, monkeypatch)
+    enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
+    enc._score_windows(600, 720, 0, 30, 4)
+    assert all("-hwaccel" not in ref for _, ref, _ in calls)

@@ -531,6 +531,10 @@ class ShotEncoder:
         # Probe workers call it concurrently, hence the lock.
         self._sycl_ok: Optional[bool] = None
         self._sycl_lock = threading.Lock()
+        # reference_hwaccel: None until the first scoring read runs the
+        # preflight; then whether the source decodes on QSV for this job
+        self._hwdec_ok: Optional[bool] = None
+        self._hwdec_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0
         # every frame's pts_time from the scdet pass (see _run_scdet), and the
@@ -2356,6 +2360,10 @@ class ShotEncoder:
         if self.metric == "ssimulacra2":
             return self._score_ssimulacra2(w0, w1, dist, idx, crf, shard)
         ref_args, ref_vf = self._probe_input(w0, w1, shard)
+        if shard is None:
+            # a DV shard is a small file already carrying the probe-side
+            # filters; only the 4K source read is worth the GPU
+            ref_args, ref_vf = self._reference_read(ref_args, ref_vf)
         dist_args = ["-i", str(dist)]
         if self.metric == "xpsnr":
             return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf)
@@ -2377,15 +2385,75 @@ class ShotEncoder:
         return ["-threads", str(max(1, threads)), "-ss", self._seek(w0, source),
                 "-t", f"{self._span(w0, w1):.6f}", "-i", str(source)]
 
+    _HWDEC_ARGS = ("-hwaccel", "qsv", "-hwaccel_output_format", "qsv")
+
+    def _surface_format(self) -> str:
+        """The pixel format a QSV decode of the source lands in."""
+        return "p010le" if (self.info.color.bit_depth or 8) > 8 else "nv12"
+
+    def _reference_read(self, args: List[str],
+                        vf: List[str]) -> Tuple[List[str], List[str]]:
+        """Move a source read onto the GPU decoder, when reference_hwaccel
+        allows it and the preflight passed.
+
+        The hwaccel options precede the input they apply to, and the download
+        has to be the first filter in the chain: everything after it (fps=,
+        scale=, setpts, format) wants system-memory frames.
+        """
+        if not self._hwdec():
+            return args, vf
+        return ([*self._HWDEC_ARGS, *args],
+                [f"hwdownload,format={self._surface_format()}", *vf])
+
+    def _hwdec(self) -> bool:
+        if (self.opt.reference_hwaccel or "auto").lower() == "off":
+            return False
+        with self._hwdec_lock:
+            if self._hwdec_ok is None:
+                self._hwdec_ok = self._hwdec_preflight()
+            return self._hwdec_ok
+
+    def _hwdec_preflight(self) -> bool:
+        """Prove QSV decodes this source before any score depends on it.
+
+        Not just "ffmpeg exits 0": on a B580 an unsupported stream decodes to
+        nothing and still exits cleanly (the scdet path learnt that on AV1),
+        and a scoring run with an empty reference would fail hundreds of
+        times over. framemd5 of the first frames says whether frames came out.
+        """
+        fmt = self._surface_format()
+        cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats",
+               *self._HWDEC_ARGS, "-i", str(self.source),
+               "-map", "0:v:0", "-frames:v", "4",
+               "-vf", f"hwdownload,format={fmt}", "-f", "framemd5", "-"]
+        try:
+            out = self._run(cmd, timeout=120)
+        except (TranscodeError, OSError) as e:
+            logger.warning("reference_hwaccel: QSV cannot decode {} ({}); "
+                           "scoring reads stay on the CPU for this job",
+                           self.source.name, e)
+            return False
+        frames = sum(1 for line in out.splitlines() if line.startswith("0,"))
+        if not frames:
+            logger.warning("reference_hwaccel: QSV decoded no frames of {}; "
+                           "scoring reads stay on the CPU for this job",
+                           self.source.name)
+            return False
+        logger.info("reference_hwaccel: scoring reads of {} decode on QSV ({})",
+                    self.source.name, fmt)
+        return True
+
     def _score_windows(self, w0: int, w1: int, idx: int, crf: int,
                        threads: int) -> float:
         """Score [w0, w1) of the finished output against the same frames of the
         source, reading both in place."""
+        # the AV1 side stays on the CPU: dav1d beats QSV-plus-download there
         dist_args = self._window_input(w0, w1, self.output, threads)
-        ref_args = self._window_input(w0, w1, self.source, threads)
+        ref_args, ref_vf = self._reference_read(
+            self._window_input(w0, w1, self.source, threads), [])
         if self.metric == "xpsnr":
-            return self._score_xpsnr(dist_args, ref_args, [], idx, crf)
-        return self._score_vmaf(dist_args, ref_args, [], idx, crf,
+            return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf)
+        return self._score_vmaf(dist_args, ref_args, ref_vf, idx, crf,
                                 threads=threads, frames=w1 - w0)
 
     # ---- colour description of the reference, for metrics that need it ----

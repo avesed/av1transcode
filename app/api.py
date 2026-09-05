@@ -252,13 +252,15 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         return {"ok": True, "optimizer": params.model_dump(), "overrides": over}
 
     # ---------- GPU ----------
-    _GPU_KEYS = ("vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel")
+    _GPU_KEYS = ("vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel",
+                 "reference_hwaccel")
 
     def _gpu_settings() -> dict:
         o = settings.transcode.optimizer
         return {"vmaf_sycl_device": o.vmaf_sycl_device,
                 "vmaf_sycl_min_width": o.vmaf_sycl_min_width,
                 "scenedetect_hwaccel": o.scenedetect_hwaccel,
+                "reference_hwaccel": o.reference_hwaccel,
                 "vulkan_device": settings.transcode.dovi.vulkan_device}
 
     @router.get("/gpu")

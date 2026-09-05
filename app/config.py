@@ -307,6 +307,18 @@ class OptimizerSettings(BaseModel):
     # cuts of 59 against native resolution). Below 2160p the x264 pass
     # dominates and the wall clock gets worse, though CPU still drops ~5x.
     scenedetect_hwaccel: Literal["auto", "off"] = "auto"
+    # Decode the VMAF *reference* read on the GPU (Intel QSV): the source side
+    # of every probe score and of every verification window. auto = try it
+    # once per job (4 frames to framemd5) and fall back to software for the
+    # whole job if that fails; off = never. Only this one read goes onto the
+    # GPU on purpose: copying 4K frames back to the CPU tops out around 130
+    # frames/s across the whole probe pool, which is about what the pool
+    # already consumes, so a second read per probe would be GPU-bound and
+    # slower; and the AV1 probe files decode faster on dav1d than on QSV plus
+    # a download (measured: 13.5s against 10.1s wall for 120 frames). Measured
+    # on 120 4K frames scored on SYCL: 39.4 -> 22.1 CPU-seconds, wall -12%,
+    # decoded frames bit-exact, scores unchanged.
+    reference_hwaccel: Literal["auto", "off"] = "auto"
     # Fold shots shorter than this many frames into a neighbour before probing.
     # OFF by default, because the size win it was added for did not survive
     # measurement. Splitting a CONTINUOUS take into short pieces is expensive
@@ -378,9 +390,12 @@ class DolbyVision(BaseModel):
     # passed into the container and falls back to Mesa's llvmpipe software
     # renderer when there is none. Pin it to "llvmpipe" only to force software.
     vulkan_device: str = ""
-    # NB there is no strip_rpu knob. Profile 7/8 sources always have their DV
-    # layers stripped before the encoder sees them (dovi.strip_dv_from_hevc),
-    # and the RPU is saved separately when save_rpu is set. A `strip_rpu` field
+    # NB there is no strip_rpu knob. Profile 7/8 sources are read straight
+    # from the original file: the decoder returns the base layer and ignores
+    # the enhancement layer and the RPU by itself, frame-identical (framemd5,
+    # software and QSV) to the dovi_split=bl remux that used to be written
+    # first - three minutes and a 27GB write per 4K episode, for nothing. The
+    # RPU is saved separately when save_rpu is set. A `strip_rpu` field
     # sat here for a long time, documented in config.yaml, read by nothing at
     # all; it was removed rather than wired up, because wiring it would have
     # changed the pipeline for anyone who had already set it to false and

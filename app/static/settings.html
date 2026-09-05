@@ -339,9 +339,10 @@ const GPU_FIELDS = [
   F("vmaf_sycl_device", "VMAF 打分设备", "用 libvmaf 的 SYCL 后端在 GPU 上打分。关闭 = CPU。作业开始时会先自检一次，设备不可用则整个作业退回 CPU。", { type: "sycl" }),
   F("vmaf_sycl_min_width", "GPU 打分的最小宽度", "源窄于此仍用 CPU：GPU 的收益随帧大小增长，1080p 上 CPU 本来就只要两秒。", { min: 0, max: 7680, unit: "px" }),
   F("scenedetect_hwaccel", "分镜解码", "auto = 有 QSV 就用它解码分镜那一趟；off = 一律软解。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
+  F("reference_hwaccel", "打分参考解码", "探测打分和验证时读源片的那一路是否用 QSV 解码。auto = 作业开始先解 4 帧自检，失败整个作业软解；off = 一律软解。只放这一路上 GPU：4K 帧回传 CPU 约 130 帧/秒封顶，探测池本来就吃到这个量。实测每次打分省 44% CPU、墙钟 -12%，分数不变。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
   F("vulkan_device", "Dolby Vision P5 转换设备", "libplacebo 应用 RPU 用的 Vulkan 设备，ffmpeg 的 -init_hw_device 选择器：序号或名字片段。空 = 让 ffmpeg 挑，有 GPU 就用 GPU；写 llvmpipe 强制软件渲染。", { type: "vulkan", wide: true }),
 ];
-const GPU_KEYS = new Set(["vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel"]);
+const GPU_KEYS = new Set(["vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel", "reference_hwaccel"]);
 
 let optDefaults = {}, optValues = {};
 const fieldEl = new Map();   // key -> .field element
@@ -478,6 +479,7 @@ function renderGpu(data) {
   const vkPick = g.vulkan_device ? `按选择器 "${esc(g.vulkan_device)}"` : (vk.length ? `自动 → ${esc(vk[0])}` : "自动，但没有设备");
   paths.push(["P5 转换", vkPick]);
   paths.push(["分镜解码", g.scenedetect_hwaccel === "off" ? "软解" : s.qsv ? "QSV" : "auto，但 QSV 不可用 → 软解"]);
+  paths.push(["打分参考解码", g.reference_hwaccel === "off" ? "软解" : s.qsv ? "QSV（探测文件和成品仍软解）" : "auto，但 QSV 不可用 → 软解"]);
   $("paths").innerHTML = paths.map(([k, v]) => `<div><span class="k">${esc(k)}</span><span class="v">${v}</span></div>`).join("");
   $("gpuNote").textContent = `检测于 ${new Date(s.checked_at * 1000).toLocaleTimeString()}`;
   // SYCL device picker

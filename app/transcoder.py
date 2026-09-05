@@ -466,12 +466,14 @@ def run_full_transcode(
                 tmp_files.append(intermediate)
                 encode_input = intermediate
             elif info.dovi.profile in (7, 8):
-                stripped = work_dir / f"{source.stem}.dv_bl.mkv"
-                outfile = dovi.strip_dv_from_hevc(settings, str(source), str(stripped))
-                if outfile is None:
-                    raise TranscodeError("failed to strip DV layers for encode")
-                tmp_files.append(stripped)
-                encode_input = stripped
+                # Read the original: the decoder returns the base layer and
+                # ignores the enhancement layer and the RPU on its own,
+                # frame-identical (framemd5, software and QSV) to the
+                # dovi_split=bl remux this used to write first - which cost
+                # about three minutes and a 27GB write per 4K episode. The
+                # RPU was saved by extract_rpu above.
+                logger.info("P{}: base layer decoded in place, no remux",
+                            info.dovi.profile)
             else:
                 logger.warning("Unsupported DV profile {} - encoding BL directly", info.dovi.profile)
 
