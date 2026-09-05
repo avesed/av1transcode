@@ -189,14 +189,16 @@ class OptimizerSettings(BaseModel):
     # Left in because it is the right lever on a differently shaped machine
     # (many cores, little memory, or a much cheaper metric), but do not reach
     # for it expecting free throughput here. Default 1.0 is today's behaviour.
+    #
+    # Tried again on 2026-09-05 with the GPU build (SYCL scoring, VA-API
+    # reference read), where a probe's scoring step measures about two of
+    # the four cores it holds and E06 ran its probe phase at 30-36 of 40
+    # cores: relaxing HALF the charge during the scoring step only, capped
+    # at 30% of the cores, took peak concurrency from 10 to 13 and the probe
+    # phase from 234s to 266s on an idle 40-core box (encode phase identical
+    # at 178s). The cores that look idle are pipeline bubbles the extra
+    # probes cannot fill without slowing every encode. Reverted.
     probe_cpu_charge: float = 1.0
-    # While a probe SCORES on the SYCL device with a hardware reference read,
-    # keep this share of its CPU charge and hand the rest back to admission
-    # for the duration; 1.0 = never relax. Measured: that score uses ~2 of
-    # the 4 cores the probe holds, and the probe pool left a quarter of the
-    # container's cores idle. Only that step, only with both off the CPU -
-    # unlike probe_cpu_charge above, encodes are never over-committed.
-    probe_score_charge: float = 0.5
     # libvmaf model configs. Accepts "path=/x.json", "version=NAME", or a bare
     # path (wrapped as path=...). Note: stock libvmaf <= 2.3.1 has no
     # ssimulacra2 model; a patched libvmaf or a ssimulacra2.json is required

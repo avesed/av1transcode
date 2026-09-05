@@ -18,7 +18,6 @@ ffmpeg's libvmaf filter, so both go through identical plumbing.
 
 from __future__ import annotations
 
-import contextlib
 import glob
 import json
 import math
@@ -30,7 +29,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -544,8 +543,6 @@ class ShotEncoder:
         self._hwdec_failures = 0
         self._hwdec_bad: Set[Tuple[int, int]] = set()   # windows that failed once
         self._hwdec_lock = threading.Lock()
-        self._sched_cv: Optional[threading.Condition] = None
-        self._sched_state: Optional[Dict[str, float]] = None
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0
         # every frame's pts_time from the scdet pass (see _run_scdet), and the
@@ -797,15 +794,9 @@ class ShotEncoder:
         errors: List[BaseException] = []
         started: List[threading.Thread] = []
         state = {"mem": budget, "cpu": float(self._cores()), "live": 0,
-                 "done": 0, "peak_conc": 0,
-                 # units scoring tasks have handed back, and the most they
-                 # may hand back at once (see _cpu_relaxed)
-                 "relaxed": 0.0, "relax_budget": self._cores() * self._RELAX_SHARE_OF_CORES}
+                 "done": 0, "peak_conc": 0}
         cv = threading.Condition()
         squeezed = [False]
-        # what a running task uses to hand part of its CPU charge back for a
-        # while (see _cpu_relaxed); one schedule runs at a time per engine
-        self._sched_cv, self._sched_state = cv, state
 
         def corrected(key: int, lp: int) -> float:
             return cost(key, lp) * cal.factor()
@@ -887,7 +878,6 @@ class ShotEncoder:
                 self._kill_all()
             for th in started:
                 th.join()
-        self._sched_cv, self._sched_state = None, None
         self._sched_peak_conc = state["peak_conc"]
         self._sched_budget = budget
         if errors:
@@ -2288,58 +2278,6 @@ class ShotEncoder:
                 f"(a full grid would have been {len(grid)})")
         return results
 
-    _RELAX_SHARE_OF_CORES = 0.3
-
-    @contextlib.contextmanager
-    def _cpu_relaxed(self, units: float) -> Iterator[None]:
-        """Give up to `units` of this task's CPU charge back to the scheduler
-        for the duration of the block, so another task can be admitted
-        against them; take them back afterwards.
-
-        Bounded: relaxed units admit tasks that relax in their turn, and
-        unbounded that cascades - measured at 20 cores, peak concurrency
-        went from 5 to 10, twice the pool, for no gain. Outstanding relaxed
-        units are capped at _RELAX_SHARE_OF_CORES of the cores (40 cores:
-        12 units, about three extra probes), which is the headroom that was
-        measured idle, not more. The counter may dip below zero on the way
-        back, which only delays the next admission until something finishes.
-        """
-        cv, state = self._sched_cv, self._sched_state
-        if cv is None or state is None or units <= 0:
-            yield
-            return
-        with cv:
-            grant = min(units, max(0.0, state["relax_budget"] - state["relaxed"]))
-            state["relaxed"] += grant
-            state["cpu"] += grant
-            cv.notify_all()
-        try:
-            yield
-        finally:
-            with cv:
-                state["relaxed"] -= grant
-                state["cpu"] -= grant
-
-    def _score_relax_units(self, lp: int) -> float:
-        """How much of a probe's CPU charge its scoring step hands back.
-
-        A probe is charged lp cores for its whole life, and while it encodes
-        that is right. While it scores on the SYCL device with a hardware
-        reference read it is not: measured on 120 4K frames, that score costs
-        22 CPU-seconds over ~10s of wall, about two cores of the four it holds,
-        and E06 of Stranger Things showed it - the container sat at 30-36 of
-        its 40 cores through the probe phase with the pool pinned at ten.
-        probe_cpu_charge's own note records that a blanket lower charge made
-        things SLOWER; that was measured with CPU scoring, where the cores
-        were genuinely busy. This relaxes only the scoring step, only when
-        both the scorer and the reference read are off the CPU, by
-        probe_score_charge of the step's charge.
-        """
-        share = float(self.opt.probe_score_charge if self.opt.probe_score_charge is not None else 0.5)
-        if share >= 1.0 or not (self._sycl_ok and self._hwdec_ok):
-            return 0.0
-        return lp * float(self.opt.probe_cpu_charge or 1.0) * (1.0 - share)
-
     def _max_probe_concurrency(self, n_tasks: int) -> int:
         """Hard cap on probes in flight; the budget decides the real number."""
         w = self.opt.probe_workers
@@ -2415,8 +2353,7 @@ class ShotEncoder:
         args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items()),
                  "-pix_fmt", self._pix_fmt(), "-f", "ivf", str(ivf)]
         self._run(args, timeout=3600)
-        with self._cpu_relaxed(self._score_relax_units(lp) if shard is None else 0.0):
-            score = self._score_probe(w0, w1, ivf, idx, crf, shard)
+        score = self._score_probe(w0, w1, ivf, idx, crf, shard)
         if not self.opt.keep_probes:
             try:
                 ivf.unlink()
