@@ -540,7 +540,7 @@ class ShotEncoder:
         # reference_hwaccel: None until the first scoring read runs the
         # preflight; then whether the source decodes on QSV for this job
         self._hwdec_ok: Optional[bool] = None
-        self._hwdec_failures = 0
+        self._hwdec_streak = 0        # hardware reads failed in a row, reset on success
         self._hwdec_bad: Set[Tuple[int, int]] = set()   # windows that failed once
         self._hwdec_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
@@ -2376,12 +2376,15 @@ class ShotEncoder:
         dist_args = ["-i", str(dist)]
         frames = (w1 - w0) // self._probing_rate()
         try:
-            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
+            score = self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
         except TranscodeError as e:
             if not hw or not self._hwdec_fallback(w0, w1, e):
                 raise
-        ref_args, ref_vf = self._probe_input(w0, w1, shard)
-        return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
+            ref_args, ref_vf = self._probe_input(w0, w1, shard)
+            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
+        if hw:
+            self._hwdec_read_ok()
+        return score
 
     def _score_pair(self, dist_args: List[str], ref_args: List[str],
                     ref_vf: List[str], idx: int, crf: int,
@@ -2456,39 +2459,52 @@ class ShotEncoder:
             return args, vf, False
         return [*self._hwdec_args(), *args], [self._download_vf(), *vf], True
 
-    _HWDEC_MAX_FAILURES = 8
+    _HWDEC_MAX_STREAK = 8
 
     def _hwdec_fallback(self, w0: int, w1: int, err: TranscodeError) -> bool:
         """Whether a failed hardware read of [w0, w1) should be scored again
         on the CPU. True for a decode failure; False for a timeout or a
         cancelled job, which are not the GPU's doing.
 
-        The preflight cannot prove every window. E06 of Stranger Things (a
-        Blu-ray remux, DV P7 with its enhancement layer) begins with a broken
-        group of pictures: its first frames reference pictures that are not
-        in the file ("Could not find ref with POC 2..12"). The software
-        decoder conceals and carries on; VA-API answers "Failed to sync
-        surface: internal decoding error" and ffmpeg exits 251, which took
-        the whole job down. From 0.5s on, and at 65 other seeked positions,
-        the hardware read is frame-identical. One window is a few seconds on
-        the CPU; a job that fails on it is three hours. The window is
-        remembered so its other CRF probes skip the doomed attempt, and past
-        _HWDEC_MAX_FAILURES distinct windows the rest of the job goes
-        straight to the CPU.
+        The preflight cannot prove every window, and two different things
+        fail. E06 of Stranger Things (a Blu-ray remux, DV P7 with its
+        enhancement layer) begins with a broken group of pictures: its first
+        frames reference pictures not in the file ("Could not find ref with
+        POC 2..12"). Software conceals and carries on; VA-API answers "Failed
+        to sync surface: internal decoding error" and exits 251. That window
+        fails every time, so it is remembered and its other CRF probes skip
+        the doomed attempt. E07 is the other kind: five mid-file windows that
+        decode cleanly on their own each failed once under ten concurrent
+        VA-API reads plus SYCL scoring on the one B580 - contention, not the
+        stream, and the next read succeeds.
+
+        So the whole-job give-up counts CONSECUTIVE failures, reset by any
+        successful hardware read (see _hwdec_read_ok). A device that has
+        genuinely died fails read after read and trips it; a scattered burst
+        under load never does, because successes keep resetting it. Either
+        way the window at hand is scored on the CPU and the job goes on.
         """
         if isinstance(err, CommandTimeout) or (self.cancel_flag and self.cancel_flag()):
             return False
         with self._hwdec_lock:
             self._hwdec_bad.add((w0, w1))
-            self._hwdec_failures = n = len(self._hwdec_bad)
-            flip = n >= self._HWDEC_MAX_FAILURES and self._hwdec_ok
+            self._hwdec_streak += 1
+            n = self._hwdec_streak
+            flip = n >= self._HWDEC_MAX_STREAK and self._hwdec_ok
             if flip:
                 self._hwdec_ok = False
         tail = str(err).strip().splitlines()[-1][:160] if str(err).strip() else err.__class__.__name__
         logger.warning("reference_hwaccel: the VA-API read of frames [{}, {}) failed "
                        "({}); scoring that window on the CPU{}", w0, w1, tail,
-                       f"; that is {n} windows, the rest of the job scores on the CPU" if flip else "")
+                       f"; {n} in a row, the rest of the job scores on the CPU" if flip else "")
         return True
+
+    def _hwdec_read_ok(self) -> None:
+        """A hardware read succeeded: clear the consecutive-failure streak so
+        a scattered failure under load never adds up to giving up the GPU."""
+        if self._hwdec_streak:
+            with self._hwdec_lock:
+                self._hwdec_streak = 0
 
     def _hwdec(self) -> bool:
         if (self.opt.reference_hwaccel or "auto").lower() == "off":
@@ -2569,12 +2585,15 @@ class ShotEncoder:
         if (w0, w1) not in self._hwdec_bad:
             ref_args, ref_vf, hw = self._reference_read(ref_args, ref_vf)
         try:
-            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, w1 - w0)
+            score = self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, w1 - w0)
         except TranscodeError as e:
             if not hw or not self._hwdec_fallback(w0, w1, e):
                 raise
-        return self._score_pair(dist_args, self._window_input(w0, w1, self.source, threads),
-                                [], idx, crf, threads, w1 - w0)
+            return self._score_pair(dist_args, self._window_input(w0, w1, self.source, threads),
+                                    [], idx, crf, threads, w1 - w0)
+        if hw:
+            self._hwdec_read_ok()
+        return score
 
     # ---- colour description of the reference, for metrics that need it ----
     # ffmpeg's colour names are not zimg's, and a wrong one is not a rounding
@@ -2698,24 +2717,48 @@ class ShotEncoder:
                 return self._score_vmaf_on(sycl, dist_args, ref_args, ref_vf,
                                            idx, crf, threads,
                                            timeout=self._sycl_timeout(frames))
-            except CommandTimeout as e:
-                # Under the lock: probe workers time out concurrently, and
-                # the flip to the CPU should be announced exactly once.
+            except TranscodeError as e:
+                # Not just timeouts. E07 of Stranger Things died on
+                # "SYCL memcpy H2D: OUT_OF_DEVICE_MEMORY" followed by
+                # "DEVICE_LOST": ten concurrent VA-API reads and ten SYCL
+                # contexts exhausted the B580's memory, ffmpeg exited 234 and
+                # the whole three-hour job failed. A score is a score - if the
+                # device cannot produce it, the CPU can, and only the job
+                # dying is unrecoverable. A non-GPU error (a bad model path,
+                # say) fails on the CPU too and surfaces from there.
+                if self.cancel_flag and self.cancel_flag():
+                    raise
+                stalled = isinstance(e, CommandTimeout)
+                # DEVICE_LOST is terminal for the context: every later run on
+                # it fails the same way, so give the device up at once rather
+                # than paying _SYCL_MAX_TIMEOUTS more failures for the proof.
+                text = str(e)
+                lost = "DEVICE_LOST" in text or "OUT_OF_DEVICE_MEMORY" in text
+                # Under the lock: probe workers fail concurrently, and the
+                # flip to the CPU should be announced exactly once.
                 with self._sycl_lock:
                     self._sycl_timeouts += 1
                     n = self._sycl_timeouts
-                    flip = n >= self._SYCL_MAX_TIMEOUTS and self._sycl_ok
+                    flip = (lost or n >= self._SYCL_MAX_TIMEOUTS) and self._sycl_ok
                     if flip:
                         self._sycl_ok = False
-                logger.warning(
-                    "optimizer: SYCL scoring of shot {} crf {} did not finish "
-                    "within {}s (stall {} this job); scoring it on the CPU "
-                    "instead", idx, crf, self._sycl_timeout(frames), n)
-                self._log(f"sycl timeout shot {idx:05d} crf {crf}: {e}")
+                if stalled:
+                    logger.warning(
+                        "optimizer: SYCL scoring of shot {} crf {} did not finish "
+                        "within {}s (stall {} this job); scoring it on the CPU "
+                        "instead", idx, crf, self._sycl_timeout(frames), n)
+                else:
+                    tail = text.strip().splitlines()[-1][:160] if text.strip() else e.__class__.__name__
+                    logger.warning(
+                        "optimizer: SYCL scoring of shot {} crf {} failed ({}); "
+                        "scoring it on the CPU instead", idx, crf, tail)
+                self._log(f"sycl failure shot {idx:05d} crf {crf}: {e}")
                 if flip:
                     logger.warning(
-                        "optimizer: libvmaf SYCL device {} stalled {} times; "
-                        "the rest of this job scores on the CPU", sycl, n)
+                        "optimizer: libvmaf SYCL device {} {}; the rest of this "
+                        "job scores on the CPU", sycl,
+                        "reported the device lost or out of memory" if lost
+                        else f"stalled {n} times")
         return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,
                                    threads, timeout=3600)
 

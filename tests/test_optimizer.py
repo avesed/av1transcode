@@ -3095,11 +3095,19 @@ def test_reference_read_falls_back_per_window_when_the_gpu_read_fails(
     real = enc._score_vmaf
     mode = {"fail": "sync"}
 
+    calls_by_ss = []
+
     def flaky(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None):
-        if "-hwaccel" in ref_args and mode["fail"] == "sync":
+        hw = "-hwaccel" in ref_args
+        if hw and mode["fail"] == "sync":
             raise opt.TranscodeError("ffmpeg failed (rc=251):\n[hwdownload] Failed to download frame: -5.")
-        if "-hwaccel" in ref_args and mode["fail"] == "timeout":
+        if hw and mode["fail"] == "timeout":
             raise opt.CommandTimeout("libvmaf timed out")
+        if hw and mode["fail"] == "odd":
+            # fail every other window; the ones between reset the streak
+            calls_by_ss.append(1)
+            if len(calls_by_ss) % 2 == 1:
+                raise opt.TranscodeError("ffmpeg failed (rc=251):\n[hwdownload] Failed to download frame: -5.")
         return real(dist_args, ref_args, ref_vf, idx, crf, threads=threads, frames=frames)
 
     monkeypatch.setattr(enc, "_score_vmaf", flaky)
@@ -3118,11 +3126,19 @@ def test_reference_read_falls_back_per_window_when_the_gpu_read_fails(
     n = len(warnings)
     enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 34)
     assert len(warnings) == n and "-hwaccel" not in calls[-1][1]
-    # enough distinct failed windows and the job stops trying
-    for k in range(enc._HWDEC_MAX_FAILURES + 2):
-        enc._score_probe(1000 + 120 * k, 1120 + 120 * k, tmp_path / "d.ivf", 0, 30)
+    # a scattered burst under load (E07): a good read between the failures
+    # keeps resetting the streak, so the job never gives up the GPU
+    mode["fail"] = "odd"
+    for k in range(enc._HWDEC_MAX_STREAK * 3):
+        enc._score_probe(2000 + 120 * k, 2120 + 120 * k, tmp_path / "d.ivf", 0, 30)
+    assert enc._hwdec_ok is True and enc._hwdec_streak == 0
+    # a device that has died fails read after read: enough in a row and it
+    # stops trying
+    mode["fail"] = "sync"
+    for k in range(enc._HWDEC_MAX_STREAK + 2):
+        enc._score_probe(5000 + 120 * k, 5120 + 120 * k, tmp_path / "d.ivf", 0, 30)
     assert enc._hwdec_ok is False
-    assert any("rest of the job scores on the CPU" in w for w in warnings)
+    assert any("the rest of the job scores on the CPU" in w for w in warnings)
     # after the flip the reads are built for the CPU outright
     n = len(warnings)
     enc._score_probe(840, 960, tmp_path / "d.ivf", 0, 30)
@@ -3208,3 +3224,52 @@ def test_reference_read_off_never_touches_the_gpu(settings, info, plan, tmp_path
     enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
     enc._score_windows(600, 720, 0, 30, 4)
     assert all("-hwaccel" not in ref for _, ref, _ in calls)
+
+
+def test_sycl_device_error_scores_on_the_cpu_instead_of_killing_the_job(
+        settings, info, plan, tmp_path, monkeypatch):
+    """E07 of Stranger Things died on "SYCL memcpy H2D:
+    OUT_OF_DEVICE_MEMORY" then "DEVICE_LOST" - ten VA-API reads and ten SYCL
+    contexts exhausted the card, ffmpeg exited 234 and a three-hour job
+    failed. A score the device cannot produce is one the CPU can; only the
+    job dying is unrecoverable. DEVICE_LOST is terminal for the context, so
+    the device is given up at once rather than after three more failures."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    settings.transcode.optimizer.vmaf_sycl_min_width = 0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    enc._sycl_ok = True                 # the preflight already passed
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    backends = []
+
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout):
+        backends.append(sycl)
+        if sycl >= 0:
+            raise opt.TranscodeError(
+                "ffmpeg failed (rc=234):\nlibvmaf ERROR SYCL memcpy H2D: "
+                "level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)")
+        return 91.5
+
+    monkeypatch.setattr(enc, "_score_vmaf_on", on)
+    assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 91.5
+    assert backends == [0, -1]                      # tried the GPU, scored on the CPU
+    assert enc._sycl_ok is False                    # and gave the device up at once
+    assert any("out of memory" in w for w in warnings)
+    # the rest of the job never reaches the device again
+    backends.clear()
+    assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 91.5
+    assert backends == [-1]
+
+
+def test_a_cancelled_job_does_not_retry_the_score_on_the_cpu(
+        settings, info, plan, tmp_path, monkeypatch):
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    settings.transcode.optimizer.vmaf_sycl_min_width = 0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._sycl_ok = True
+    enc.cancel_flag = lambda: True
+    monkeypatch.setattr(enc, "_score_vmaf_on",
+                        lambda *a, **k: (_ for _ in ()).throw(opt.TranscodeError("Job cancelled by user")))
+    with pytest.raises(opt.TranscodeError, match="cancelled"):
+        enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120)
