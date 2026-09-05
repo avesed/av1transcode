@@ -3208,3 +3208,43 @@ def test_reference_read_off_never_touches_the_gpu(settings, info, plan, tmp_path
     enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
     enc._score_windows(600, 720, 0, 30, 4)
     assert all("-hwaccel" not in ref for _, ref, _ in calls)
+
+
+# ---------------------------------------------------------------- probe_score_charge
+
+def test_probe_scoring_hands_half_its_cpu_back_while_on_the_gpu(settings, info, plan, tmp_path, monkeypatch):
+    """Measured: a probe holds lp=4 cores for its whole life but its SYCL score
+    with a hardware reference read uses about two. E06 ran the probe phase at
+    30-36 of 40 cores with the pool pinned at ten. The relax applies to the
+    scoring step only, and only when both the scorer and the read are off
+    the CPU; encodes keep their full charge."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    state = {"cpu": 40.0}
+    enc._sched_cv, enc._sched_state = threading.Condition(), state
+    seen = []
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: (seen.append(("run", state["cpu"])), "")[1])
+    monkeypatch.setattr(enc, "_score_probe", lambda *a, **k: (seen.append(("score", state["cpu"])), 90.0)[1])
+    # CPU scorer or CPU read: nothing is handed back
+    enc._sycl_ok, enc._hwdec_ok = True, False
+    enc._probe_encode_and_score(0, 600, 720, 30, 4, None)
+    assert seen == [("run", 40.0), ("score", 40.0)] and state["cpu"] == 40.0
+    # both on the GPU: the score runs with half the charge given back
+    seen.clear()
+    enc._sycl_ok, enc._hwdec_ok = True, True
+    enc._probe_encode_and_score(0, 600, 720, 30, 4, None)
+    assert seen == [("run", 40.0), ("score", 42.0)] and state["cpu"] == 40.0
+    # a DV shard read is on the CPU regardless
+    seen.clear()
+    enc._probe_encode_and_score(0, 600, 720, 30, 4, tmp_path / "s.mkv")
+    assert seen[-1] == ("score", 40.0)
+    # 1.0 turns it off; the share follows probe_cpu_charge
+    settings.transcode.optimizer.probe_score_charge = 1.0
+    assert enc._score_relax_units(4) == 0.0
+    settings.transcode.optimizer.probe_score_charge = 0.25
+    settings.transcode.optimizer.probe_cpu_charge = 0.5
+    assert enc._score_relax_units(4) == pytest.approx(4 * 0.5 * 0.75)
+    # outside a schedule the context manager is inert
+    enc._sched_cv = enc._sched_state = None
+    with enc._cpu_relaxed(2.0):
+        pass

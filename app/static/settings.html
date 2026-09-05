@@ -329,6 +329,7 @@ const OPT_GROUPS = [
     F("encode_workers", "并行正式编码数", "0 = 按内存自动；每个 4K 实例持有几 GB 帧池。", { min: 0, max: 128 }),
     F("encode_threads", "每个编码实例的核数", "0 = 自动 = 核数 / 实例数。", { min: 0, max: 512 }),
     F("probe_cpu_charge", "探测的 CPU 计费", "探测按 lp 的几成计入 CPU 预算，1.0 = 满额；调低放更多并发，代价是余量。", { step: 0.05, min: 0.1, max: 1 }),
+    F("probe_score_charge", "GPU 打分时的 CPU 计费", "探测在 GPU 上打分（SYCL 打分且 VA-API 读参考）的那一段按 lp 的几成继续计费，其余暂时还给调度器；1.0 = 不放。实测这一段只用一半的核。", { step: 0.05, min: 0.1, max: 1 }),
   ]},
   { id: "grp-verify", name: "校验与调试", note: "编码完成后抽几个镜头重新打分，对账探测预测和实际交付", fields: [
     F("verify_shots", "抽验镜头数", "0 = 关闭。这是全流程唯一的对账机制。", { min: 0 }),
