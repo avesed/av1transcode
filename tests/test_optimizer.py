@@ -3078,12 +3078,58 @@ def test_reference_read_decodes_the_source_on_vaapi(settings, info, plan, tmp_pa
     assert ref_vf == ["hwdownload,format=p010le,format=yuv420p10le"]
 
 
+def test_reference_read_falls_back_per_window_when_the_gpu_read_fails(
+        settings, info, plan, tmp_path, monkeypatch):
+    """E06 of Stranger Things: 65 seeked hardware reads matched software, and
+    the first production batch still lost one window to "Failed to sync
+    surface: internal decoding error". That window is scored again on the
+    CPU; a timeout is not the GPU's doing and is not retried; and past
+    _HWDEC_MAX_FAILURES the whole rest of the job goes to the CPU."""
+    info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: _FRAMEMD5)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    calls = _capture_scores(enc, monkeypatch)
+    real = enc._score_vmaf
+    mode = {"fail": "sync"}
+
+    def flaky(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None):
+        if "-hwaccel" in ref_args and mode["fail"] == "sync":
+            raise opt.TranscodeError("ffmpeg failed (rc=251):\n[hwdownload] Failed to download frame: -5.")
+        if "-hwaccel" in ref_args and mode["fail"] == "timeout":
+            raise opt.CommandTimeout("libvmaf timed out")
+        return real(dist_args, ref_args, ref_vf, idx, crf, threads=threads, frames=frames)
+
+    monkeypatch.setattr(enc, "_score_vmaf", flaky)
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 90.0
+    assert ["-hwaccel" in ref for _, ref, _ in calls] == [False]        # the CPU attempt reached the scorer
+    assert len(warnings) == 1 and "[600, 720)" in warnings[0] and "Failed to download" in warnings[0]
+    assert enc._score_windows(600, 720, 0, 30, 4) == 90.0
+    assert "-hwaccel" not in calls[-1][1] and calls[-1][2] == []
+    # a timeout propagates untouched (the SYCL layer owns that decision)
+    mode["fail"] = "timeout"
+    with pytest.raises(opt.CommandTimeout):
+        enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
+    # enough failures and the job stops trying
+    mode["fail"] = "sync"
+    for k in range(enc._HWDEC_MAX_FAILURES + 2):
+        enc._score_probe(720, 840, tmp_path / "d.ivf", 0, 30)
+    assert enc._hwdec_ok is False
+    assert any("rest of the job scores on the CPU" in w for w in warnings)
+    # after the flip the reads are built for the CPU outright
+    n = len(warnings)
+    enc._score_probe(840, 960, tmp_path / "d.ivf", 0, 30)
+    assert len(warnings) == n and "-hwaccel" not in calls[-1][1]
+
+
 def test_reference_read_download_format_follows_the_bit_depth(settings, info, plan, tmp_path, monkeypatch):
     info.color.bit_depth, info.color.pix_fmt = 8, "yuv420p"
     enc = make_encoder(settings, info, plan, tmp_path)
     monkeypatch.setattr(enc, "_run", lambda args, timeout=None: _FRAMEMD5)
-    _, vf = enc._reference_read(*enc._probe_input(600, 720))
-    assert vf[0] == "hwdownload,format=nv12,format=yuv420p"
+    _, vf, hw = enc._reference_read(*enc._probe_input(600, 720))
+    assert hw and vf[0] == "hwdownload,format=nv12,format=yuv420p"
 
 
 def _md5_lines(sums):

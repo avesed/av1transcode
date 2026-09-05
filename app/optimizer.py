@@ -540,6 +540,7 @@ class ShotEncoder:
         # reference_hwaccel: None until the first scoring read runs the
         # preflight; then whether the source decodes on QSV for this job
         self._hwdec_ok: Optional[bool] = None
+        self._hwdec_failures = 0
         self._hwdec_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0
@@ -2366,16 +2367,28 @@ class ShotEncoder:
         if self.metric == "ssimulacra2":
             return self._score_ssimulacra2(w0, w1, dist, idx, crf, shard)
         ref_args, ref_vf = self._probe_input(w0, w1, shard)
+        hw = False
         if shard is None:
             # a DV shard is a small file already carrying the probe-side
             # filters; only the 4K source read is worth the GPU
-            ref_args, ref_vf = self._reference_read(ref_args, ref_vf)
+            ref_args, ref_vf, hw = self._reference_read(ref_args, ref_vf)
         dist_args = ["-i", str(dist)]
+        frames = (w1 - w0) // self._probing_rate()
+        try:
+            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
+        except TranscodeError as e:
+            if not hw or not self._hwdec_fallback(w0, w1, e):
+                raise
+        ref_args, ref_vf = self._probe_input(w0, w1, shard)
+        return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
+
+    def _score_pair(self, dist_args: List[str], ref_args: List[str],
+                    ref_vf: List[str], idx: int, crf: int,
+                    threads: Optional[int], frames: int) -> float:
         if self.metric == "xpsnr":
             return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf)
         return self._score_vmaf(dist_args, ref_args, ref_vf, idx, crf,
-                                threads=threads,
-                                frames=(w1 - w0) // self._probing_rate())
+                                threads=threads, frames=frames)
 
     def _window_input(self, w0: int, w1: int, source: Path,
                       threads: int) -> List[str]:
@@ -2430,17 +2443,48 @@ class ShotEncoder:
         return f"hwdownload,format={self._surface_format()},format={self._native_format()}"
 
     def _reference_read(self, args: List[str],
-                        vf: List[str]) -> Tuple[List[str], List[str]]:
+                        vf: List[str]) -> Tuple[List[str], List[str], bool]:
         """Move a source read onto the GPU decoder, when reference_hwaccel
-        allows it and the preflight passed.
+        allows it and the preflight passed; the flag says whether it moved.
 
         The hwaccel options precede the input they apply to, and the download
         has to be the first filter in the chain: everything after it wants
         system-memory frames.
         """
         if not self._hwdec():
-            return args, vf
-        return [*self._hwdec_args(), *args], [self._download_vf(), *vf]
+            return args, vf, False
+        return [*self._hwdec_args(), *args], [self._download_vf(), *vf], True
+
+    _HWDEC_MAX_FAILURES = 8
+
+    def _hwdec_fallback(self, w0: int, w1: int, err: TranscodeError) -> bool:
+        """Whether a failed hardware read of [w0, w1) should be scored again
+        on the CPU. True for a decode failure; False for a timeout or a
+        cancelled job, which are not the GPU's doing.
+
+        The preflight cannot prove every window: on E06 of Stranger Things
+        (DV P7 with its enhancement layer) 65 seeked hardware reads matched
+        software exactly, and the first production batch still failed one
+        window with "Failed to sync surface: internal decoding error" behind a
+        run of "Could not find ref with POC". The software decoder shrugs at
+        a missing reference and conceals; the driver does not. One window is
+        a few seconds on the CPU; a job that fails on it is three hours. Past
+        _HWDEC_MAX_FAILURES windows the rest of the job goes straight to the
+        CPU rather than paying for the failed attempt every time.
+        """
+        if isinstance(err, CommandTimeout) or (self.cancel_flag and self.cancel_flag()):
+            return False
+        with self._hwdec_lock:
+            self._hwdec_failures += 1
+            n = self._hwdec_failures
+            flip = n >= self._HWDEC_MAX_FAILURES and self._hwdec_ok
+            if flip:
+                self._hwdec_ok = False
+        tail = str(err).strip().splitlines()[-1][:160] if str(err).strip() else err.__class__.__name__
+        logger.warning("reference_hwaccel: the VA-API read of frames [{}, {}) failed "
+                       "({}); scoring that window on the CPU{}", w0, w1, tail,
+                       f"; that is {n} windows, the rest of the job scores on the CPU" if flip else "")
+        return True
 
     def _hwdec(self) -> bool:
         if (self.opt.reference_hwaccel or "auto").lower() == "off":
@@ -2514,14 +2558,18 @@ class ShotEncoder:
                        threads: int) -> float:
         """Score [w0, w1) of the finished output against the same frames of the
         source, reading both in place."""
-        # the AV1 side stays on the CPU: dav1d beats QSV-plus-download there
+        # the AV1 side stays on the CPU: dav1d beats a GPU decode plus
+        # download there
         dist_args = self._window_input(w0, w1, self.output, threads)
-        ref_args, ref_vf = self._reference_read(
+        ref_args, ref_vf, hw = self._reference_read(
             self._window_input(w0, w1, self.source, threads), [])
-        if self.metric == "xpsnr":
-            return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf)
-        return self._score_vmaf(dist_args, ref_args, ref_vf, idx, crf,
-                                threads=threads, frames=w1 - w0)
+        try:
+            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, w1 - w0)
+        except TranscodeError as e:
+            if not hw or not self._hwdec_fallback(w0, w1, e):
+                raise
+        return self._score_pair(dist_args, self._window_input(w0, w1, self.source, threads),
+                                [], idx, crf, threads, w1 - w0)
 
     # ---- colour description of the reference, for metrics that need it ----
     # ffmpeg's colour names are not zimg's, and a wrong one is not a rounding
