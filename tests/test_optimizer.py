@@ -3018,7 +3018,12 @@ def test_probe_scale_treats_zero_as_none(settings, info, plan, tmp_path):
 _FRAMEMD5 = ("#format: frame checksums\n"
              "0,          0,          0,        1, 12441600, deadbeef\n"
              "0,          1,          1,        1, 12441600, deadbeef\n")
-_QSV = ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+_VAAPI = ["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD129", "-hwaccel_output_format", "vaapi"]
+
+
+@pytest.fixture(autouse=True)
+def _one_render_node(monkeypatch):
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
 
 
 def _capture_scores(enc, monkeypatch):
@@ -3032,7 +3037,7 @@ def _capture_scores(enc, monkeypatch):
     return calls
 
 
-def test_reference_read_decodes_the_source_on_qsv(settings, info, plan, tmp_path, monkeypatch):
+def test_reference_read_decodes_the_source_on_vaapi(settings, info, plan, tmp_path, monkeypatch):
     """Measured on 120 4K frames scored on SYCL: 39.4 -> 22.1 CPU-seconds and
     wall -12%, decoded frames bit-exact (framemd5), scores unchanged.
 
@@ -3049,7 +3054,7 @@ def test_reference_read_decodes_the_source_on_qsv(settings, info, plan, tmp_path
     calls = _capture_scores(enc, monkeypatch)
     enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
     dist, ref, ref_vf = calls[-1]
-    assert ref[:4] == _QSV and ref.index("-hwaccel") < ref.index("-i")
+    assert ref[:6] == _VAAPI and ref.index("-hwaccel") < ref.index("-i")
     # downloaded, then handed on in the format the software decoder gives
     assert ref_vf[0] == "hwdownload,format=p010le,format=yuv420p10le"
     assert "-hwaccel" not in dist
@@ -3069,7 +3074,7 @@ def test_reference_read_decodes_the_source_on_qsv(settings, info, plan, tmp_path
     enc._score_windows(600, 720, 0, 30, 4)
     dist, ref, ref_vf = calls[-1]
     assert "-hwaccel" not in dist and str(enc.output) in dist
-    assert ref[:4] == _QSV and str(enc.source) in ref
+    assert ref[:6] == _VAAPI and str(enc.source) in ref
     assert ref_vf == ["hwdownload,format=p010le,format=yuv420p10le"]
 
 
@@ -3127,6 +3132,21 @@ def test_reference_read_falls_back_to_software_for_the_job(
                for _, ref, vf in calls)
     args, _ = enc._probe_input(600, 720)
     assert calls[-1][1] == args
+
+
+def test_reference_read_needs_a_render_node(settings, info, plan, tmp_path, monkeypatch):
+    """No /dev/dri in the container: nothing to preflight, software, one warning."""
+    monkeypatch.setattr(opt, "_render_nodes", lambda: [])
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    monkeypatch.setattr(enc, "_run", lambda *a, **k: pytest.fail("no decode without a node"))
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    calls = _capture_scores(enc, monkeypatch)
+    enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
+    enc._score_probe(720, 840, tmp_path / "d.ivf", 0, 30)
+    assert all("-hwaccel" not in ref for _, ref, _ in calls)
+    assert len(warnings) == 1 and "render node" in warnings[0]
 
 
 def test_reference_read_off_never_touches_the_gpu(settings, info, plan, tmp_path, monkeypatch):

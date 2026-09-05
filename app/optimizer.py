@@ -18,6 +18,7 @@ ffmpeg's libvmaf filter, so both go through identical plumbing.
 
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
@@ -461,6 +462,11 @@ def run_shot_transcode(
     """Run the full shot-based encode. Mirrors run_av1an's callback contract."""
     ShotEncoder(settings, info, plan, source, output, tempdir, log_path,
                 progress_cb, cancel_flag, stage_cb).run()
+
+
+def _render_nodes() -> List[str]:
+    """The DRM render nodes this process can see, in name order."""
+    return sorted(glob.glob("/dev/dri/renderD*"))
 
 
 class CommandTimeout(TranscodeError):
@@ -2385,11 +2391,29 @@ class ShotEncoder:
         return ["-threads", str(max(1, threads)), "-ss", self._seek(w0, source),
                 "-t", f"{self._span(w0, w1):.6f}", "-i", str(source)]
 
-    _HWDEC_ARGS = ("-hwaccel", "qsv", "-hwaccel_output_format", "qsv")
     _HWDEC_PREFLIGHT_FRAMES = 8
 
+    def _hwdec_args(self) -> List[str]:
+        """The hardware-decode options for one input, or [] without a GPU.
+
+        VA-API, not QSV, and that is not a preference. ffmpeg's QSV path is a
+        separate decoder (h264_qsv, hevc_qsv) with its own timestamp handling,
+        and after an input-side -ss it kept different frames than the software
+        decoder on an mkv with timeline gaps, on a DV P5 mp4, and on an 8-bit
+        H.264 WEB-DL at two of three seek points (55 VMAF where the software
+        read scored 92) - while reading clean Blu-ray remuxes exactly. VA-API
+        is a hwaccel OF the native decoder: the frame selection is the software
+        path's by construction and only the pixels come from the GPU. Nine
+        cases, nine identical scores.
+        """
+        nodes = _render_nodes()
+        if not nodes:
+            return []
+        return ["-hwaccel", "vaapi", "-hwaccel_device", nodes[0],
+                "-hwaccel_output_format", "vaapi"]
+
     def _surface_format(self) -> str:
-        """The pixel format a QSV decode of the source lands in."""
+        """The pixel format a hardware decode of the source lands in."""
         return "p010le" if (self.info.color.bit_depth or 8) > 8 else "nv12"
 
     def _native_format(self) -> str:
@@ -2416,7 +2440,7 @@ class ShotEncoder:
         """
         if not self._hwdec():
             return args, vf
-        return [*self._HWDEC_ARGS, *args], [self._download_vf(), *vf]
+        return [*self._hwdec_args(), *args], [self._download_vf(), *vf]
 
     def _hwdec(self) -> bool:
         if (self.opt.reference_hwaccel or "auto").lower() == "off":
@@ -2427,21 +2451,25 @@ class ShotEncoder:
             return self._hwdec_ok
 
     def _hwdec_preflight(self) -> bool:
-        """Prove a seeked QSV read of this source is frame-identical to the
-        software read before any score depends on it.
+        """Prove a seeked hardware read of this source is frame-identical to
+        the software read before any score depends on it.
 
         Two things go wrong, and both did on a B580. A stream the card cannot
         decode still exits 0 with no frames (the scdet path learnt that on
-        AV1). And an input-side seek can land elsewhere than the software
-        decoder's: on an 8-bit H.264 WEB-DL the QSV read began five frames
-        BEFORE the seek target - every frame bit-exact, every one the wrong
-        frame - while HEVC seeks matched on three sources. A slip of one
-        frame in the reference window measured 66 VMAF against 92, so the
-        two reads are compared frame by frame after a seek, in the pixel
+        AV1). And a decoder can keep different frames after an input-side
+        seek: QSV began five frames BEFORE the seek target on an 8-bit H.264
+        WEB-DL - every frame bit-exact, every one the wrong frame - which is
+        why the reads go through VA-API now (see _hwdec_args). A slip of one
+        frame in the reference window measured 66 VMAF against 92, so the two
+        reads are still compared frame by frame after a seek, in the pixel
         format the scorer sees. A mismatch keeps the job on the CPU and says
         which kind it was.
         """
         n = self._HWDEC_PREFLIGHT_FRAMES
+        if not self._hwdec_args():
+            logger.warning("reference_hwaccel: no /dev/dri render node in this "
+                           "container; scoring reads stay on the CPU")
+            return False
         # two seconds in, so the seek path is the one that is exercised, but
         # never past the end of a short source
         seek = self._seek(min(int(round(2 * self.fps)), max(self.total_frames - n, 0)))
@@ -2449,7 +2477,7 @@ class ShotEncoder:
         tail = ["-i", str(self.source), "-map", "0:v:0", "-frames:v", str(n)]
         sw = [self.ffmpeg, *common, "-threads", "2", "-ss", seek, *tail,
               "-vf", f"format={self._native_format()}", "-f", "framemd5", "-"]
-        hw = [self.ffmpeg, *common, *self._HWDEC_ARGS, "-ss", seek, *tail,
+        hw = [self.ffmpeg, *common, *self._hwdec_args(), "-ss", seek, *tail,
               "-vf", self._download_vf(), "-f", "framemd5", "-"]
 
         def sums(out: str) -> List[str]:
@@ -2460,24 +2488,24 @@ class ShotEncoder:
             want = sums(self._run(sw, timeout=300))
             got = sums(self._run(hw, timeout=300))
         except (TranscodeError, OSError) as e:
-            logger.warning("reference_hwaccel: QSV cannot decode {} ({}); "
+            logger.warning("reference_hwaccel: VA-API cannot decode {} ({}); "
                            "scoring reads stay on the CPU for this job",
                            self.source.name, e)
             return False
         if not want or not got:
             logger.warning("reference_hwaccel: {} decoded no frames of {}; "
                            "scoring reads stay on the CPU for this job",
-                           "software" if not want else "QSV", self.source.name)
+                           "software" if not want else "VA-API", self.source.name)
             return False
         if want != got:
             shift = next((k for k in range(1, min(len(want), len(got)))
                           if want[:-k] == got[k:] or got[:-k] == want[k:]), None)
-            logger.warning("reference_hwaccel: the QSV read of {} is not the "
+            logger.warning("reference_hwaccel: the VA-API read of {} is not the "
                            "software read after a seek ({}); scoring reads "
                            "stay on the CPU for this job", self.source.name,
                            f"offset by {shift} frame(s)" if shift else "different frames")
             return False
-        logger.info("reference_hwaccel: scoring reads of {} decode on QSV "
+        logger.info("reference_hwaccel: scoring reads of {} decode on VA-API "
                     "({}); {} frames after a seek verified frame-identical",
                     self.source.name, self._surface_format(), len(got))
         return True
