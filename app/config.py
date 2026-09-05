@@ -333,6 +333,15 @@ class OptimizerSettings(BaseModel):
     # on 120 4K frames scored on SYCL: 39.4 -> 22.1 CPU-seconds, wall -12%,
     # decoded frames bit-exact, scores unchanged.
     reference_hwaccel: Literal["auto", "off"] = "auto"
+    # How many probes may score on the GPU at once (0 = auto, 6). NOT the
+    # probe pool's width: the card is one device with one pool of memory and
+    # each GPU score holds a SYCL context plus, with reference_hwaccel on, a
+    # VA-API decode session. Ten of each exhausted a 12GB B580 mid-episode
+    # (OUT_OF_DEVICE_MEMORY -> DEVICE_LOST -> the job failed), and the device
+    # stayed broken for later processes. A wider queue buys nothing anyway:
+    # measured on 240-frame 4K windows, throughput plateaus at four
+    # (0.21/s at n=4, 0.23/s at n=10) and every job failed at twelve.
+    vmaf_sycl_workers: int = 0
     # Fold shots shorter than this many frames into a neighbour before probing.
     # OFF by default, because the size win it was added for did not survive
     # measurement. Splitting a CONTINUOUS take into short pieces is expensive

@@ -206,6 +206,13 @@ transcode:
                                  # 上去反而会被 GPU 卡住；AV1 探测文件用 dav1d 比 QSV+回传更快
                                  # (120 帧 10.1s 对 13.5s)。实测 120 帧 4K SYCL 打分 39.4→22.1
                                  # CPU 秒、墙钟 -12%，解码帧逐比特一致，分数不变。
+    vmaf_sycl_workers: 0         # 同时最多几个探测在 GPU 上打分(0 = 自动，6)。这不是探测池宽度：
+                                 # 显卡只有一块显存，每个 GPU 打分占一个 SYCL 上下文，开了
+                                 # reference_hwaccel 还要一个 VA-API 解码会话(4K surface 池)。
+                                 # 各 10 个就把 12GB 的 B580 撑爆了(OUT_OF_DEVICE_MEMORY →
+                                 # DEVICE_LOST → 整个作业失败)，而且之后显卡一直是坏的，
+                                 # 后续进程 2 个并发也失败。加宽队列本来也没好处：240 帧 4K
+                                 # 窗口实测吞吐 n=4 就到顶(0.21/s，n=10 才 0.23/s)，n=12 全灭。
     scenedetect_scale: "-2:540"  # 4K 分镜前先用 ffmpeg 降采样(帧号1:1)，避免 OpenCV 逐帧解 4K 卡死
     max_shots: 3000              # cap; shortest shots merged past this
     max_crf_delta: 4.0           # 相邻镜头 CRF 差上限(0=关闭)，避免质量跳变

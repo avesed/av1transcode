@@ -537,6 +537,7 @@ class ShotEncoder:
         # Probe workers call it concurrently, hence the lock.
         self._sycl_ok: Optional[bool] = None
         self._sycl_lock = threading.Lock()
+        self._gpu_slots = threading.BoundedSemaphore(self._gpu_workers())
         # reference_hwaccel: None until the first scoring read runs the
         # preflight; then whether the source decodes on QSV for this job
         self._hwdec_ok: Optional[bool] = None
@@ -2684,6 +2685,33 @@ class ShotEncoder:
     # rest of the job scores on the CPU: a GPU that keeps stalling is not
     # going to get better, and every stall already cost a full timeout.
     _SYCL_MAX_TIMEOUTS = 3
+    # How long a probe waits for a GPU slot before scoring on the CPU instead.
+    # Generous: a slot frees every few seconds, and the CPU score costs real
+    # cores that the encodes want.
+    _GPU_SLOT_WAIT = 120.0
+    _GPU_WORKERS_AUTO = 6
+
+    def _gpu_workers(self) -> int:
+        """How many scores may use the GPU at once.
+
+        Not the probe pool's width. The card is one device with one pool of
+        memory, and every GPU score holds a SYCL context plus - when
+        reference_hwaccel is on - a VA-API decode session with its own 4K
+        surface pool. Ten of each is what killed E07 of Stranger Things:
+        "SYCL memcpy H2D: OUT_OF_DEVICE_MEMORY", then "DEVICE_LOST", ffmpeg
+        exit 234, job failed. Measured afterwards on an idle B580 with
+        240-frame 4K windows, the whole point of a wider queue is missing
+        anyway - total throughput plateaus at four:
+
+            n=2 0.11/s   n=4 0.21/s   n=6 0.22/s   n=8 0.22/s   n=10 0.23/s
+            n=12 every one of the twelve failed, and the device stayed
+            broken afterwards: the next run of TWO failed as well.
+
+        So the default sits above the plateau and at half of what broke:
+        margin where it costs nothing. 0 = auto.
+        """
+        w = int(self.opt.vmaf_sycl_workers or 0)
+        return max(1, w if w > 0 else self._GPU_WORKERS_AUTO)
 
     def _sycl_timeout(self, frames: Optional[int]) -> int:
         """Seconds a SYCL scoring may take before it is killed and retried.
@@ -2712,6 +2740,12 @@ class ShotEncoder:
         costs one short wait rather than the job.
         """
         sycl = self._sycl_device()
+        if sycl >= 0 and not self._gpu_slots.acquire(timeout=self._GPU_SLOT_WAIT):
+            # Every GPU slot is busy and staying busy. Scoring on the CPU is
+            # slower per shot but it is not queued behind anything, and the
+            # point of the cap is that a wider GPU queue buys nothing.
+            self._log(f"gpu slots all busy; scoring shot {idx:05d} crf {crf} on the CPU")
+            sycl = -1
         if sycl >= 0:
             try:
                 return self._score_vmaf_on(sycl, dist_args, ref_args, ref_vf,
@@ -2759,6 +2793,8 @@ class ShotEncoder:
                         "job scores on the CPU", sycl,
                         "reported the device lost or out of memory" if lost
                         else f"stalled {n} times")
+            finally:
+                self._gpu_slots.release()
         return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,
                                    threads, timeout=3600)
 
