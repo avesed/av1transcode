@@ -797,7 +797,10 @@ class ShotEncoder:
         errors: List[BaseException] = []
         started: List[threading.Thread] = []
         state = {"mem": budget, "cpu": float(self._cores()), "live": 0,
-                 "done": 0, "peak_conc": 0}
+                 "done": 0, "peak_conc": 0,
+                 # units scoring tasks have handed back, and the most they
+                 # may hand back at once (see _cpu_relaxed)
+                 "relaxed": 0.0, "relax_budget": self._cores() * self._RELAX_SHARE_OF_CORES}
         cv = threading.Condition()
         squeezed = [False]
         # what a running task uses to hand part of its CPU charge back for a
@@ -2285,25 +2288,37 @@ class ShotEncoder:
                 f"(a full grid would have been {len(grid)})")
         return results
 
+    _RELAX_SHARE_OF_CORES = 0.3
+
     @contextlib.contextmanager
     def _cpu_relaxed(self, units: float) -> Iterator[None]:
-        """Give `units` of this task's CPU charge back to the scheduler for
-        the duration of the block, so another task can be admitted against
-        them; take them back afterwards. The counter may dip below zero on
-        the way back, which only delays the next admission until something
-        finishes - the transient over-commit is at most what was relaxed."""
+        """Give up to `units` of this task's CPU charge back to the scheduler
+        for the duration of the block, so another task can be admitted
+        against them; take them back afterwards.
+
+        Bounded: relaxed units admit tasks that relax in their turn, and
+        unbounded that cascades - measured at 20 cores, peak concurrency
+        went from 5 to 10, twice the pool, for no gain. Outstanding relaxed
+        units are capped at _RELAX_SHARE_OF_CORES of the cores (40 cores:
+        12 units, about three extra probes), which is the headroom that was
+        measured idle, not more. The counter may dip below zero on the way
+        back, which only delays the next admission until something finishes.
+        """
         cv, state = self._sched_cv, self._sched_state
         if cv is None or state is None or units <= 0:
             yield
             return
         with cv:
-            state["cpu"] += units
+            grant = min(units, max(0.0, state["relax_budget"] - state["relaxed"]))
+            state["relaxed"] += grant
+            state["cpu"] += grant
             cv.notify_all()
         try:
             yield
         finally:
             with cv:
-                state["cpu"] -= units
+                state["relaxed"] -= grant
+                state["cpu"] -= grant
 
     def _score_relax_units(self, lp: int) -> float:
         """How much of a probe's CPU charge its scoring step hands back.

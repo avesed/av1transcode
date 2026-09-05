@@ -3220,7 +3220,7 @@ def test_probe_scoring_hands_half_its_cpu_back_while_on_the_gpu(settings, info, 
     the CPU; encodes keep their full charge."""
     enc = make_encoder(settings, info, plan, tmp_path)
     enc._lead_of = lambda path: 0.0
-    state = {"cpu": 40.0}
+    state = {"cpu": 40.0, "relaxed": 0.0, "relax_budget": 3.0}
     enc._sched_cv, enc._sched_state = threading.Condition(), state
     seen = []
     monkeypatch.setattr(enc, "_run", lambda args, timeout=None: (seen.append(("run", state["cpu"])), "")[1])
@@ -3244,6 +3244,18 @@ def test_probe_scoring_hands_half_its_cpu_back_while_on_the_gpu(settings, info, 
     settings.transcode.optimizer.probe_score_charge = 0.25
     settings.transcode.optimizer.probe_cpu_charge = 0.5
     assert enc._score_relax_units(4) == pytest.approx(4 * 0.5 * 0.75)
+    # the relaxed units are capped: a second scorer gets what is left of the
+    # budget, a third nothing, so admissions cannot cascade
+    state["cpu"] = 40.0
+    with enc._cpu_relaxed(2.0):
+        assert state["cpu"] == 42.0
+        with enc._cpu_relaxed(2.0):
+            assert state["cpu"] == 43.0
+            with enc._cpu_relaxed(2.0):
+                assert state["cpu"] == 43.0
+            assert state["cpu"] == 43.0
+        assert state["cpu"] == 42.0
+    assert state["cpu"] == 40.0 and state["relaxed"] == 0.0
     # outside a schedule the context manager is inert
     enc._sched_cv = enc._sched_state = None
     with enc._cpu_relaxed(2.0):
