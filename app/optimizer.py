@@ -29,7 +29,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -541,6 +541,7 @@ class ShotEncoder:
         # preflight; then whether the source decodes on QSV for this job
         self._hwdec_ok: Optional[bool] = None
         self._hwdec_failures = 0
+        self._hwdec_bad: Set[Tuple[int, int]] = set()   # windows that failed once
         self._hwdec_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0
@@ -2368,7 +2369,7 @@ class ShotEncoder:
             return self._score_ssimulacra2(w0, w1, dist, idx, crf, shard)
         ref_args, ref_vf = self._probe_input(w0, w1, shard)
         hw = False
-        if shard is None:
+        if shard is None and (w0, w1) not in self._hwdec_bad:
             # a DV shard is a small file already carrying the probe-side
             # filters; only the 4K source read is worth the GPU
             ref_args, ref_vf, hw = self._reference_read(ref_args, ref_vf)
@@ -2462,21 +2463,24 @@ class ShotEncoder:
         on the CPU. True for a decode failure; False for a timeout or a
         cancelled job, which are not the GPU's doing.
 
-        The preflight cannot prove every window: on E06 of Stranger Things
-        (DV P7 with its enhancement layer) 65 seeked hardware reads matched
-        software exactly, and the first production batch still failed one
-        window with "Failed to sync surface: internal decoding error" behind a
-        run of "Could not find ref with POC". The software decoder shrugs at
-        a missing reference and conceals; the driver does not. One window is
-        a few seconds on the CPU; a job that fails on it is three hours. Past
-        _HWDEC_MAX_FAILURES windows the rest of the job goes straight to the
-        CPU rather than paying for the failed attempt every time.
+        The preflight cannot prove every window. E06 of Stranger Things (a
+        Blu-ray remux, DV P7 with its enhancement layer) begins with a broken
+        group of pictures: its first frames reference pictures that are not
+        in the file ("Could not find ref with POC 2..12"). The software
+        decoder conceals and carries on; VA-API answers "Failed to sync
+        surface: internal decoding error" and ffmpeg exits 251, which took
+        the whole job down. From 0.5s on, and at 65 other seeked positions,
+        the hardware read is frame-identical. One window is a few seconds on
+        the CPU; a job that fails on it is three hours. The window is
+        remembered so its other CRF probes skip the doomed attempt, and past
+        _HWDEC_MAX_FAILURES distinct windows the rest of the job goes
+        straight to the CPU.
         """
         if isinstance(err, CommandTimeout) or (self.cancel_flag and self.cancel_flag()):
             return False
         with self._hwdec_lock:
-            self._hwdec_failures += 1
-            n = self._hwdec_failures
+            self._hwdec_bad.add((w0, w1))
+            self._hwdec_failures = n = len(self._hwdec_bad)
             flip = n >= self._HWDEC_MAX_FAILURES and self._hwdec_ok
             if flip:
                 self._hwdec_ok = False
@@ -2561,8 +2565,9 @@ class ShotEncoder:
         # the AV1 side stays on the CPU: dav1d beats a GPU decode plus
         # download there
         dist_args = self._window_input(w0, w1, self.output, threads)
-        ref_args, ref_vf, hw = self._reference_read(
-            self._window_input(w0, w1, self.source, threads), [])
+        ref_args, ref_vf, hw = self._window_input(w0, w1, self.source, threads), [], False
+        if (w0, w1) not in self._hwdec_bad:
+            ref_args, ref_vf, hw = self._reference_read(ref_args, ref_vf)
         try:
             return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, w1 - w0)
         except TranscodeError as e:

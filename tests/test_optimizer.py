@@ -3111,11 +3111,16 @@ def test_reference_read_falls_back_per_window_when_the_gpu_read_fails(
     # a timeout propagates untouched (the SYCL layer owns that decision)
     mode["fail"] = "timeout"
     with pytest.raises(opt.CommandTimeout):
-        enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
-    # enough failures and the job stops trying
+        enc._score_probe(2000, 2120, tmp_path / "d.ivf", 0, 30)
+    # a window that failed is remembered: its other CRF probes go straight
+    # to the CPU (E06's broken head is probed at every CRF of the bisection)
     mode["fail"] = "sync"
+    n = len(warnings)
+    enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 34)
+    assert len(warnings) == n and "-hwaccel" not in calls[-1][1]
+    # enough distinct failed windows and the job stops trying
     for k in range(enc._HWDEC_MAX_FAILURES + 2):
-        enc._score_probe(720, 840, tmp_path / "d.ivf", 0, 30)
+        enc._score_probe(1000 + 120 * k, 1120 + 120 * k, tmp_path / "d.ivf", 0, 30)
     assert enc._hwdec_ok is False
     assert any("rest of the job scores on the CPU" in w for w in warnings)
     # after the flip the reads are built for the CPU outright
