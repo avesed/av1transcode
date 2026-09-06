@@ -336,11 +336,20 @@ class OptimizerSettings(BaseModel):
     # How many probes may score on the GPU at once (0 = auto, 6). NOT the
     # probe pool's width: the card is one device with one pool of memory and
     # each GPU score holds a SYCL context plus, with reference_hwaccel on, a
-    # VA-API decode session. Ten of each exhausted a 12GB B580 mid-episode
-    # (OUT_OF_DEVICE_MEMORY -> DEVICE_LOST -> the job failed), and the device
-    # stayed broken for later processes. A wider queue buys nothing anyway:
-    # measured on 240-frame 4K windows, throughput plateaus at four
-    # (0.21/s at n=4, 0.23/s at n=10) and every job failed at twelve.
+    # VA-API decode session - so one score is TWO DRM clients, ~440MB each.
+    # Ten of them exhausted a 12GB B580 mid-episode (OUT_OF_DEVICE_MEMORY ->
+    # DEVICE_LOST -> the job failed), and the device stayed broken for every
+    # later process until the box was rebooted: the driver turns an
+    # allocation failure into a lost device, which is its bug, but the
+    # trigger is ours to avoid. Measured with DRM fdinfo (the interface
+    # nvtop uses: sum drm-total-vram0 over /proc/*/fdinfo, deduplicated by
+    # drm-client-id) on a 4K probe run - six concurrent scores peak at
+    # 5.27GB across 12 clients, 44% of the card, so ten is ~8.8GB and the
+    # twelve that broke it ~10.5GB before Plex and the framebuffer.
+    # A wider queue buys nothing anyway: on 240-frame 4K windows throughput
+    # plateaus at four (0.21/s at n=4, 0.23/s at n=10) and every job failed
+    # at twelve. The cap costs 7.8% of the probe phase and is worth it: the
+    # failure it prevents costs a reboot of a box that also runs Plex.
     vmaf_sycl_workers: int = 0
     # Fold shots shorter than this many frames into a neighbour before probing.
     # OFF by default, because the size win it was added for did not survive

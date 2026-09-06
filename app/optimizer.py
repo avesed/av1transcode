@@ -2705,10 +2705,22 @@ class ShotEncoder:
 
             n=2 0.11/s   n=4 0.21/s   n=6 0.22/s   n=8 0.22/s   n=10 0.23/s
             n=12 every one of the twelve failed, and the device stayed
-            broken afterwards: the next run of TWO failed as well.
+            broken afterwards: the next run of TWO failed as well, and only
+            rebooting the host brought the card back.
 
-        So the default sits above the plateau and at half of what broke:
-        margin where it costs nothing. 0 = auto.
+        The memory is measurable, and worth measuring before changing this.
+        DRM fdinfo carries it - the interface nvtop reads: sum
+        drm-total-vram0 over /proc/*/fdinfo, deduplicated by drm-client-id,
+        inside the container holding the device. On a 4K probe run six
+        concurrent scores peak at 5.27GB across 12 clients (~440MB each,
+        two clients per score), 44% of a 12GB B580; ten works out to ~8.8GB
+        and the twelve that broke it to ~10.5GB, before Plex and the
+        framebuffer take their share.
+
+        So the default sits above the throughput plateau and at half of what
+        broke: margin where it costs little. Measured cost of the cap on a
+        150s 4K clip at 40 cores: probe phase 447.7s -> 482.5s, scores
+        identical. 0 = auto.
         """
         w = int(self.opt.vmaf_sycl_workers or 0)
         return max(1, w if w > 0 else self._GPU_WORKERS_AUTO)
