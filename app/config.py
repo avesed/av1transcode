@@ -410,6 +410,19 @@ class OptimizerSettings(BaseModel):
     # gap the SVT probe path carries. The outlier is the reason for
     # gpu_probe_max_q_margin below: a very easy shot let SVT reach the target
     # at CRF 36 while the bulk sat near 20, and the line missed it by 10 CRF.
+    #
+    # Validated end to end on a 150s 4K clip, against the same clip on the SVT
+    # path. At target 94 the calibration was REFUSED (leave-one-out 3.00 CRF
+    # against the 2.00 limit) and the job fell back: delivered scores
+    # identical to the SVT run, shot for shot. At target 90 it was accepted
+    # (1.83 CRF over 5 anchors) and the shots it mapped delivered within 0.32
+    # VMAF of the SVT path, worst case, for the same output size.
+    #
+    # The refusal at 94 is a property of that clip, not of the target: 12 of
+    # its 22 shots cannot reach 94 at any probed CRF, so both curves are being
+    # crossed at their ends where the inversion is worst. Real episodes are
+    # the opposite - 4 shots of 1035 on one measured episode - which is why
+    # this needs an episode-scale trial before it is worth anyone turning on.
     probe_encoder: Literal["svt", "qsv"] = "svt"
     # Quality indices swept on the QSV side. Same role as probe_crfs, and the
     # search over them is the same bisection; av1_qsv saturates above ~50 on
