@@ -332,7 +332,21 @@ class OptimizerSettings(BaseModel):
     # a download (measured: 13.5s against 10.1s wall for 120 frames). Measured
     # on 120 4K frames scored on SYCL: 39.4 -> 22.1 CPU-seconds, wall -12%,
     # decoded frames bit-exact, scores unchanged.
-    reference_hwaccel: Literal["auto", "off"] = "auto"
+    #
+    # Default OFF, measured. On the same 150s 4K clip at 40 cores, scores
+    # identical to the last probe in all three runs:
+    #   no hardware read      probing 401.3s   total 439.7s
+    #   VA-API read           probing 447.7s   total 491.9s
+    #   VA-API read, capped   probing 482.5s   total 528.2s
+    # The read saves CPU (28.5 against 33.0 CPU-seconds for a 240-frame
+    # score) but costs wall time (16.8s against 6.9s): pulling 4K frames back
+    # out of the card is slower than decoding them. That only pays where the
+    # CPU is the bottleneck - at 20 cores the same clip went 826s to 592s
+    # with it on. At 40 it is a loss, and it doubles the card's memory
+    # footprint (a score becomes two DRM clients instead of one), which is
+    # what exhausted a 12GB B580 mid-episode and cost a reboot. Turn it on
+    # for a CPU-starved host, not otherwise.
+    reference_hwaccel: Literal["auto", "off"] = "off"
     # How many probes may score on the GPU at once (0 = auto, 6). NOT the
     # probe pool's width: the card is one device with one pool of memory and
     # each GPU score holds a SYCL context plus, with reference_hwaccel on, a
@@ -351,6 +365,18 @@ class OptimizerSettings(BaseModel):
     # at twelve. The cap costs 7.8% of the probe phase and is worth it: the
     # failure it prevents costs a reboot of a box that also runs Plex.
     vmaf_sycl_workers: int = 0
+
+    @field_validator("reference_hwaccel", "scenedetect_hwaccel", mode="before")
+    @classmethod
+    def _yaml_reads_off_as_false(cls, v: object) -> object:
+        """YAML 1.1 parses a bare `off` as the boolean False (and `on` as
+        True), so `reference_hwaccel: off` in config.yaml arrives here as a
+        bool and fails the Literal with a message that says nothing about
+        quoting. Take it as written instead - the quotes in config.yaml are
+        belt and braces, not the only thing holding this up."""
+        if isinstance(v, bool):
+            return "auto" if v else "off"
+        return v
     # Fold shots shorter than this many frames into a neighbour before probing.
     # OFF by default, because the size win it was added for did not survive
     # measurement. Splitting a CONTINUOUS take into short pieces is expensive

@@ -3022,8 +3022,11 @@ _VAAPI = ["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD129", "-hwacc
 
 
 @pytest.fixture(autouse=True)
-def _one_render_node(monkeypatch):
+def _one_render_node(monkeypatch, settings):
     monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
+    # reference_hwaccel ships off (it measured slower on a 40-core host); the
+    # tests below are about what it does when someone turns it on.
+    settings.transcode.optimizer.reference_hwaccel = "auto"
 
 
 def _capture_scores(enc, monkeypatch):
