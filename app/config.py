@@ -121,9 +121,18 @@ class OptimizerSettings(BaseModel):
     # extra pass over every shot; 5 well-spread points interpolate fine.
     probe_crfs: List[int] = Field(default_factory=lambda: [20, 26, 32, 38, 44])
     # Fast SVT-AV1 preset used for the probe encodes. NB: SVT-AV1 clamps to M9
-    # for 4K and above in random-access mode, so 10+ behaves as 9 there. The
-    # probe preset is always faster than the final one, which makes the probe
-    # under-report quality a little - see probe_crf_offset.
+    # for 4K and above in random-access mode, so 10+ behaves as 9 there, five
+    # presets away from the delivery default of 4.
+    #
+    # The direction of the resulting bias is NOT the obvious one and is not
+    # even fixed. Measured on ten 4K windows at CRF 24, encoding the same
+    # window at preset 4 instead of 9 scored 0.80 VMAF LOWER (sd 0.76): the
+    # slower preset spends its extra work on rate, not on the metric. Yet
+    # end-to-end (probe prediction against delivered) the sign follows the
+    # content - clip_A -0.18, a DV P7 remux -0.29, an 8-bit 1080p WEB-DL
+    # +1.52. So this is a bias to measure per job, not a constant to assume;
+    # see probe_crf_offset, and note the spread it contributes (0.76) is the
+    # SMALLER half of the prediction error - probe_max_frames owns the rest.
     probe_preset: int = 10
     # Probe resolution "WxH". Empty (recommended) = probe at source resolution.
     # Setting this encodes the probes at a DIFFERENT resolution than the final
@@ -168,6 +177,23 @@ class OptimizerSettings(BaseModel):
     # on average (worst +12.2, some pinned to the ceiling) and the delivered-
     # vs-predicted gap went from -0.38 to -2.28, i.e. the probes became six
     # times less predictive. Change it only while watching that gap.
+    #
+    # Raising it is the main lever left on prediction error. Decomposing the
+    # per-shot residual on ten 4K windows: the probe preset contributes
+    # -0.80 VMAF of BIAS with sd 0.76, while truncating a 300-frame shot to
+    # its middle 120 contributes sd 1.22 - nearly pure noise, because whether
+    # the middle represents the whole shot is a property of the shot. The two
+    # together give sd 1.16 against the 1.19 measured end to end, so
+    # interpolation accounts for almost none of it.
+    # And the truncation reaches further than the shot COUNT suggests: on two
+    # real 4K episodes only 13-22% of shots exceed 120 frames, but those
+    # shots hold 47-55% of the picture, of which the probe sees about 45%.
+    # The cost of reaching further is modest, because long shots are few -
+    # measured on a 1035-shot episode, total probed frames go 1.16x at 240,
+    # 1.26x at 480 and 1.35x with no cap at all, while the truncated share of
+    # the picture falls 26.2% -> 14.1% -> 7.1% -> 0%. Concurrency does not
+    # suffer: _est_probe_gb grows only with log(frames) (+29% from 120 to
+    # 480) and the pool is capped by cores/lp long before the memory budget.
     probe_max_frames: int = 120
     # Fraction of its lp a probe books against the CPU budget. 1.0 charges
     # the full lp for the task's whole life, which is what the encoding phase
@@ -404,10 +430,15 @@ class OptimizerSettings(BaseModel):
     # back to the lowest probed CRF, i.e. the most expensive setting available,
     # and the output ends up larger than the source.
     min_crf: int = 0
-    # Added to every interpolated CRF before clamping. The probes run at
-    # probe_preset while the delivery runs at the (slower, better) preset, so
-    # the probe under-reports the quality the final encode will actually
-    # deliver; a positive offset trades that bias back for size. 0 = off.
+    # Added to every interpolated CRF before clamping, to trade the probe's
+    # systematic bias back for size. 0 = off.
+    #
+    # Read probe_preset's note before setting this: the bias is content
+    # dependent (measured end-to-end at -0.29, -0.18, +0.55, +0.81 and +1.52
+    # VMAF on five different sources), so one constant helps some material
+    # and hurts the rest. It is also the smaller half of the problem - the
+    # per-shot SPREAD, which no offset can touch, comes mostly from
+    # probe_max_frames truncating long shots.
     probe_crf_offset: float = 0.0
     # Pass decimal CRF values to SVT-AV1 (finer than integer CRF granularity).
     # SVT-AV1 must accept fractional --crf for this to work.
