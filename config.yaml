@@ -234,6 +234,29 @@ transcode:
                                  # DEVICE_LOST → 整个作业失败)，而且之后显卡一直是坏的，
                                  # 后续进程 2 个并发也失败。加宽队列本来也没好处：240 帧 4K
                                  # 窗口实测吞吐 n=4 就到顶(0.21/s，n=10 才 0.23/s)，n=12 全灭。
+
+    # ---- GPU 探测路径(可选，附加；probe_encoder=svt 时完全不生效) ----
+    probe_encoder: svt           # 探测用哪个编码器。svt=上面描述的原有路径；qsv=在显卡上探测
+                                 # (VA-API 解码直接进硬件 AV1 编码器)，再把找到的质量索引通过
+                                 # 逐作业标定映射回 SVT 的 CRF。
+                                 # 它可能不只是更快而是更准: 300 帧 4K 一次探测 16.4 CPU 秒，
+                                 # 对 SVT preset 9 的 88.3 秒，省下的预算可以把探测窗口放开——
+                                 # 而 probe_max_frames 的截断正是今天预测误差里最大的一项
+                                 # (端到端 sd 1.19 中占 sd 1.22)，它存在的唯一原因就是 SVT 探测贵。
+                                 # 10 个 4K 窗口实测,用同一 VMAF 处的 QSV 质量索引拟合 SVT CRF,
+                                 # 留一残差: 目标 91 时 0.12 VMAF、目标 94 剔除一个离群点后 0.29,
+                                 # 而 SVT 探测路径自身的 preset 误差是 0.76。
+    gpu_probe_qs: [14, 18, 22, 26, 30, 34, 38]   # QSV 侧扫描的质量索引,作用同 probe_crfs,
+                                 # 搜索方式也是同一套二分。av1_qsv 在 4K 上约 50 以上就饱和了。
+    gpu_probe_anchors: 16        # 同时用两条路探测、用来拟合映射的镜头数。它们是正常的探测——
+                                 # 这些镜头用的就是自己的 SVT 结果，所以不是白跑的工作量。
+    gpu_probe_max_residual: 2.0  # 标定的留一残差超过这么多 CRF 就整个作业放弃映射、退回 SVT。
+                                 # 按实测 0.24 VMAF/CRF，默认值约合 0.5 VMAF。
+    gpu_probe_max_q_margin: 1.5  # 逐镜头弃权: 质量索引超出锚点取值范围这么多的镜头,不信任外推的
+                                 # 直线,改用 SVT 探测。这条规则就是用来兜住上面那个离群点的——
+                                 # 一个很容易编的镜头让 SVT 在 CRF 36 才到目标,而主体在 20 附近,
+                                 # 直线在它上面差了 10 个 CRF。
+    gpu_probe_preset: 4          # QSV 编码器 preset(0-7,越小越慢越好)。映射就是在 4 上标定的。
     scenedetect_scale: "-2:540"  # 4K 分镜前先用 ffmpeg 降采样(帧号1:1)，避免 OpenCV 逐帧解 4K 卡死
     max_shots: 3000              # cap; shortest shots merged past this
     max_crf_delta: 4.0           # 相邻镜头 CRF 差上限(0=关闭)，避免质量跳变

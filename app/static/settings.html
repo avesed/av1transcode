@@ -305,6 +305,12 @@ const OPT_GROUPS = [
   ]},
   { id: "grp-probe", name: "探测", note: "每个镜头在源分辨率下用快速 preset 编几个 CRF，量出它自己的质量曲线", fields: [
     F("probe_crfs", "CRF 网格", "逗号分隔的整数，从这里出发二分。", { type: "csv" , wide: true}),
+    F("probe_encoder", "探测编码器", "svt = 原有路径。qsv = 在显卡上探测（VA-API 解码进硬件 AV1 编码器），再用逐作业标定把质量索引映射回 SVT 的 CRF。实测一次 300 帧 4K 探测 16.4 CPU 秒对 88.3 秒，省下的预算可以放开探测窗口——而窗口截断正是今天预测误差的最大来源。映射不可靠时会整个作业或逐镜头退回 SVT。", { type: "select", options: [["svt", "svt：原有路径"], ["qsv", "qsv：GPU 探测 + 映射"]] }),
+    F("gpu_probe_qs", "QSV 质量网格", "QSV 侧扫描的质量索引，作用同 CRF 网格。av1_qsv 在 4K 上约 50 以上饱和。", { type: "csv", wide: true }),
+    F("gpu_probe_anchors", "标定锚点镜头数", "同时用两条路探测、用来拟合映射的镜头数。它们用的是自己的 SVT 结果，不是白跑的。", { min: 4, max: 200 }),
+    F("gpu_probe_max_residual", "放弃映射的残差上限", "标定的留一残差超过这么多 CRF 就整个作业退回 SVT。按 0.24 VMAF/CRF，默认约合 0.5 VMAF。", { step: 0.1, min: 0.1, max: 20 }),
+    F("gpu_probe_max_q_margin", "逐镜头弃权余量", "质量索引超出锚点范围这么多的镜头改用 SVT 探测，用来兜住外推失效的容易镜头。", { step: 0.1, min: 0, max: 20 }),
+    F("gpu_probe_preset", "QSV 编码 preset", "0-7，越小越慢越好。映射就是在 4 上标定的。", { min: 0, max: 7 }),
     F("probe_bracket_width", "二分停止宽度", "目标所在区间窄于此就停；0 = 跑完整网格。", { min: 0 }),
     F("probe_preset", "探测速度", "SVT-AV1 preset，比正式编码快；4K 下 SVT 自动降到 9。", { min: 0, max: 13 }),
     F("probe_max_frames", "探测窗口", "每镜头最多探测这么多连续帧，超长镜头取中间一段。", { min: 24, unit: "帧" }),

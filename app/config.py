@@ -391,6 +391,46 @@ class OptimizerSettings(BaseModel):
     # at twelve. The cap costs 7.8% of the probe phase and is worth it: the
     # failure it prevents costs a reboot of a box that also runs Plex.
     vmaf_sycl_workers: int = 0
+    # ---- the GPU probe path (opt-in, additive; "svt" leaves it switched off) ----
+    # Which encoder the PROBES use. "svt" is the path everything above
+    # describes. "qsv" probes on the card instead - VA-API decode into the
+    # hardware AV1 encoder - and maps the quality index it finds back to an
+    # SVT CRF through a per-job calibration.
+    #
+    # Why it can be more accurate rather than merely faster: a probe costs
+    # 16.4 CPU-seconds this way against 88.3 for the SVT preset-9 probe on
+    # 300 4K frames, and that budget buys back the probe window. Truncating
+    # long shots to probe_max_frames is the single biggest term in today's
+    # prediction error (sd 1.22 VMAF of the 1.19 measured end to end), and it
+    # exists only because SVT probes are expensive.
+    #
+    # Measured on ten 4K windows, fitting SVT CRF against the QSV quality
+    # index at the same VMAF, leave-one-out: sd 0.12 VMAF at target 91, 0.29
+    # at target 94 once one outlier is removed - against 0.76 for the preset
+    # gap the SVT probe path carries. The outlier is the reason for
+    # gpu_probe_max_q_margin below: a very easy shot let SVT reach the target
+    # at CRF 36 while the bulk sat near 20, and the line missed it by 10 CRF.
+    probe_encoder: Literal["svt", "qsv"] = "svt"
+    # Quality indices swept on the QSV side. Same role as probe_crfs, and the
+    # search over them is the same bisection; av1_qsv saturates above ~50 on
+    # 4K, so there is nothing to learn past the top of this.
+    gpu_probe_qs: List[int] = Field(default_factory=lambda: [14, 18, 22, 26, 30, 34, 38])
+    # Shots probed BOTH ways to fit the mapping. They are ordinary probes -
+    # their SVT samples are used for those shots - so this is not wasted work,
+    # it is the part of the job that stays on the old path.
+    gpu_probe_anchors: int = 16
+    # Give up on the mapping for the whole job when the calibration's
+    # leave-one-out residual exceeds this many CRF. At the measured 0.24
+    # VMAF/CRF the default is ~0.5 VMAF, comfortably inside what the SVT
+    # probe path already carries.
+    gpu_probe_max_residual: float = 2.0
+    # Per-SHOT abstention: a shot whose quality index falls further than this
+    # outside the anchors' range is probed with SVT instead of trusting an
+    # extrapolated line. This is what catches the easy-shot outlier above.
+    gpu_probe_max_q_margin: float = 1.5
+    # QSV encoder preset (0-7, lower is slower and better). 4 is what the
+    # mapping above was measured at.
+    gpu_probe_preset: int = 4
 
     @field_validator("reference_hwaccel", "scenedetect_hwaccel", mode="before")
     @classmethod

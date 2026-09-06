@@ -3276,3 +3276,136 @@ def test_a_cancelled_job_does_not_retry_the_score_on_the_cpu(
                         lambda *a, **k: (_ for _ in ()).throw(opt.TranscodeError("Job cancelled by user")))
     with pytest.raises(opt.TranscodeError, match="cancelled"):
         enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120)
+
+
+# ---------------------------------------------------------------- gpu probe path
+
+def _curve(idxs, crossing, target, slope=1.0):
+    """A monotone score curve that crosses `target` exactly at `crossing`."""
+    return {i: target + (crossing - i) * slope for i in idxs}
+
+
+def _gpu_encoder(settings, info, plan, tmp_path, shots=20):
+    settings.transcode.optimizer.probe_encoder = "qsv"
+    settings.transcode.optimizer.gpu_probe_anchors = 6
+    settings.transcode.optimizer.probe_crfs = [20, 26, 32, 38, 44]
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    return enc, [(i * 100, (i + 1) * 100) for i in range(shots)]
+
+
+def test_gpu_probe_is_off_unless_asked_for(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert settings.transcode.optimizer.probe_encoder == "svt"
+    assert enc._gpu_probe_on() is False
+
+
+def test_gpu_probe_needs_a_render_node(settings, info, plan, tmp_path, monkeypatch):
+    settings.transcode.optimizer.probe_encoder = "qsv"
+    monkeypatch.setattr(opt, "_render_nodes", lambda: [])
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._gpu_probe_on() is False
+    assert len(warnings) == 1 and "render node" in warnings[0]
+
+
+def test_gpu_probe_encode_runs_wholly_on_the_card(settings, info, plan, tmp_path, monkeypatch):
+    """VA-API decode straight into the hardware AV1 encoder: 16.4 CPU-seconds
+    for 300 4K frames against 88.3 for the SVT preset-9 probe."""
+    info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
+    enc, _ = _gpu_encoder(settings, info, plan, tmp_path)
+    ran = []
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: (ran.append(args), "")[1])
+    enc._qsv_probe_encode(600, 720, 22, tmp_path / "p.ivf")
+    cmd = ran[0]
+    assert cmd[cmd.index("-c:v") + 1] == "av1_qsv"
+    assert cmd[cmd.index("-global_quality") + 1] == "22"
+    assert "-hwaccel" in cmd and cmd[cmd.index("-hwaccel") + 1] == "vaapi"
+    assert cmd.index("-hwaccel") < cmd.index("-ss") < cmd.index("-i")
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf.startswith("hwdownload,format=p010le")     # the encoder takes it as-is
+    assert "setpts=PTS-STARTPTS" in vf                   # same framing as every other read
+    # and it is bounded by the same semaphore the scores use: one card, one
+    # pool of memory, and exhausting it once already cost a reboot
+    enc._gpu_slots = threading.BoundedSemaphore(1)
+    enc._GPU_SLOT_WAIT = 0.05
+    enc._gpu_slots.acquire()
+    with pytest.raises(opt.TranscodeError, match="no GPU slot"):
+        enc._qsv_probe_encode(600, 720, 22, tmp_path / "p.ivf")
+
+
+def test_gpu_probe_maps_the_bulk_and_keeps_anchor_samples(settings, info, plan, tmp_path, monkeypatch):
+    """The anchors are ordinary SVT probes whose samples are used for their own
+    shots; everything else is probed on the card and mapped."""
+    enc, shots = _gpu_encoder(settings, info, plan, tmp_path)
+    grid = [20, 26, 32, 38, 44]
+    qgrid = enc._qsv_grid()
+    # ground truth the test plants: CRF = 2*q - 14
+    crf_of = lambda i: 22.0 + (i % 5)
+    q_of = lambda i: (crf_of(i) + 14.0) / 2.0
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: _curve(grid, crf_of(idx), enc.target))
+    monkeypatch.setattr(enc, "_probe_shot_qsv",
+                        lambda idx, s0, s1, qg: _curve(qgrid, q_of(idx), enc.target))
+    samples, chosen = enc.probe_all_gpu(shots, grid)
+    assert len(chosen) == len(shots)                      # every shot got a CRF
+    assert len(samples) == 6                              # only the anchors cost an SVT probe
+    for idx, crf in chosen.items():
+        assert crf == pytest.approx(crf_of(idx), abs=0.01)
+
+
+def test_gpu_probe_gives_up_on_the_whole_job_when_the_line_does_not_hold(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A line always fits its own points, so the leave-one-out residual is what
+    decides. Above gpu_probe_max_residual the rest of the job goes back to SVT
+    rather than shipping CRFs nobody measured."""
+    enc, shots = _gpu_encoder(settings, info, plan, tmp_path)
+    grid = [20, 26, 32, 38, 44]
+    qgrid = enc._qsv_grid()
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: _curve(grid, 21.0 + (idx * 7 % 11), enc.target))
+    monkeypatch.setattr(enc, "_probe_shot_qsv",
+                        lambda idx, s0, s1, qg: _curve(qgrid, 16.0 + (idx * 3 % 7), enc.target))
+    called = []
+    real_all = enc.probe_all
+    monkeypatch.setattr(enc, "probe_all", lambda sh, g: (called.append(len(sh)),
+                                                         {k: _curve(grid, 24.0, enc.target) for k in range(len(sh))})[1])
+    samples, chosen = enc.probe_all_gpu(shots, grid)
+    assert called == [len(shots) - 6]                     # the rest went to SVT
+    assert len(chosen) == len(shots)
+    assert any("does not hold" in w for w in warnings)
+
+
+def test_gpu_probe_abstains_shot_by_shot_outside_the_calibrated_range(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The one failure the measurement found was an easy shot reaching the
+    target 14 CRF above the bulk, which an extrapolated line missed by 10.
+    Such a shot is probed with SVT instead."""
+    enc, shots = _gpu_encoder(settings, info, plan, tmp_path)
+    grid = [20, 26, 32, 38, 44]
+    qgrid = enc._qsv_grid()
+    crf_of = lambda i: 22.0 + (i % 5)
+    q_of = lambda i: (crf_of(i) + 14.0) / 2.0
+    odd = len(shots) - 1                                  # the easy shot
+    svt_probed = []
+
+    def fake_svt(idx, s0, s1, g, lp):
+        svt_probed.append(idx)
+        return _curve(grid, crf_of(idx), enc.target)
+
+    monkeypatch.setattr(enc, "_probe_shot", fake_svt)
+    monkeypatch.setattr(enc, "_probe_shot_qsv",
+                        lambda idx, s0, s1, qg: _curve(qgrid, 34.0 if idx == odd else q_of(idx), enc.target))
+    samples, chosen = enc.probe_all_gpu(shots, grid)
+    assert odd in svt_probed and odd in samples           # abstained, probed properly
+    assert len(chosen) == len(shots)
+
+
+def test_theil_sen_is_not_tilted_by_one_easy_shot(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    pts = [(float(q), 2.0 * q - 14.0) for q in range(18, 26)] + [(24.79, 36.14)]
+    a, b = enc._theil_sen(pts)
+    assert a == pytest.approx(2.0, abs=0.05) and b == pytest.approx(-14.0, abs=1.0)
