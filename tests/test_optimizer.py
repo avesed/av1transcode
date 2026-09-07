@@ -3409,3 +3409,45 @@ def test_theil_sen_is_not_tilted_by_one_easy_shot(settings, info, plan, tmp_path
     pts = [(float(q), 2.0 * q - 14.0) for q in range(18, 26)] + [(24.79, 36.14)]
     a, b = enc._theil_sen(pts)
     assert a == pytest.approx(2.0, abs=0.05) and b == pytest.approx(-14.0, abs=1.0)
+
+
+def test_sycl_stalls_must_be_consecutive_to_retire_the_device(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Three stalls scattered among hundreds of good scores retired the device
+    for a whole episode once, costing its remaining 400 shots CPU scoring. A
+    run of failures with nothing working between them is what a sick device
+    looks like; occasional slowness under a busy card is not."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    settings.transcode.optimizer.vmaf_sycl_min_width = 0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    enc._sycl_ok = True
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: None)
+    seq = []
+
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout):
+        if sycl >= 0 and seq and seq.pop(0) == "stall":
+            raise opt.CommandTimeout("libvmaf timed out")
+        return 90.0
+
+    monkeypatch.setattr(enc, "_score_vmaf_on", on)
+    # stall, good, stall, good, ... never retires the device
+    for _ in range(6):
+        seq[:] = ["stall"]
+        enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120)
+        seq[:] = ["ok"]
+        enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120)
+    assert enc._sycl_ok is True and enc._sycl_timeouts == 0
+    # three in a row does
+    for _ in range(enc._SYCL_MAX_TIMEOUTS):
+        seq[:] = ["stall"]
+        enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120)
+    assert enc._sycl_ok is False
+
+
+def test_the_sycl_budget_widens_when_the_card_also_encodes(settings, info, plan, tmp_path):
+    """The probe encodes share the device, and a score queues behind them."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    alone = enc._sycl_timeout(120)
+    settings.transcode.optimizer.probe_encoder = "qsv"
+    assert enc._sycl_timeout(120) == alone * 2

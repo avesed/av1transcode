@@ -548,7 +548,7 @@ class ShotEncoder:
         self._hwdec_bad: Set[Tuple[int, int]] = set()   # windows that failed once
         self._hwdec_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
-        self._sycl_timeouts = 0
+        self._sycl_timeouts = 0        # consecutive; a good score clears it
         # every frame's pts_time from the scdet pass (see _run_scdet), and the
         # timeline slot each frame sits in (see _slots_from_pts / _slot)
         self._frame_pts: List[float] = []
@@ -2989,8 +2989,16 @@ class ShotEncoder:
         _VIDEO_ONLY_OUTPUT for the one that was found), so what matters is
         that the budget is a small multiple of the honest case, not the
         3600s the CPU path keeps: 60s plus a second per frame.
+
+        With the GPU probe path on, the card is ALSO running hardware AV1
+        encodes, and a score waits behind them. Measured on an episode: the
+        budget sized for a scoring-only card tripped three times around shot
+        180 and flipped the whole job to CPU scoring for its remaining 400
+        shots - a self-inflicted stall, not a sick device. So the budget
+        widens with the work the card has been given.
         """
-        return 60 + max(0, int(frames or 0))
+        base = 60 + max(0, int(frames or 0))
+        return base * (2 if self._gpu_probe_on() else 1)
 
     def _score_vmaf(self, dist_args: List[str], ref_args: List[str],
                     ref_vf: List[str], idx: int, crf: int,
@@ -3016,9 +3024,11 @@ class ShotEncoder:
             sycl = -1
         if sycl >= 0:
             try:
-                return self._score_vmaf_on(sycl, dist_args, ref_args, ref_vf,
-                                           idx, crf, threads,
-                                           timeout=self._sycl_timeout(frames))
+                score = self._score_vmaf_on(sycl, dist_args, ref_args, ref_vf,
+                                            idx, crf, threads,
+                                            timeout=self._sycl_timeout(frames))
+                self._sycl_scored_ok()
+                return score
             except TranscodeError as e:
                 # Not just timeouts. E07 of Stranger Things died on
                 # "SYCL memcpy H2D: OUT_OF_DEVICE_MEMORY" followed by
@@ -3041,6 +3051,7 @@ class ShotEncoder:
                 with self._sycl_lock:
                     self._sycl_timeouts += 1
                     n = self._sycl_timeouts
+                    # consecutive, not cumulative: see _sycl_scored_ok
                     flip = (lost or n >= self._SYCL_MAX_TIMEOUTS) and self._sycl_ok
                     if flip:
                         self._sycl_ok = False
@@ -3065,6 +3076,19 @@ class ShotEncoder:
                 self._gpu_slots.release()
         return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,
                                    threads, timeout=3600)
+
+    def _sycl_scored_ok(self) -> None:
+        """A SYCL score came back: clear the stall streak.
+
+        Cumulative counting cost an episode 400 shots of CPU scoring once -
+        three stalls scattered among hundreds of good scores were enough to
+        retire the device for the whole job. What should retire it is a run
+        of failures with nothing working in between, which is what a sick
+        device looks like; occasional slowness under a busy card is not.
+        """
+        if self._sycl_timeouts:
+            with self._sycl_lock:
+                self._sycl_timeouts = 0
 
     def _score_vmaf_on(self, sycl: int, dist_args: List[str], ref_args: List[str],
                        ref_vf: List[str], idx: int, crf: int,
