@@ -3371,6 +3371,20 @@ class ShotEncoder:
         to a single shot of int(fps * duration), which is an estimate and can
         overshoot the real frame count by a frame. That path would report a
         shortfall here; the message says exactly what was seen either way.
+        
+        The source read here stays on the CPU, and that is measured rather
+        than inherited. On 300 4K frames with the production SVT parameters
+        at lp=4, moving the decode to VA-API took CPU from 484s to 470s
+        (-2.9%) and wall from 70.0s to 68.1s - but peak RSS from 7.30GiB to
+        7.94GiB (+8.7%), because hwdownload allocates host frames on top of
+        the surface pool rather than instead of them. Memory is what caps
+        this phase's concurrency (see the encode budget log: peak RSS sits
+        on the budget and concurrency drops below 10 whenever a long shot is
+        in flight), so paying 8.7% of it to save 2.9% of CPU loses.
+        What decides this per phase is how expensive the ENCODE is: scene
+        detection is pure decode and gains hugely on the GPU, a probe encode
+        at preset 9 spends ~30% of its cost decoding and gains, and a
+        delivery encode at preset 4 spends 3% and does not.
         """
         written = self._count_frames(dst)
         if written is None or written == expected:
