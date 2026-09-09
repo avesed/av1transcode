@@ -3062,18 +3062,24 @@ class ShotEncoder:
                 if self.cancel_flag and self.cancel_flag():
                     raise
                 stalled = isinstance(e, CommandTimeout)
-                # DEVICE_LOST is terminal for the context: every later run on
-                # it fails the same way, so give the device up at once rather
-                # than paying _SYCL_MAX_TIMEOUTS more failures for the proof.
+                # DEVICE_LOST is terminal for the CONTEXT, which is not the
+                # same as the device being gone, and treating it as the latter
+                # cost an episode its GPU scoring twice. Caught in the act on
+                # S03E01: one scorer aborted with "SYCL graph wait: ...
+                # DEVICE_LOST" followed by OUT_OF_DEVICE_MEMORY, while the
+                # scorers running beside it finished normally in the next
+                # breath and a selfcheck minutes later passed. So this counts
+                # like any other failure: the streak below retires the device
+                # only when nothing at all is getting through, which is what a
+                # device that has really gone looks like.
                 text = str(e)
-                lost = "DEVICE_LOST" in text or "OUT_OF_DEVICE_MEMORY" in text
                 # Under the lock: probe workers fail concurrently, and the
                 # flip to the CPU should be announced exactly once.
                 with self._sycl_lock:
                     self._sycl_timeouts += 1
                     n = self._sycl_timeouts
                     # consecutive, not cumulative: see _sycl_scored_ok
-                    flip = (lost or n >= self._SYCL_MAX_TIMEOUTS) and self._sycl_ok
+                    flip = n >= self._SYCL_MAX_TIMEOUTS and self._sycl_ok
                     if flip:
                         self._sycl_ok = False
                         self._sycl_retired_at = time.time()
@@ -3090,10 +3096,9 @@ class ShotEncoder:
                 self._log(f"sycl failure shot {idx:05d} crf {crf}: {e}")
                 if flip:
                     logger.warning(
-                        "optimizer: libvmaf SYCL device {} {}; the rest of this "
-                        "job scores on the CPU", sycl,
-                        "reported the device lost or out of memory" if lost
-                        else f"stalled {n} times")
+                        "optimizer: libvmaf SYCL device {} failed {} times in a "
+                        "row; scoring moves to the CPU until it passes a "
+                        "preflight again", sycl, n)
             finally:
                 self._gpu_slots.release()
         return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,

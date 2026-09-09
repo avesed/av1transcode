@@ -3257,9 +3257,16 @@ def test_sycl_device_error_scores_on_the_cpu_instead_of_killing_the_job(
     monkeypatch.setattr(enc, "_score_vmaf_on", on)
     assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 91.5
     assert backends == [0, -1]                      # tried the GPU, scored on the CPU
-    assert enc._sycl_ok is False                    # and gave the device up at once
-    assert any("out of memory" in w for w in warnings)
-    # the rest of the job never reaches the device again
+    # ONE such failure is not the device going away. Caught in the act on a
+    # real episode: a scorer aborted with DEVICE_LOST and OUT_OF_DEVICE_MEMORY
+    # while the scorers beside it finished normally in the next breath, and a
+    # selfcheck minutes later passed. The context died, not the card.
+    assert enc._sycl_ok is True
+    # it takes a run of them, with nothing getting through in between
+    for _ in range(enc._SYCL_MAX_TIMEOUTS - 1):
+        enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120)
+    assert enc._sycl_ok is False
+    assert any("in a row" in w for w in warnings)
     backends.clear()
     assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 91.5
     assert backends == [-1]
@@ -3478,7 +3485,8 @@ def test_a_retired_sycl_device_is_given_another_chance(settings, info, plan, tmp
 
     monkeypatch.setattr(enc, "_score_vmaf_on", on)
     enc._sycl_ok = True                              # preflight already passed
-    assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 90.0
+    for _ in range(enc._SYCL_MAX_TIMEOUTS):          # a run of failures, not one
+        assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 90.0
     assert enc._sycl_ok is False and enc._sycl_retired_at == 1000.0
     # too soon: no preflight, still on the CPU
     now["t"] = 1000.0 + enc._SYCL_REARM_AFTER - 1
