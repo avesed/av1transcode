@@ -527,3 +527,65 @@ def test_cgroup_memory_in_use_discounts_reclaimable_page_cache(monkeypatch, tmp_
     (tmp_path / "memory.stat").unlink()
     assert sysres.memory_in_use_gb() == pytest.approx(current / sysres._GB)
 
+
+
+def test_rpu_extraction_never_uses_dovi_tools_matroska_reader(settings, tmp_path, monkeypatch):
+    """Handing dovi_tool an .mkv silently extracted 5819 bytes of a 46-minute
+    remux - about 29 frames - exited 0 and printed nothing, so the old
+    `rc == 0 and size > 0` check called it a success for a whole season. The
+    same file piped through ffmpeg gives 13.4MB."""
+    import shutil
+    from app import dovi
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    src = tmp_path / "ep.mkv"; src.write_bytes(b"x")
+    dest = tmp_path / "ep.rpu.bin"
+    seen = {}
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            seen["ffmpeg"] = cmd
+            self.stdout = None
+        def wait(self, timeout=None): return 0
+
+    def fake_run(cmd, **kw):
+        seen["dovi"] = cmd
+        dest.write_bytes(b"R" * 500_000)
+        class R: returncode, stderr = 0, b""
+        return R()
+
+    monkeypatch.setattr(dovi.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(dovi.subprocess, "run", fake_run)
+    monkeypatch.setattr(dovi, "_duration_seconds", lambda s, p: 100.0)
+    assert dovi.extract_rpu(settings, src, dest, 7) is True
+    assert "hevc_mp4toannexb" in seen["ffmpeg"]        # through ffmpeg, not the mkv reader
+    assert seen["dovi"][1:] == ["extract-rpu", "-", "-o", str(dest)]
+
+
+def test_a_truncated_rpu_is_a_failure_however_clean_the_exit(settings, tmp_path, monkeypatch):
+    """The failure this guards against produced a valid, parseable, useless
+    file: 2 bytes of RPU per second of video where a real one carries ~4800."""
+    import shutil
+    from app import dovi
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    src = tmp_path / "ep.mkv"; src.write_bytes(b"x")
+    dest = tmp_path / "ep.rpu.bin"
+
+    class FakePopen:
+        def __init__(self, cmd, **kw): self.stdout = None
+        def wait(self, timeout=None): return 0
+
+    def fake_run(cmd, **kw):
+        dest.write_bytes(b"R" * 5819)                  # what the real bug wrote
+        class R: returncode, stderr = 0, b""
+        return R()
+
+    monkeypatch.setattr(dovi.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(dovi.subprocess, "run", fake_run)
+    monkeypatch.setattr(dovi, "_duration_seconds", lambda s, p: 2808.0)
+    assert dovi.extract_rpu(settings, src, dest, 7) is False
+    assert not dest.exists()
+    # and a short source with the same file is fine - the check is a rate
+    monkeypatch.setattr(dovi, "_duration_seconds", lambda s, p: 10.0)
+    assert dovi.extract_rpu(settings, src, dest, 7) is True
