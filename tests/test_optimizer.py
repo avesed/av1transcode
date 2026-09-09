@@ -3451,3 +3451,46 @@ def test_the_sycl_budget_widens_when_the_card_also_encodes(settings, info, plan,
     alone = enc._sycl_timeout(120)
     settings.transcode.optimizer.probe_encoder = "qsv"
     assert enc._sycl_timeout(120) == alone * 2
+
+
+def test_a_retired_sycl_device_is_given_another_chance(settings, info, plan, tmp_path, monkeypatch):
+    """An episode reported OUT_OF_DEVICE_MEMORY at 8% of its probe phase, the
+    device was retired for the whole job, and a selfcheck minutes later
+    passed - the card had recovered while the job spent its remaining 90% on
+    the CPU. One preflight per cool-off costs a couple of seconds; a card that
+    is really gone fails it and is left alone."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    settings.transcode.optimizer.vmaf_sycl_min_width = 0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: None)
+    healthy = {"card": False}
+    preflights = []
+    monkeypatch.setattr(enc, "_sycl_preflight",
+                        lambda dev: (preflights.append(dev), healthy["card"])[1])
+    now = {"t": 1000.0}
+    monkeypatch.setattr(opt.time, "time", lambda: now["t"])
+
+    def on(sycl, *a, **k):
+        if sycl >= 0:
+            raise opt.TranscodeError("libvmaf ERROR SYCL: UR_RESULT_ERROR_DEVICE_LOST")
+        return 90.0
+
+    monkeypatch.setattr(enc, "_score_vmaf_on", on)
+    enc._sycl_ok = True                              # preflight already passed
+    assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 90.0
+    assert enc._sycl_ok is False and enc._sycl_retired_at == 1000.0
+    # too soon: no preflight, still on the CPU
+    now["t"] = 1000.0 + enc._SYCL_REARM_AFTER - 1
+    assert enc._sycl_device() == -1 and preflights == []
+    # after the cool-off it is asked once - and the card is still sick
+    now["t"] = 1000.0 + enc._SYCL_REARM_AFTER
+    assert enc._sycl_device() == -1 and preflights == [0]
+    # asked once per cool-off, not once per score
+    assert enc._sycl_device() == -1 and preflights == [0]
+    # the card recovers; the next cool-off brings scoring back
+    healthy["card"] = True
+    enc._sycl_retired_at = now["t"]
+    now["t"] += enc._SYCL_REARM_AFTER
+    assert enc._sycl_device() == 0
+    assert enc._sycl_ok is True and enc._sycl_timeouts == 0

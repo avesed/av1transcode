@@ -549,6 +549,7 @@ class ShotEncoder:
         self._hwdec_lock = threading.Lock()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0        # consecutive; a good score clears it
+        self._sycl_retired_at: Optional[float] = None   # when the device was given up
         # every frame's pts_time from the scdet pass (see _run_scdet), and the
         # timeline slot each frame sits in (see _slots_from_pts / _slot)
         self._frame_pts: List[float] = []
@@ -1999,6 +2000,18 @@ class ShotEncoder:
         with self._sycl_lock:
             if self._sycl_ok is None:
                 self._sycl_ok = self._sycl_preflight(dev)
+            elif (not self._sycl_ok and self._sycl_retired_at is not None
+                  and time.time() - self._sycl_retired_at >= self._SYCL_REARM_AFTER):
+                # One attempt per cool-off, whatever the outcome: clearing the
+                # timestamp first means a device that is really gone is asked
+                # once and then left alone for the rest of the job.
+                self._sycl_retired_at = None
+                if self._sycl_preflight(dev):
+                    self._sycl_ok = True
+                    self._sycl_timeouts = 0
+                    logger.info("optimizer: libvmaf SYCL device {} works again "
+                                "after {:.0f}s; scoring returns to the GPU",
+                                dev, self._SYCL_REARM_AFTER)
         return dev if self._sycl_ok else -1
 
     # How far the GPU and CPU backends may disagree on the same pair. Measured
@@ -2941,6 +2954,14 @@ class ShotEncoder:
     # rest of the job scores on the CPU: a GPU that keeps stalling is not
     # going to get better, and every stall already cost a full timeout.
     _SYCL_MAX_TIMEOUTS = 3
+    # How long a retired SYCL device is left alone before the preflight is
+    # given one more go. Measured the hard way: an episode reported
+    # OUT_OF_DEVICE_MEMORY at 8% of its probe phase, the device was retired
+    # for the whole job, and a selfcheck minutes later passed - so the card
+    # had recovered while the job spent its remaining 90% on the CPU, about
+    # half an hour of it. A card that is genuinely gone fails the preflight
+    # again and costs only that.
+    _SYCL_REARM_AFTER = 300.0
     # How long a probe waits for a GPU slot before scoring on the CPU instead.
     # Generous: a slot frees every few seconds, and the CPU score costs real
     # cores that the encodes want.
@@ -3055,6 +3076,7 @@ class ShotEncoder:
                     flip = (lost or n >= self._SYCL_MAX_TIMEOUTS) and self._sycl_ok
                     if flip:
                         self._sycl_ok = False
+                        self._sycl_retired_at = time.time()
                 if stalled:
                     logger.warning(
                         "optimizer: SYCL scoring of shot {} crf {} did not finish "
