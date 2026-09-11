@@ -3333,12 +3333,12 @@ def test_gpu_probe_encode_runs_wholly_on_the_card(settings, info, plan, tmp_path
     vf = cmd[cmd.index("-vf") + 1]
     assert vf.startswith("hwdownload,format=p010le")     # the encoder takes it as-is
     assert "setpts=PTS-STARTPTS" in vf                   # same framing as every other read
-    # and it is bounded by the same semaphore the scores use: one card, one
+    # and it books room against the same budget the scores do: one card, one
     # pool of memory, and exhausting it once already cost a reboot
-    enc._gpu_slots = threading.BoundedSemaphore(1)
+    enc._gpu_vram = opt.VramBudget(1000, max_ops=8, measure=lambda: 0.0)
     enc._GPU_SLOT_WAIT = 0.05
-    enc._gpu_slots.acquire()
-    with pytest.raises(opt.TranscodeError, match="no GPU slot"):
+    assert enc._gpu_vram.reserve(1000, 0.0) is True      # the card is now full
+    with pytest.raises(opt.TranscodeError, match="no room on the GPU"):
         enc._qsv_probe_encode(600, 720, 22, tmp_path / "p.ivf")
 
 
@@ -3502,3 +3502,101 @@ def test_a_retired_sycl_device_is_given_another_chance(settings, info, plan, tmp
     now["t"] += enc._SYCL_REARM_AFTER
     assert enc._sycl_device() == 0
     assert enc._sycl_ok is True and enc._sycl_timeouts == 0
+
+
+# ---------------------------------------------------------------------------
+# VRAM budget: admission on bytes rather than on a count of operations
+# ---------------------------------------------------------------------------
+
+def test_vram_budget_admits_by_bytes_not_by_count():
+    """Six slots is six operations, and operations are not the same size. A
+    budget that fits three big ones must admit three, not six."""
+    b = opt.VramBudget(3000, max_ops=6, measure=lambda: 0.0)
+    assert [b.reserve(900, 0.0) for _ in range(3)] == [True, True, True]
+    assert b.reserve(900, 0.0) is False
+    b.release(900)
+    assert b.reserve(900, 0.0) is True
+
+
+def test_vram_budget_still_honours_the_worker_cap():
+    """The count cap was measured on throughput, not on memory, so a budget
+    with room to spare must not widen the queue past it."""
+    b = opt.VramBudget(100000, max_ops=2, measure=lambda: 0.0)
+    assert b.reserve(10, 0.0) and b.reserve(10, 0.0)
+    assert b.reserve(10, 0.0) is False
+
+
+def test_vram_budget_always_lets_one_operation_through():
+    """A budget smaller than a single score should slow the phase down, not
+    deadlock it - the CPU fallback is for contention, not for an impossible
+    sum."""
+    b = opt.VramBudget(256, max_ops=6, measure=lambda: 0.0)
+    assert b.reserve(50000, 0.0) is True
+
+
+def test_vram_budget_counts_what_the_card_actually_holds():
+    """The reservation covers the ramp, the measurement covers the model
+    being wrong. A card already full from an operation that under-estimated
+    itself must refuse the next one."""
+    used = {"mb": 2950.0}
+    b = opt.VramBudget(3000, max_ops=6, measure=lambda: used["mb"])
+    assert b.reserve(100, 0.0) is True      # first one always fits
+    assert b.reserve(100, 0.0) is False     # measured 2950 + 100 > 3000
+    used["mb"] = 0.0
+    b._measured_at = 0.0
+    assert b.reserve(100, 0.0) is True
+
+
+def test_vram_budget_survives_an_unreadable_card():
+    """Without fdinfo it degrades to the reservation model - the old counting
+    behaviour with better units - rather than refusing to run."""
+    b = opt.VramBudget(3000, max_ops=6, measure=lambda: None)
+    assert b.reserve(900, 0.0) is True
+    assert b.readable is False
+    assert "unmeasured" in b.summary()
+
+
+def test_vram_calibration_pulls_the_model_towards_the_measurement():
+    """An operation that really costs twice its estimate should raise the
+    model, so the next admissions book the real number."""
+    b = opt.VramBudget(100000, max_ops=6, measure=lambda: 2000.0)
+    b.reserve(1000, 0.0)
+    for _ in range(200):
+        b._calibrated_at = 0.0
+        b.calibrate()
+    assert b._ratio > 1.5
+
+
+def test_vram_calibration_ignores_an_idle_card():
+    """Nothing in flight says nothing about the size of an operation."""
+    b = opt.VramBudget(100000, max_ops=6, measure=lambda: 0.0)
+    b.calibrate()
+    assert b._ratio == 1.0
+
+
+def test_drm_vram_reader_deduplicates_clients_and_filters_the_device(tmp_path):
+    """A client that dup()s its fd shows the same allocation twice, and this
+    box has four render nodes - summing blindly would count both."""
+    proc = tmp_path / "proc"
+    def client(pid, fd, cid, pdev, kib):
+        d = proc / str(pid) / "fdinfo"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / str(fd)).write_text(
+            f"pos:\t0\ndrm-driver:\txe\ndrm-pdev:\t{pdev}\n"
+            f"drm-client-id:\t{cid}\ndrm-total-vram0:\t{kib} KiB\n")
+    client(10, 3, "1", "0000:c6:00.0", 440 * 1024)
+    client(10, 4, "1", "0000:c6:00.0", 440 * 1024)   # same client, dup'd fd
+    client(11, 3, "2", "0000:c6:00.0", 440 * 1024)
+    client(12, 3, "3", "0000:41:00.0", 9000 * 1024)  # a 3090, not ours
+    mb = opt.drm_vram_used_mb("0000:c6:00.0", root=str(proc))
+    assert mb == pytest.approx(880, abs=1)
+
+
+def test_score_estimate_doubles_with_the_hardware_reference_read(settings, info, plan, tmp_path):
+    """With reference_hwaccel on a score is two DRM clients, not one, and
+    that is exactly what exhausted the card."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._hwdec_ok = False
+    cpu_read = enc._est_score_mb(120)
+    enc._hwdec_ok = True
+    assert enc._est_score_mb(120) == pytest.approx(cpu_read * 2)

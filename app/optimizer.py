@@ -472,6 +472,254 @@ def _render_nodes() -> List[str]:
     return sorted(glob.glob("/dev/dri/renderD*"))
 
 
+def _render_pdev(node: str) -> Optional[str]:
+    """The PCI address behind a render node, e.g. "0000:c6:00.0".
+
+    fdinfo tags every DRM client with the device it belongs to, and this box
+    has four render nodes (two 3090s, the B580, and the iGPU); without the
+    address a memory reading would sum clients of cards this job never
+    touches.
+    """
+    name = os.path.basename(node)
+    try:
+        return os.path.basename(
+            os.path.realpath(f"/sys/class/drm/{name}/device"))
+    except OSError:
+        return None
+
+
+def drm_vram_used_mb(pdev: Optional[str],
+                     root: str = "/proc") -> Optional[float]:
+    """VRAM this process tree holds on `pdev`, in MB, or None if unreadable.
+
+    The interface nvtop reads: every open DRM file exposes drm-total-vram0 in
+    /proc/<pid>/fdinfo/<fd>, and a client that dup()s or forks its fd shows
+    the same allocation under several fds, so the sum has to be deduplicated
+    by drm-client-id or it counts the same bytes many times over.
+
+    It sees only what this PID namespace can see. Inside the container that
+    is our own ffmpegs - Plex's share of the card is invisible here, which is
+    why the budget has to leave room for it rather than measure it.
+    """
+    total, seen = 0.0, set()
+    try:
+        pids = [d for d in os.listdir(root) if d.isdigit()]
+    except OSError:
+        return None
+    found = False
+    for pid in pids:
+        d = f"{root}/{pid}/fdinfo"
+        try:
+            fds = os.listdir(d)
+        except OSError:
+            continue                      # the process exited, or is not ours
+        for fd in fds:
+            try:
+                with open(f"{d}/{fd}") as fh:
+                    text = fh.read(4096)
+            except OSError:
+                continue
+            if "drm-client-id" not in text:
+                continue
+            found = True
+            cid = dev = None
+            vram = 0.0
+            for line in text.splitlines():
+                k, _, v = line.partition(":")
+                v = v.strip()
+                if k == "drm-client-id":
+                    cid = v
+                elif k == "drm-pdev":
+                    dev = v
+                elif k.startswith("drm-total-vram"):
+                    vram += _kib_to_mb(v)
+            if cid is None or cid in seen:
+                continue
+            if pdev and dev and dev != pdev:
+                continue
+            seen.add(cid)
+            total += vram
+    return total if found or total == 0.0 else None
+
+
+def _kib_to_mb(v: str) -> float:
+    """One fdinfo size field ("1234 KiB", "12 MiB", bare bytes) in MB."""
+    parts = v.split()
+    if not parts:
+        return 0.0
+    try:
+        n = float(parts[0])
+    except ValueError:
+        return 0.0
+    unit = (parts[1] if len(parts) > 1 else "KiB").lower()
+    scale = {"b": 1 / 1048576.0, "kib": 1 / 1024.0, "mib": 1.0,
+             "gib": 1024.0}.get(unit, 1 / 1024.0)
+    return n * scale
+
+
+class VramBudget:
+    """Admission control for the card's memory, in MB.
+
+    What the counting semaphore this replaces got wrong is the unit. Six
+    slots is six OPERATIONS, and operations are not the same size: a SYCL
+    score of a 120-frame 4K window holds ~440MB, the same score with
+    reference_hwaccel on holds a VA-API surface pool beside it for ~880MB,
+    and a QSV probe encode of a 480-frame window is a different number again.
+    Six of the cheap kind is a third of the card; six of the expensive kind is
+    most of it. Sizing one constant for the worst case wastes the card the
+    rest of the time, and sizing it for the average is how E07 died:
+    OUT_OF_DEVICE_MEMORY, then DEVICE_LOST, then a reboot to get the card
+    back (see _gpu_workers).
+
+    So admission is on bytes, against two numbers that disagree in useful
+    ways:
+
+      - RESERVED, the sum of the estimates of everything in flight. Covers
+        the ramp: a VA-API session allocates its pool within a second or two
+        of launch and a SYCL context grows over the score, so for the first
+        moments of an operation the measurement has not caught up yet.
+      - MEASURED, what fdinfo says the card actually holds right now. Covers
+        the model being wrong, in either direction.
+
+    Occupancy is the larger of the two, which is conservative exactly where
+    being wrong is expensive and lets the budget breathe everywhere else.
+    Reservations are never trusted after the fact: the model is recalibrated
+    from the measurement (see `calibrate`), so a systematic error costs a
+    little throughput for a few operations rather than for the whole job.
+    """
+
+    def __init__(self, budget_mb: float, max_ops: int,
+                 pdev: Optional[str] = None,
+                 measure: Optional[Callable[[], Optional[float]]] = None):
+        self.budget = max(256.0, float(budget_mb))
+        self.max_ops = max(1, int(max_ops))
+        self._pdev = pdev
+        self._measure = measure or (lambda: drm_vram_used_mb(self._pdev))
+        self._cv = threading.Condition()
+        self._reserved = 0.0
+        self._ops = 0
+        self._measured = 0.0
+        self._measured_at = 0.0
+        self._peak = 0.0
+        self._readable: Optional[bool] = None
+        # model correction, in the shape MemCalibration uses for RSS: the
+        # ratio of what operations really cost to what they were estimated at
+        self._ratio = 1.0
+        self._samples = 0
+        self._calibrated_at = 0.0
+
+    # -- measurement ---------------------------------------------------
+    _CACHE_S = 1.0
+    # A score takes seconds and there are thousands of them in an episode;
+    # recalibrating on every one would walk /proc thousands of times for a
+    # number that moves slowly.
+    _CALIBRATE_EVERY_S = 5.0
+
+    def measured_mb(self, force: bool = False) -> float:
+        """Current usage, cached for a second - admission runs per operation
+        and walking /proc is not free."""
+        now = time.monotonic()
+        if not force and now - self._measured_at < self._CACHE_S:
+            return self._measured
+        mb = self._measure()
+        self._measured_at = now
+        if mb is None:
+            if self._readable is None:
+                self._readable = False
+            return self._measured
+        self._readable = True
+        self._measured = mb
+        self._peak = max(self._peak, mb)
+        return mb
+
+    @property
+    def readable(self) -> bool:
+        """Whether fdinfo answered at least once. When it never does the
+        budget degrades to the reservation model alone, which is the old
+        counting behaviour with better units."""
+        return self._readable is not False
+
+    def occupancy(self) -> float:
+        return max(self._reserved, self.measured_mb())
+
+    # -- admission -----------------------------------------------------
+    def reserve(self, mb: float, timeout: float) -> bool:
+        """Book `mb` for one operation. False when the wait ran out.
+
+        One operation always fits: a budget smaller than a single score would
+        otherwise deadlock the phase rather than slow it down, and the CPU
+        fallback the caller takes on failure is meant for contention, not for
+        an impossible sum.
+        """
+        want = max(0.0, float(mb)) * self._ratio
+        deadline = time.monotonic() + max(0.0, timeout)
+        self.measured_mb()          # cached; the reservation alone is half the story
+        with self._cv:
+            while True:
+                free = self.budget - max(self._reserved, self._measured)
+                if self._ops == 0 or (want <= free and self._ops < self.max_ops):
+                    self._reserved += want
+                    self._ops += 1
+                    return True
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cv.wait(min(left, self._CACHE_S))
+                self.measured_mb()
+
+    def release(self, mb: float) -> None:
+        want = max(0.0, float(mb)) * self._ratio
+        with self._cv:
+            self._reserved = max(0.0, self._reserved - want)
+            self._ops = max(0, self._ops - 1)
+            self._cv.notify_all()
+
+    @contextlib.contextmanager
+    def hold(self, mb: float, timeout: float, what: str) -> Iterator[None]:
+        if not self.reserve(mb, timeout):
+            raise TranscodeError(
+                f"no room on the GPU for {what} within {timeout:.0f}s "
+                f"({self.occupancy():.0f}MB of {self.budget:.0f}MB in use)")
+        try:
+            yield
+        finally:
+            self.release(mb)
+
+    # -- calibration ---------------------------------------------------
+    def calibrate(self) -> None:
+        """Pull the model towards what the card actually holds.
+
+        Only while something is in flight and only from a reading that is
+        larger than nothing - an empty card says nothing about the size of an
+        operation. The correction is deliberately slow (a twentieth of the
+        gap per sample) because the measurement is instantaneous and an
+        operation's footprint is not flat over its life.
+        """
+        now = time.monotonic()
+        with self._cv:
+            if self._ops <= 0 or self._reserved <= 0:
+                return
+            if now - self._calibrated_at < self._CALIBRATE_EVERY_S:
+                return
+            self._calibrated_at = now
+        mb = self.measured_mb(force=True)
+        if mb <= 0:
+            return
+        with self._cv:
+            if self._ops <= 0 or self._reserved <= 0:
+                return
+            want = mb / (self._reserved / self._ratio)
+            self._ratio += (want - self._ratio) / 20.0
+            self._ratio = min(4.0, max(0.25, self._ratio))
+            self._samples += 1
+
+    def summary(self) -> str:
+        return (f"peak {self._peak:.0f}MB of a {self.budget:.0f}MB budget, "
+                f"model x{self._ratio:.2f} after {self._samples} sample(s)"
+                if self.readable else
+                f"{self.budget:.0f}MB budget, unmeasured (no readable fdinfo)")
+
+
 class CommandTimeout(TranscodeError):
     """A subprocess hit its _run timeout and was killed."""
 
@@ -540,7 +788,9 @@ class ShotEncoder:
         # Probe workers call it concurrently, hence the lock.
         self._sycl_ok: Optional[bool] = None
         self._sycl_lock = threading.Lock()
-        self._gpu_slots = threading.BoundedSemaphore(self._gpu_workers())
+        nodes = _render_nodes()
+        self._gpu_vram = VramBudget(self._vram_budget_mb(), self._gpu_workers(),
+                                    _render_pdev(nodes[0]) if nodes else None)
         # reference_hwaccel: None until the first scoring read runs the
         # preflight; then whether the source decodes on QSV for this job
         self._hwdec_ok: Optional[bool] = None
@@ -2401,17 +2651,14 @@ class ShotEncoder:
         return g
 
     @contextlib.contextmanager
-    def _gpu_slot(self, what: str) -> Iterator[None]:
-        """Hold one of the card's slots. The same semaphore the scores use:
-        encode engine and compute engine are separate, but they share the one
-        pool of memory, and it was exhausting that which cost a reboot."""
-        if not self._gpu_slots.acquire(timeout=self._GPU_SLOT_WAIT):
-            raise TranscodeError(f"no GPU slot for {what} within "
-                                 f"{self._GPU_SLOT_WAIT:.0f}s")
-        try:
+    def _gpu_slot(self, what: str, mb: Optional[float] = None) -> Iterator[None]:
+        """Hold room on the card for one operation. The same budget the scores
+        book against: encode engine and compute engine are separate, but they
+        share the one pool of memory, and it was exhausting that which cost a
+        reboot."""
+        with self._gpu_vram.hold(mb if mb is not None else self._est_score_mb(None),
+                                 self._GPU_SLOT_WAIT, what):
             yield
-        finally:
-            self._gpu_slots.release()
 
     def _qsv_probe_encode(self, w0: int, w1: int, q: int, out: Path) -> None:
         """One probe encode that never leaves the card: VA-API decode into the
@@ -2432,7 +2679,8 @@ class ShotEncoder:
                  "-vf", ",".join(vf + exact_vf)] + exact_out
                 + ["-c:v", "av1_qsv", "-preset", str(self.opt.gpu_probe_preset),
                    "-global_quality", str(q), "-f", "ivf", str(out)])
-        with self._gpu_slot(f"probe encode q={q}"):
+        with self._gpu_slot(f"probe encode q={q}",
+                            self._est_qsv_probe_mb(w1 - w0)):
             self._run(args, timeout=3600)
 
     def _probe_shot_qsv(self, idx: int, s0: int, s1: int,
@@ -3002,6 +3250,52 @@ class ShotEncoder:
         w = int(self.opt.vmaf_sycl_workers or 0)
         return max(1, w if w > 0 else self._GPU_WORKERS_AUTO)
 
+    # The card's memory to book when nothing else says otherwise. Six 4K
+    # scores with reference_hwaccel on measured 5.27GB, so this lands the
+    # default where vmaf_sycl_workers already put it - and leaves half of a
+    # 12GB B580 for Plex, which shares the card and cannot be measured from
+    # inside this container.
+    _VRAM_BUDGET_AUTO_MB = 6000.0
+
+    def _vram_budget_mb(self) -> float:
+        v = float(self.opt.gpu_vram_budget_mb or 0)
+        return v if v > 0 else self._VRAM_BUDGET_AUTO_MB
+
+    # Per megapixel, from the fdinfo measurement behind _gpu_workers: one 4K
+    # SYCL score is one DRM client at ~440MB (~55MB per megapixel), and with
+    # reference_hwaccel on a VA-API decode session with its own surface pool
+    # sits beside it for about as much again.
+    #
+    # Flat in window length on purpose. libvmaf streams frames rather than
+    # holding the window, and across the 120- and 240-frame runs measured the
+    # per-client figure did not move with it; if that turns out to be wrong
+    # on some other content, `calibrate` corrects the model from what the
+    # card actually holds rather than waiting for someone to remeasure.
+    _VRAM_MB_PER_MPX = 55.0
+    # Over-booking leaves the card idle; under-booking is what turns into
+    # OUT_OF_DEVICE_MEMORY and then a device that needs a reboot, so the
+    # estimate is biased the safe way.
+    _VRAM_SAFETY = 1.15
+
+    def _est_score_mb(self, frames: Optional[int] = None) -> float:
+        """Card memory one GPU score holds, in MB."""
+        clients = 2.0 if self._hwdec_ok else 1.0
+        return (self._megapixels() * self._VRAM_MB_PER_MPX * clients
+                * self._VRAM_SAFETY)
+
+    def _est_qsv_probe_mb(self, frames: Optional[int] = None) -> float:
+        """Card memory one QSV probe encode holds, in MB.
+
+        Two clients like a score with the reference read on - a VA-API decode
+        session feeding a hardware encoder - but the encoder's reference
+        frames are its own, so this starts a little above a score and lets
+        the calibration carry it the rest of the way. Unlike the score figure
+        this one is a projection, not a measurement: nothing has run the GPU
+        probe path long enough on this card to read it off fdinfo.
+        """
+        return (self._megapixels() * self._VRAM_MB_PER_MPX * 2.5
+                * self._VRAM_SAFETY)
+
     def _sycl_timeout(self, frames: Optional[int]) -> int:
         """Seconds a SYCL scoring may take before it is killed and retried.
 
@@ -3037,11 +3331,14 @@ class ShotEncoder:
         costs one short wait rather than the job.
         """
         sycl = self._sycl_device()
-        if sycl >= 0 and not self._gpu_slots.acquire(timeout=self._GPU_SLOT_WAIT):
-            # Every GPU slot is busy and staying busy. Scoring on the CPU is
-            # slower per shot but it is not queued behind anything, and the
-            # point of the cap is that a wider GPU queue buys nothing.
-            self._log(f"gpu slots all busy; scoring shot {idx:05d} crf {crf} on the CPU")
+        need = self._est_score_mb(frames)
+        if sycl >= 0 and not self._gpu_vram.reserve(need, self._GPU_SLOT_WAIT):
+            # The card is full and staying full. Scoring on the CPU is slower
+            # per shot but it is not queued behind anything, and the point of
+            # the budget is that a deeper GPU queue buys nothing.
+            self._log(f"gpu full ({self._gpu_vram.occupancy():.0f}MB of "
+                      f"{self._gpu_vram.budget:.0f}MB, wanted {need:.0f}MB); "
+                      f"scoring shot {idx:05d} crf {crf} on the CPU")
             sycl = -1
         if sycl >= 0:
             try:
@@ -3100,7 +3397,8 @@ class ShotEncoder:
                         "row; scoring moves to the CPU until it passes a "
                         "preflight again", sycl, n)
             finally:
-                self._gpu_slots.release()
+                self._gpu_vram.calibrate()
+                self._gpu_vram.release(need)
         return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,
                                    threads, timeout=3600)
 
@@ -3340,6 +3638,8 @@ class ShotEncoder:
             f"(python={self._py_rss_mb():.0f}MB), peak concurrency "
             f"{getattr(self, '_sched_peak_conc', 0)} of a "
             f"{getattr(self, '_sched_budget', 0.0):.1f}GB budget{drift}{heavy}")
+        if phase == "probing" and self._sycl_device() >= 0:
+            self._mem_log(f"[vram] {phase}: {self._gpu_vram.summary()}")
 
     def _encode_shot(self, idx: int, s0: int, s1: int, crf: float, lp: int,
                      slot: int = -1, threads: int = 0) -> Path:

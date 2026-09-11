@@ -391,6 +391,23 @@ class OptimizerSettings(BaseModel):
     # at twelve. The cap costs 7.8% of the probe phase and is worth it: the
     # failure it prevents costs a reboot of a box that also runs Plex.
     vmaf_sycl_workers: int = 0
+    # The card's memory this job may hold, in MB (0 = auto, 6000).
+    #
+    # vmaf_sycl_workers counts OPERATIONS; this counts bytes, which is what
+    # the card actually runs out of. The two work together - the worker cap
+    # stays as a ceiling on concurrency, the budget decides admission - and
+    # the default is sized to land on the same place the cap does today: six
+    # 4K scores with reference_hwaccel on measured 5.27GB. What it buys is
+    # the cases the count cannot see: a longer probe window, a QSV probe
+    # encode beside the scores, or a model that turns out to be wrong, all of
+    # which change the bytes per operation without changing their number.
+    #
+    # Usage is measured from DRM fdinfo, so it is what the card really holds
+    # rather than what was predicted - but only for THIS pid namespace. Plex
+    # shares the B580 and is invisible from inside the container, so the
+    # default leaves half the 12GB card unbooked rather than trying to
+    # measure the other tenant. Raise it only on a card nothing else uses.
+    gpu_vram_budget_mb: int = 0
     # ---- the GPU probe path (opt-in, additive; "svt" leaves it switched off) ----
     # Which encoder the PROBES use. "svt" is the path everything above
     # describes. "qsv" probes on the card instead - VA-API decode into the
