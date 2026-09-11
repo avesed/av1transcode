@@ -3319,20 +3319,26 @@ def test_gpu_probe_needs_a_render_node(settings, info, plan, tmp_path, monkeypat
 
 
 def test_gpu_probe_encode_runs_wholly_on_the_card(settings, info, plan, tmp_path, monkeypatch):
-    """VA-API decode straight into the hardware AV1 encoder: 16.4 CPU-seconds
-    for 300 4K frames against 88.3 for the SVT preset-9 probe."""
+    """It used to claim this and not do it - hwdownload brought the 4K frames
+    back to system memory for av1_qsv to upload again, which measured SLOWER
+    in wall clock than the SVT probe it was meant to undercut (5.39s against
+    4.29s). Encoding through VA-API keeps them where they were decoded:
+    0.78s and a twelfth of the CPU."""
     info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
     enc, _ = _gpu_encoder(settings, info, plan, tmp_path)
     ran = []
     monkeypatch.setattr(enc, "_run", lambda args, timeout=None: (ran.append(args), "")[1])
     enc._qsv_probe_encode(600, 720, 22, tmp_path / "p.ivf")
     cmd = ran[0]
-    assert cmd[cmd.index("-c:v") + 1] == "av1_qsv"
+    assert cmd[cmd.index("-c:v") + 1] == "av1_vaapi"
     assert cmd[cmd.index("-global_quality") + 1] == "22"
+    # ICQ, not CQP: under CQP the driver ignores -qp and returns the same
+    # 35690 KiB at 20, 32 and 44
+    assert cmd[cmd.index("-rc_mode") + 1] == "ICQ"
     assert "-hwaccel" in cmd and cmd[cmd.index("-hwaccel") + 1] == "vaapi"
     assert cmd.index("-hwaccel") < cmd.index("-ss") < cmd.index("-i")
-    vf = cmd[cmd.index("-vf") + 1]
-    assert vf.startswith("hwdownload,format=p010le")     # the encoder takes it as-is
+    vf = cmd[cmd.index("-vf") + 1] if "-vf" in cmd else ""
+    assert "hwdownload" not in vf                        # the whole point
     assert "setpts=PTS-STARTPTS" in vf                   # same framing as every other read
     # and it books room against the same budget the scores do: one card, one
     # pool of memory, and exhausting it once already cost a reboot

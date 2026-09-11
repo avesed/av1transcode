@@ -2775,23 +2775,46 @@ class ShotEncoder:
             yield
 
     def _qsv_probe_encode(self, w0: int, w1: int, q: int, out: Path) -> None:
-        """One probe encode that never leaves the card: VA-API decode into the
-        hardware AV1 encoder. Measured on 300 4K frames, 16.4 CPU-seconds
-        against 88.3 for the SVT preset-9 probe at comparable wall time."""
-        vf = [f"hwdownload,format={self._surface_format()}"]
+        """One probe encode that really never leaves the card.
+
+        It used to say that and not do it: VA-API decoded into a hwdownload,
+        the 4K frames came back to system memory, and av1_qsv uploaded them
+        again. Measured on a 120-frame 4K window that round trip costs 5.39s
+        of wall against 4.29s for the SVT probe it was supposed to undercut -
+        SLOWER, on 1.2 cores against 8.5 - because the pool is ten wide and a
+        probe that idles on a copy holds its slot just as long as one that
+        works. That is where the 57% the GPU probe path was losing actually
+        went; it was never the CPU, and it was never the admission cap
+        (raising it from six to ten moved nothing and the card never went
+        above 3.97GB either way).
+
+        Encoding through VA-API instead keeps the frames where they were
+        decoded: 0.78s wall and 0.53 CPU-seconds for the same window, 6.9x
+        the throughput on a twelfth of the CPU.
+
+        rc_mode=ICQ, not the CQP the option names suggest: with CQP the
+        driver ignores -qp outright and returns the same 35690 KiB at 20, 32
+        and 44. ICQ's global_quality lands within 2% of what av1_qsv produced
+        at the same number (386 KiB against 392 at ~30), so gpu_probe_qs
+        keeps its meaning.
+        """
+        vf: List[str] = []
         rate = self._probing_rate()
         if rate > 1:
             vf.append(f"fps={self.fps / rate:.6f}")
         scale = self._probe_scale()
         if scale:
-            vf.append(f"scale={scale}")
+            # on the card the scaler is the card's too, or the frames would
+            # have to come back for it
+            vf.append(f"scale_vaapi={scale.replace('x', ':')}")
         exact_vf, exact_out = self._exact_frames()
         args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                  "-threads", "4", *self._hwdec_args(),
                  "-ss", self._seek(w0), "-t", f"{self._span(w0, w1):.6f}",
-                 "-i", str(self.source), "-map", "0:v:0",
-                 "-vf", ",".join(vf + exact_vf)] + exact_out
-                + ["-c:v", "av1_qsv", "-preset", str(self.opt.gpu_probe_preset),
+                 "-i", str(self.source), "-map", "0:v:0"]
+                + (["-vf", ",".join(vf + exact_vf)] if (vf or exact_vf) else [])
+                + exact_out
+                + ["-c:v", "av1_vaapi", "-rc_mode", "ICQ",
                    "-global_quality", str(q), "-f", "ivf", str(out)])
         with self._gpu_slot(f"probe encode q={q}",
                             self._est_qsv_probe_mb(w1 - w0)):
