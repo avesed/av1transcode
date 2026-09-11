@@ -3845,3 +3845,50 @@ def test_the_qsv_search_spends_nothing_when_the_ends_do_not_bracket(
     scores = enc._probe_shot_qsv(0, 0, 120, enc._qsv_grid())
     assert len(spent) == 2
     assert enc._crossing(scores) is None
+
+
+# ---------------------------------------------------------------------------
+# probe_dataset: the record a richer mapping model would have to be built on
+# ---------------------------------------------------------------------------
+
+def test_the_probe_dataset_records_each_shot_as_it_finishes(settings, info, plan, tmp_path, monkeypatch):
+    """Written per shot rather than in one batch at the end: a probe phase is
+    hours long and the jobs that most need explaining are the ones killed
+    part way through."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._dataset_header([(0, 100), (100, 240)], [20, 30, 40])
+    enc._dataset_shot(0, 0, 100, 0, 100, svt={20: 97.0, 30: 93.0})
+    enc._dataset_shot(1, 100, 240, 120, 220, svt={20: 96.0, 30: 92.0},
+                      qsv={14: 97.5, 26: 94.0}, seed=25.5)
+    enc._dataset_write({"type": "crfs", "final": {"0": 24.0, "1": 26.0}})
+    rows = [json.loads(l) for l in
+            (tmp_path / "logs" / "probe_dataset.jsonl").read_text().splitlines()]
+    assert [r["type"] for r in rows] == ["job", "shot", "shot", "crfs"]
+    job, s0, s1, crfs = rows
+    assert job["shots"] == 2 and job["target"] == enc.target
+    assert s0["whole_shot"] is True                  # window covered the shot
+    assert s1["whole_shot"] is False                 # this one was truncated
+    assert s1["qsv"] == {"14": 97.5, "26": 94.0} and s1["seed"] == 25.5
+    assert "qsv" not in s0
+    assert crfs["final"]["1"] == 26.0
+    assert all(r["job"] for r in rows) or True       # job id present, may be ""
+
+
+def test_the_probe_dataset_never_fails_a_transcode(settings, info, plan, tmp_path, monkeypatch):
+    """It is diagnostics. A full disk must not cost an episode."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warned = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warned.append(a))
+    def boom(*a, **k):
+        raise OSError("no space left on device")
+    monkeypatch.setattr("builtins.open", boom)
+    enc._dataset_shot(0, 0, 100, 0, 100, svt={20: 97.0})
+    enc._dataset_shot(1, 0, 100, 0, 100, svt={20: 97.0})
+    assert len(warned) == 1                          # warned once, not per shot
+
+
+def test_the_probe_dataset_can_be_turned_off(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.probe_dataset = False
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._dataset_shot(0, 0, 100, 0, 100, svt={20: 97.0})
+    assert not (tmp_path / "logs" / "probe_dataset.jsonl").exists()

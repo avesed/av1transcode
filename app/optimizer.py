@@ -804,6 +804,8 @@ class ShotEncoder:
         # Probe workers call it concurrently, hence the lock.
         self._sycl_ok: Optional[bool] = None
         self._sycl_lock = threading.Lock()
+        self._dataset_lock = threading.Lock()
+        self._dataset_warned = False
         nodes = _render_nodes()
         self._gpu_vram = VramBudget(self._vram_budget_mb(), self._gpu_workers(),
                                     _render_pdev(nodes[0]) if nodes else None)
@@ -851,6 +853,84 @@ class ShotEncoder:
             return
         with self._log_lock:
             self._log_handle.write(line.rstrip() + "\n")
+
+    def _dataset_path(self) -> Optional[Path]:
+        if not getattr(self.opt, "probe_dataset", False):
+            return None
+        try:
+            d = Path(self.settings.dirs.logs)
+            d.mkdir(parents=True, exist_ok=True)
+            return d / "probe_dataset.jsonl"
+        except OSError:
+            return None
+
+    def _dataset_write(self, row: Dict[str, object]) -> None:
+        """Append one record. Never lets a diagnostics file fail a transcode.
+
+        Written as each shot finishes rather than in one batch at the end,
+        because a probe phase is hours long and the jobs that most need
+        explaining are the ones that get killed part way through.
+        """
+        path = self._dataset_path()
+        if path is None:
+            return
+        row = dict(row)
+        row.setdefault("job", self.log_path.stem if self.log_path else "")
+        row.setdefault("t", round(time.time(), 3))
+        try:
+            with self._dataset_lock:
+                with open(path, "a") as fh:
+                    fh.write(json.dumps(row, separators=(",", ":"),
+                                        default=float) + "\n")
+        except OSError as e:
+            if not self._dataset_warned:
+                self._dataset_warned = True
+                logger.warning("optimizer: cannot write the probe dataset "
+                               "({}); continuing without it", e)
+
+    def _dataset_header(self, shots: List[Shot], grid: List[int]) -> None:
+        self._dataset_write({
+            "type": "job",
+            "source": self.source.name,
+            "width": self.info.width, "height": self.info.height,
+            "fps": self.info.fps, "duration": self.info.duration,
+            "src_bitrate": self.info.bitrate,
+            "codec": getattr(self.info, "codec", ""),
+            "shots": len(shots), "frames": sum(b - a for a, b in shots),
+            "metric": self.metric, "target": self.target,
+            "preset": self.video.preset, "probe_preset": self._probe_preset(),
+            "probing_rate": self._probing_rate(),
+            "probe_max_frames": self.opt.probe_max_frames,
+            "probe_grid": list(grid), "probe_encoder": self._probe_mode(),
+            "probe_scale": self._probe_scale() or "",
+            "pix_fmt": self._pix_fmt(),
+        })
+
+    def _dataset_shot(self, idx: int, s0: int, s1: int, w0: int, w1: int,
+                      svt: Dict[int, float],
+                      qsv: Optional[Dict[int, float]] = None,
+                      seed: Optional[float] = None) -> None:
+        """One shot's probes, with the features a later model might want that
+        cost nothing to record here: where the shot sits, how long it is, and
+        whether its probe window covered the whole of it."""
+        total = max(1, self._total_frames())
+        row: Dict[str, object] = {
+            "type": "shot", "idx": idx, "s0": s0, "s1": s1,
+            "frames": s1 - s0, "pos": round(s0 / total, 5),
+            "w0": w0, "w1": w1, "window": w1 - w0,
+            "whole_shot": (w1 - w0) >= (s1 - s0),
+            "svt": {str(k): v for k, v in sorted(svt.items())},
+            "crf_star": self._crossing(svt),
+        }
+        if qsv is not None:
+            row["qsv"] = {str(k): v for k, v in sorted(qsv.items())}
+            row["q_star"] = self._crossing(qsv)
+        if seed is not None:
+            row["seed"] = seed
+        self._dataset_write(row)
+
+    def _total_frames(self) -> int:
+        return int(round((self.info.duration or 0) * (self.info.fps or 0))) or 1
 
     def _mem_log(self, line: str, level: str = "info") -> None:
         """Memory diagnostics: always written to the job log file; console
@@ -2537,6 +2617,9 @@ class ShotEncoder:
 
         def on_done(idx: int, result: object) -> None:
             results[idx] = result           # type: ignore[assignment]
+            s0, s1 = shots[idx]
+            self._dataset_shot(idx, s0, s1, *self._probe_window(s0, s1),
+                               svt=result)  # type: ignore[arg-type]
 
         def progress(done: int) -> None:
             self._report(done / max(len(shots), 1) * 100, done, len(shots))
@@ -3073,7 +3156,7 @@ class ShotEncoder:
 
         def run_one(idx: int, lp: int, _slot: int, _threads: int) -> object:
             s0, s1 = shots[idx]
-            q_star = None
+            q_star, qs = None, None
             try:
                 qs = self._probe_shot_qsv(idx, s0, s1, qgrid)
                 with lock:
@@ -3102,6 +3185,9 @@ class ShotEncoder:
                     idx, s0, s1, grid, lp, seed,
                     self._verify_step(float(fit["sd"])))
             crf_star = self._crossing(scores)
+            self._dataset_shot(idx, s0, s1, *self._probe_window(s0, s1),
+                               svt=scores, qsv=qs if q_star is not None else None,
+                               seed=seed)
             with lock:
                 samples[idx] = scores
                 if seed is not None:
@@ -4439,6 +4525,7 @@ class ShotEncoder:
             self._report(0.0, 0, len(shots))  # surface the shot count to the UI
             grid = self._probe_grid()
             mode = self._probe_mode()
+            self._dataset_header(shots, grid)
             if mode == "qsv":
                 samples, chosen = self.probe_all_gpu(shots, grid)
             else:
@@ -4453,6 +4540,10 @@ class ShotEncoder:
                 chosen = self.smooth_chosen(chosen)
             crf_line = ", ".join(f"{i}:{chosen[i]:g}" for i in sorted(chosen))
             self._log(f"chosen per-shot CRFs -> {crf_line}")
+            # the training target, after smoothing: what each shot is really
+            # encoded at, which is not always what its own probes picked
+            self._dataset_write({"type": "crfs",
+                                 "final": {str(i): chosen[i] for i in sorted(chosen)}})
 
             self._stage("encoding", 0.0)
             ivf_paths = self.encode_all(shots, chosen)

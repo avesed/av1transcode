@@ -345,6 +345,7 @@ const GPU_FIELDS = [
   F("vmaf_sycl_device", "VMAF 打分设备", "用 libvmaf 的 SYCL 后端在 GPU 上打分。关闭 = CPU。作业开始时会先自检一次，设备不可用则整个作业退回 CPU。", { type: "sycl" }),
   F("vmaf_sycl_min_width", "GPU 打分的最小宽度", "源窄于此仍用 CPU：GPU 的收益随帧大小增长，1080p 上 CPU 本来就只要两秒。", { min: 0, max: 7680, unit: "px" }),
   F("scenedetect_hwaccel", "分镜解码", "auto = 有 QSV 就用它解码分镜那一趟；off = 一律软解。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
+  F("probe_dataset", "记录探测数据集", "每探测完一个镜头往 <logs>/probe_dataset.jsonl 追加一行：镜头几何、探到的 (crf, 分数) 点、(q, 分数) 点、两个交点、最终 CRF。一集约 160 行。QSV→SVT 那条映射线的残差是关系本身而不是估计误差（104 对样本时已在渐近值 0.5% 以内），要改善只能靠更丰富的模型，而那需要跨集累积数据——不记录就永久损失。", { type: "checkbox" }),
   F("gpu_vram_budget_mb", "显存预算 (MB)", "本作业最多占用显卡多少显存，0 = 自动（6000）。worker 数管并发个数，这个管字节数——显卡耗尽的是后者。占用量用 DRM fdinfo 实测，但只看得见本容器的进程，Plex 的那份看不到，所以默认给 12GB 的卡留了一半。", { min: 0, max: 65536 }),
   F("vmaf_sycl_workers", "GPU 打分并发上限", "同时最多几个探测在 GPU 上打分，0 = 自动（6）。显卡只有一块显存：各 10 个 SYCL 上下文 + VA-API 解码会话曾把 B580 撑爆并弄坏设备。加宽也没用，实测吞吐 4 个就到顶。", { min: 0, max: 32 }),
   F("reference_hwaccel", "打分参考解码", "探测打分和验证时读源片的那一路是否用 GPU（VA-API）解码。默认 off：40 核实测它反而更慢（探测 401s→448s），只有 CPU 是瓶颈的机器才值得开（20 核上 826s→592s）。auto = 作业开始先各解 8 帧（带定位）做软解/硬解逐帧对比，不一致整个作业软解。用 VA-API 不用 QSV：QSV 解码器定位后保留的帧在部分源上和软解不同（像素一致、帧全错），VA-API 只给 ffmpeg 自带解码器加速，选帧和软解一样。只放这一路上 GPU：4K 帧回传 CPU 约 130 帧/秒封顶，探测池本来就吃到这个量。实测每次打分省 44% CPU、墙钟 -12%，分数不变。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),

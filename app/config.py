@@ -408,6 +408,25 @@ class OptimizerSettings(BaseModel):
     # default leaves half the 12GB card unbooked rather than trying to
     # measure the other tenant. Raise it only on a card nothing else uses.
     gpu_vram_budget_mb: int = 0
+    # Append one JSON line per probed shot to <logs>/probe_dataset.jsonl:
+    # the shot's geometry, the probed (crf, score) points, the (q, score)
+    # points when the card probed it too, both crossings, and the CRF the
+    # job ended up encoding it at.
+    #
+    # It exists because the fit that maps one encoder's quality index to the
+    # other's CRF is stuck at a residual no amount of per-job data will
+    # improve: measured on a 163-shot episode, a two-parameter line is
+    # already within 0.5% of its asymptote at 104 pairs (sqrt(1+1/n)), so the
+    # 4.14 CRF it carries is the RELATIONSHIP, not the estimate. What could
+    # improve it is a richer model - and on the same episode 94% of shots are
+    # probed whole rather than sampled, which means that residual is content
+    # structure a model could learn rather than measurement noise it cannot.
+    #
+    # A richer model needs more than one episode's 160 pairs, and every
+    # episode that runs without recording them loses them for good. 160 lines
+    # an episode is nothing to keep; this is the cheapest possible insurance
+    # against wanting the data later.
+    probe_dataset: bool = True
     # ---- the GPU probe path (opt-in, additive; "svt" leaves it switched off) ----
     # Which encoder the PROBES use. "svt" is the path everything above
     # describes. "qsv" probes on the card instead - VA-API decode into the
