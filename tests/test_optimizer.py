@@ -1,4 +1,5 @@
 import json
+import math
 import shutil
 import sys
 import threading
@@ -3354,7 +3355,8 @@ def test_gpu_probe_maps_the_bulk_and_keeps_anchor_samples(settings, info, plan, 
     monkeypatch.setattr(enc, "_probe_shot",
                         lambda idx, s0, s1, g, lp: _curve(grid, crf_of(idx), enc.target))
     monkeypatch.setattr(enc, "_probe_shot_qsv",
-                        lambda idx, s0, s1, qg: _curve(qgrid, q_of(idx), enc.target))
+                        lambda idx, s0, s1, qg: (_curve(qgrid, q_of(idx), enc.target),
+                                                 {max(qgrid): 100.0 + q_of(idx)}))
     samples, chosen = enc.probe_all_gpu(shots, grid)
     assert len(chosen) == len(shots)                      # every shot got a CRF
     assert len(samples) == 6                              # only the anchors cost an SVT probe
@@ -3375,7 +3377,8 @@ def test_gpu_probe_gives_up_on_the_whole_job_when_the_line_does_not_hold(
     monkeypatch.setattr(enc, "_probe_shot",
                         lambda idx, s0, s1, g, lp: _curve(grid, 21.0 + (idx * 7 % 11), enc.target))
     monkeypatch.setattr(enc, "_probe_shot_qsv",
-                        lambda idx, s0, s1, qg: _curve(qgrid, 16.0 + (idx * 3 % 7), enc.target))
+                        lambda idx, s0, s1, qg: (_curve(qgrid, 16.0 + (idx * 3 % 7), enc.target),
+                                                 {max(qgrid): 100.0}))
     called = []
     real_all = enc.probe_all
     monkeypatch.setattr(enc, "probe_all", lambda sh, g: (called.append(len(sh)),
@@ -3405,7 +3408,8 @@ def test_gpu_probe_abstains_shot_by_shot_outside_the_calibrated_range(
 
     monkeypatch.setattr(enc, "_probe_shot", fake_svt)
     monkeypatch.setattr(enc, "_probe_shot_qsv",
-                        lambda idx, s0, s1, qg: _curve(qgrid, 34.0 if idx == odd else q_of(idx), enc.target))
+                        lambda idx, s0, s1, qg: (_curve(qgrid, 34.0 if idx == odd else q_of(idx),
+                                                        enc.target), {max(qgrid): 100.0}))
     samples, chosen = enc.probe_all_gpu(shots, grid)
     assert odd in svt_probed and odd in samples           # abstained, probed properly
     assert len(chosen) == len(shots)
@@ -3710,7 +3714,8 @@ def test_verified_probing_never_takes_its_answer_from_the_map(
     _plant_svt(enc, monkeypatch, crf_of, probed)
     # q* maps to a CRF 10 too high through any line fitted on these pairs
     monkeypatch.setattr(enc, "_probe_shot_qsv",
-                        lambda idx, s0, s1, qg: _curve(qgrid, 20.0, enc.target))
+                        lambda idx, s0, s1, qg: (_curve(qgrid, 20.0, enc.target),
+                                                 {max(qgrid): 100.0 + (idx % 5)}))
     samples = enc.probe_all_verified(shots, grid)
     chosen = enc.pick_all_crfs(samples, grid)
     assert len(chosen) == len(shots)
@@ -3729,7 +3734,8 @@ def test_verified_probing_seeds_from_the_line_once_it_has_learned_one(
     q_of = lambda i: (crf_of(i) + 14.0) / 2.0
     seeded, plain = [], []
     monkeypatch.setattr(enc, "_probe_shot_qsv",
-                        lambda idx, s0, s1, qg: _curve(qgrid, q_of(idx), enc.target))
+                        lambda idx, s0, s1, qg: (_curve(qgrid, q_of(idx), enc.target),
+                                                 {max(qgrid): 100.0 + q_of(idx)}))
     monkeypatch.setattr(enc, "_probe_shot",
                         lambda idx, s0, s1, g, lp: (plain.append(idx),
                                                     _curve(grid, crf_of(idx), enc.target))[1])
@@ -3757,8 +3763,8 @@ def test_verified_probing_falls_back_to_the_grid_when_the_line_is_useless(
     truth = {i: 20.0 + rnd.random() * 28 for i in range(len(shots))}
     crf_of = truth.__getitem__            # no relation to q at all
     monkeypatch.setattr(enc, "_probe_shot_qsv",
-                        lambda idx, s0, s1, qg: _curve(qgrid, 20.0 + (idx % 7),
-                                                       enc.target))
+                        lambda idx, s0, s1, qg: (_curve(qgrid, 20.0 + (idx % 7), enc.target),
+                                                 {max(qgrid): 100.0 + (idx % 3)}))
     seeded, plain = [], []
     monkeypatch.setattr(enc, "_probe_shot",
                         lambda idx, s0, s1, g, lp: (plain.append(idx),
@@ -3805,11 +3811,13 @@ def test_the_first_fit_does_not_land_on_the_minimum_sample(settings, info, plan,
     the threshold, so nothing was seeded for the next 25 pairs - while the
     same content fitted to 4.14 over 104."""
     enc = make_encoder(settings, info, plan, tmp_path)
-    pairs = [(float(q), 2.0 * q + 3.0) for q in range(14, 40, 2)]
+    pairs = [(float(q), 5.0 + 0.1 * q, 2.0 * q + 3.0) for q in range(14, 40, 2)]
     assert enc._refit_verified(pairs[:4]) is None
     assert enc._refit_verified(pairs[:enc._VERIFY_MIN_PAIRS - 1]) is None
     fit = enc._refit_verified(pairs[:enc._VERIFY_MIN_PAIRS])
-    assert fit is not None and fit["a"] == pytest.approx(2.0)
+    assert fit is not None
+    # q and log(bytes) are collinear here, so only the prediction is defined
+    assert enc._predict_crf(fit, 20.0, 7.0, [18, 50]) == pytest.approx(43.0, abs=0.1)
 
 
 def test_the_qsv_search_stops_at_the_mapping_s_tolerance(settings, info, plan, tmp_path, monkeypatch):
@@ -3824,10 +3832,11 @@ def test_the_qsv_search_stops_at_the_mapping_s_tolerance(settings, info, plan, t
     # a convex curve crossing the target at q = 24.5
     def fake(idx, w0, w1, q):
         spent.append(q)
-        return enc.target + (24.5 - q) * (1.0 + (38 - q) * 0.02)
+        return enc.target + (24.5 - q) * (1.0 + (38 - q) * 0.02), 100.0 - q
     monkeypatch.setattr(enc, "_qsv_score", fake)
     monkeypatch.setattr(enc, "_probe_window", lambda a, b: (a, b))
-    scores = enc._probe_shot_qsv(0, 0, 120, qgrid)
+    scores, bpf = enc._probe_shot_qsv(0, 0, 120, qgrid)
+    assert set(bpf) == set(spent)                     # bytes recorded for each
     assert spent[:2] == [min(qgrid), max(qgrid)]      # the ends come first
     assert len(spent) == 3                            # and exactly one more
     assert abs(enc._crossing(scores) - 24.5) <= 2.8   # inside the tolerance
@@ -3840,9 +3849,9 @@ def test_the_qsv_search_spends_nothing_when_the_ends_do_not_bracket(
     spent = []
     monkeypatch.setattr(enc, "_qsv_score",
                         lambda idx, w0, w1, q: (spent.append(q),
-                                                enc.target - 5.0)[1])
+                                                (enc.target - 5.0, 42.0))[1])
     monkeypatch.setattr(enc, "_probe_window", lambda a, b: (a, b))
-    scores = enc._probe_shot_qsv(0, 0, 120, enc._qsv_grid())
+    scores, _ = enc._probe_shot_qsv(0, 0, 120, enc._qsv_grid())
     assert len(spent) == 2
     assert enc._crossing(scores) is None
 
@@ -3892,3 +3901,54 @@ def test_the_probe_dataset_can_be_turned_off(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
     enc._dataset_shot(0, 0, 100, 0, 100, svt={20: 97.0})
     assert not (tmp_path / "logs" / "probe_dataset.jsonl").exists()
+
+
+def test_the_mapping_uses_what_the_probe_cost_as_well_as_where_it_crossed(
+        settings, info, plan, tmp_path):
+    """Measured on a 163-shot 4K episode: the crossing alone leaves 4.53 CRF
+    of leave-one-out residual (35% of a 5.61 spread), and it is not noise -
+    94% of those shots were probed whole, and refitting the crossings with a
+    curve model instead of linear interpolation did not move it. Adding log
+    bytes per frame at the high-q end takes it to 2.72 CRF and 77%, and the
+    bytes are free: the probe writes the file either way."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    # a plane the crossing alone cannot describe: two shots share a q* but
+    # differ by 8 CRF, and only the bytes tell them apart
+    pairs = []
+    for k in range(20):
+        q = 20.0 + (k % 5)
+        lb = 5.0 + (k % 4) * 0.5
+        pairs.append((q, lb, 1.5 * q + 4.0 * lb - 10.0))
+    fit = enc._refit_verified(pairs)
+    assert fit is not None
+    assert fit["sd"] < 0.01                       # the plane fits exactly
+    grid = [18, 50]
+    a = enc._predict_crf(fit, 22.0, 5.0, grid)    # 43.0
+    b = enc._predict_crf(fit, 22.0, 6.0, grid)    # 47.0, still inside the grid
+    assert b - a == pytest.approx(4.0, abs=0.1)   # same crossing, 4 CRF apart
+    # and the prediction is still clamped to the grid it will probe in
+    assert enc._predict_crf(fit, 22.0, 9.0, grid) == 50.0
+
+
+def test_one_freak_shot_cannot_tilt_the_plane(settings, info, plan, tmp_path):
+    """Least squares replaced Theil-Sen when the fit went to two features, so
+    the robustness has to come from somewhere: one pass that drops what sits
+    beyond three residual deviations and refits."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    pairs = [(20.0 + (k % 7), 5.0 + (k % 3) * 0.4, 1.5 * (20.0 + (k % 7)) + 2.0)
+             for k in range(30)]
+    clean = enc._refit_verified(pairs)
+    pairs.append((21.0, 5.4, 400.0))              # one absurd shot
+    dirty = enc._refit_verified(pairs)
+    assert dirty["sd"] < 1.0                      # the outlier was dropped
+    assert enc._predict_crf(dirty, 22.0, 5.4, [18, 50]) == pytest.approx(
+        enc._predict_crf(clean, 22.0, 5.4, [18, 50]), abs=0.5)
+
+
+def test_the_bytes_come_from_the_high_q_end(settings, info, plan, tmp_path):
+    """The bit-starved end discriminated content better: 2.72 CRF against
+    2.87 when both ends were measured as the second feature."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._log_bpf({14: 2000.0, 38: 100.0}) == pytest.approx(math.log(100.0))
+    assert enc._log_bpf({}) is None
+    assert enc._log_bpf({38: 0.0}) is None

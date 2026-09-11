@@ -909,6 +909,7 @@ class ShotEncoder:
     def _dataset_shot(self, idx: int, s0: int, s1: int, w0: int, w1: int,
                       svt: Dict[int, float],
                       qsv: Optional[Dict[int, float]] = None,
+                      qsv_bpf: Optional[Dict[int, float]] = None,
                       seed: Optional[float] = None) -> None:
         """One shot's probes, with the features a later model might want that
         cost nothing to record here: where the shot sits, how long it is, and
@@ -925,6 +926,8 @@ class ShotEncoder:
         if qsv is not None:
             row["qsv"] = {str(k): v for k, v in sorted(qsv.items())}
             row["q_star"] = self._crossing(qsv)
+        if qsv_bpf:
+            row["qsv_bpf"] = {str(k): v for k, v in sorted(qsv_bpf.items())}
         if seed is not None:
             row["seed"] = seed
         self._dataset_write(row)
@@ -2795,7 +2798,7 @@ class ShotEncoder:
             self._run(args, timeout=3600)
 
     def _probe_shot_qsv(self, idx: int, s0: int, s1: int,
-                        qgrid: List[int]) -> Dict[int, float]:
+                        qgrid: List[int]) -> Tuple[Dict[int, float], Dict[int, float]]:
         """Find where the QSV curve crosses the target: both ends, then one
         interpolated point between them.
 
@@ -2823,23 +2826,42 @@ class ShotEncoder:
         self._check_cancel()
         w0, w1 = self._probe_window(s0, s1)
         lo, hi = min(qgrid), max(qgrid)
-        scores: Dict[int, float] = {lo: self._qsv_score(idx, w0, w1, lo)}
-        self._check_cancel()
-        scores[hi] = self._qsv_score(idx, w0, w1, hi)
+        scores: Dict[int, float] = {}
+        bpf: Dict[int, float] = {}
+        def one(q: int) -> None:
+            self._check_cancel()
+            scores[q], bpf[q] = self._qsv_score(idx, w0, w1, q)
+        one(lo)
+        one(hi)
         if bracket_for(list(scores.items()), self.target) is None:
-            return scores            # the target is outside the grid entirely
-        self._check_cancel()
+            return scores, bpf       # the target is outside the grid entirely
         mid = int(round(pick_crf(list(scores.items()), self.target)))
         mid = min(hi - 1, max(lo + 1, mid))
         if mid not in scores:
-            scores[mid] = self._qsv_score(idx, w0, w1, mid)
-        return scores
+            one(mid)
+        return scores, bpf
 
-    def _qsv_score(self, idx: int, w0: int, w1: int, q: int) -> float:
+    def _qsv_score(self, idx: int, w0: int, w1: int, q: int) -> Tuple[float, float]:
+        """Score one QSV probe, and report what it cost in bytes per frame.
+
+        The bytes are free - the probe writes the file either way - and they
+        are the single most valuable thing the card produces after the score
+        itself. Measured on a 163-shot 4K episode, predicting the SVT CRF
+        from the crossing alone leaves a leave-one-out residual of 4.53 CRF
+        (35% of the variance); adding the bytes per frame at the high-q end
+        takes it to 2.72 (77%). The two carry different information: the
+        crossing says where the curve meets the target, the bytes say what
+        the encoder had to spend to get there.
+        """
         ivf = self.probe_dir / f"gpuprobe_{idx:05d}_{q}.ivf"
         self._qsv_probe_encode(w0, w1, q, ivf)
         try:
-            return self._score_probe(w0, w1, ivf, idx, q)
+            size = ivf.stat().st_size
+        except OSError:
+            size = 0
+        frames = max(1, (w1 - w0) // self._probing_rate())
+        try:
+            return self._score_probe(w0, w1, ivf, idx, q), size / frames
         finally:
             if not self.opt.keep_probes:
                 try:
@@ -2912,7 +2934,7 @@ class ShotEncoder:
             s0, s1 = shots[idx]
             svt = self._probe_shot(idx, s0, s1, grid, lp)
             crf_star = self._crossing(svt)
-            qs = self._probe_shot_qsv(idx, s0, s1, qgrid)
+            qs, _ = self._probe_shot_qsv(idx, s0, s1, qgrid)
             q_star = self._crossing(qs)
             with lock:
                 samples[idx] = svt
@@ -2941,7 +2963,7 @@ class ShotEncoder:
 
         def bulk_one(idx: int, lp: int, _slot: int, _threads: int) -> object:
             s0, s1 = shots[idx]
-            q_star = self._crossing(self._probe_shot_qsv(idx, s0, s1, qgrid))
+            q_star = self._crossing(self._probe_shot_qsv(idx, s0, s1, qgrid)[0])
             if q_star is not None and fit["q_lo"] <= q_star <= fit["q_hi"]:
                 with lock:
                     mapped[idx] = self._map_crf(q_star, fit, grid)
@@ -3105,25 +3127,91 @@ class ShotEncoder:
         finally:
             self._release_shard(idx)
 
-    def _refit_verified(self, pairs: List[Tuple[float, float]]
-                        ) -> Optional[Dict[str, float]]:
-        """Refit the q -> CRF line on what has been verified so far.
+    @staticmethod
+    def _lstsq(X: List[List[float]], y: List[float]) -> List[float]:
+        """Normal equations with partial pivoting. Three columns at most, so
+        the numerics are not worth a dependency."""
+        n, m = len(X), len(X[0])
+        S = [[sum(X[i][a] * X[i][b] for i in range(n)) for b in range(m)]
+             + [sum(X[i][a] * y[i] for i in range(n))] for a in range(m)]
+        for c in range(m):
+            piv = max(range(c, m), key=lambda r: abs(S[r][c]))
+            S[c], S[piv] = S[piv], S[c]
+            if abs(S[c][c]) < 1e-12:
+                continue
+            for r in range(m):
+                if r != c:
+                    f = S[r][c] / S[c][c]
+                    for k in range(m + 1):
+                        S[r][k] -= f * S[c][k]
+        return [S[i][m] / S[i][i] if abs(S[i][i]) > 1e-12 else 0.0
+                for i in range(m)]
 
-        Theil-Sen for the same reason _fit_gpu_map uses it - one easy shot
-        whose target CRF sits far above the bulk would tilt a least-squares
-        line for every other shot - and the residual spread is reported in
-        sample, not leave-one-out: LOO on hundreds of pairs is quadratic on
-        top of a quadratic fit, and here the number only sizes a probe step.
-        In-sample is optimistic, which _verify_step's 1.5 multiplier and
-        floor of 2 already allow for.
+    @staticmethod
+    def _design(pairs: List[Tuple[float, float, float]]) -> List[List[float]]:
+        return [[1.0, q, bpf] for q, bpf, _ in pairs]
+
+    def _refit_verified(self, pairs: List[Tuple[float, float, float]]
+                        ) -> Optional[Dict[str, object]]:
+        """Refit CRF from the QSV crossing AND what the probe cost in bytes.
+
+        The crossing alone is a poor predictor and no amount of data fixes
+        it: on a 163-shot 4K episode a line through the crossings left a
+        leave-one-out residual of 4.53 CRF against a target whose own spread
+        is 5.61, i.e. 35% of the variance. That residual is not measurement
+        noise - 94% of those shots were probed WHOLE, and refitting the
+        crossings with a curve model instead of linear interpolation did not
+        move it (4.58) - it is a real, content-dependent difference between
+        how the two encoders respond, which is exactly the kind of thing
+        another feature can carry.
+
+        Adding log bytes per frame at the high-q end of the probe takes it to
+        2.72 CRF and 77% of the variance, and it costs nothing: the probe
+        writes the file anyway, and false position always probes both ends,
+        so that q is the same for every shot. Forward selection over shot
+        length, timeline position, the QSV curve's level and slope, and
+        whether the window covered the whole shot rejected all of them; the
+        bytes were the only feature that paid.
+
+        Least squares rather than the Theil-Sen the one-feature fit used,
+        with one robustness pass instead: drop what sits beyond three
+        residual deviations and refit, so a single freak shot cannot tilt the
+        plane for the rest of the job.
         """
         if len(pairs) < self._VERIFY_MIN_PAIRS:
             return None
         recent = pairs[-self._VERIFY_FIT_WINDOW:]
-        a, b = self._theil_sen(recent)
-        res = [c - (a * q + b) for q, c in recent]
+        X, y = self._design(recent), [c for _, _, c in recent]
+        beta = self._lstsq(X, y)
+        res = [y[i] - sum(beta[j] * X[i][j] for j in range(len(beta)))
+               for i in range(len(X))]
         sd = statistics.stdev(res) if len(res) > 1 else 0.0
-        return {"a": a, "b": b, "sd": sd, "n": len(recent)}
+        if sd > 0:
+            keep = [k for k in range(len(recent)) if abs(res[k]) <= 3 * sd]
+            if self._VERIFY_MIN_PAIRS <= len(keep) < len(recent):
+                X2 = [X[k] for k in keep]
+                y2 = [y[k] for k in keep]
+                beta = self._lstsq(X2, y2)
+                res = [y2[i] - sum(beta[j] * X2[i][j] for j in range(len(beta)))
+                       for i in range(len(X2))]
+                sd = statistics.stdev(res) if len(res) > 1 else sd
+        return {"beta": beta, "sd": sd, "n": len(recent)}
+
+    def _predict_crf(self, fit: Dict[str, object], q: float, bpf: float,
+                     grid: List[int]) -> float:
+        beta = fit["beta"]                      # type: ignore[index]
+        crf = beta[0] + beta[1] * q + beta[2] * bpf
+        return min(float(max(grid)), max(self._crf_floor(min(grid)), crf))
+
+    @staticmethod
+    def _log_bpf(bpf: Optional[Dict[int, float]]) -> Optional[float]:
+        """log bytes per frame at the highest q probed - the bit-starved end,
+        which discriminated content better than the low-q end (2.72 CRF
+        against 2.87 when both were measured)."""
+        if not bpf:
+            return None
+        v = bpf[max(bpf)]
+        return math.log(v) if v > 0 else None
 
     def probe_all_verified(self, shots: List[Shot],
                            grid: List[int]) -> ProbeSamples:
@@ -3142,7 +3230,7 @@ class ShotEncoder:
         # phase.
         seeds = set(self._gpu_anchor_indices(shots))
         samples: ProbeSamples = {}
-        pairs: List[Tuple[float, float]] = []
+        pairs: List[Tuple[float, float, float]] = []   # q*, log bytes/frame, crf*
         state: Dict[str, object] = {"fit": None, "since": 0, "warned": False,
                                     "seeded": 0, "walked": 0}
         qsv_spent = [0]
@@ -3156,9 +3244,9 @@ class ShotEncoder:
 
         def run_one(idx: int, lp: int, _slot: int, _threads: int) -> object:
             s0, s1 = shots[idx]
-            q_star, qs = None, None
+            q_star, qs, bpf = None, None, None
             try:
-                qs = self._probe_shot_qsv(idx, s0, s1, qgrid)
+                qs, bpf = self._probe_shot_qsv(idx, s0, s1, qgrid)
                 with lock:
                     qsv_spent[0] += len(qs)
                 q_star = self._crossing(qs)
@@ -3168,16 +3256,14 @@ class ShotEncoder:
                 self._log(f"qsv prediction failed for shot {idx:05d}: {e}")
             with lock:
                 fit = state["fit"]
+            lb = self._log_bpf(bpf)
             seed = None
-            if q_star is not None and fit and idx not in seeds \
+            if q_star is not None and lb is not None and fit and idx not in seeds \
                     and fit["sd"] <= self._verify_max_sd(grid):
-                # the raw line, NOT _map_crf: probe_crf_offset corrects the
-                # delivered CRF and pick_all_crfs already applies it at the
-                # end, so adding it here would shift where we probe by a
-                # correction that gets made again downstream
-                seed = min(float(max(grid)),
-                           max(self._crf_floor(min(grid)),
-                               fit["a"] * q_star + fit["b"]))
+                # no probe_crf_offset here: that corrects the DELIVERED crf
+                # and pick_all_crfs applies it at the end, so adding it would
+                # shift where we probe by a correction made again downstream
+                seed = self._predict_crf(fit, q_star, lb, grid)
             if seed is None:
                 scores = self._probe_shot(idx, s0, s1, grid, lp)
             else:
@@ -3187,7 +3273,7 @@ class ShotEncoder:
             crf_star = self._crossing(scores)
             self._dataset_shot(idx, s0, s1, *self._probe_window(s0, s1),
                                svt=scores, qsv=qs if q_star is not None else None,
-                               seed=seed)
+                               qsv_bpf=bpf, seed=seed)
             with lock:
                 samples[idx] = scores
                 if seed is not None:
@@ -3197,8 +3283,8 @@ class ShotEncoder:
                             (1 if abs(crf_star - seed) > self._verify_step(
                                 float(fit["sd"])) else 0)
                 snapshot = None
-                if q_star is not None and crf_star is not None:
-                    pairs.append((q_star, crf_star))
+                if q_star is not None and lb is not None and crf_star is not None:
+                    pairs.append((q_star, lb, crf_star))
                     state["since"] = int(state["since"]) + 1
                     cur = state["fit"]
                     usable = bool(cur) and cur["sd"] <= self._verify_max_sd(grid)
@@ -3246,12 +3332,13 @@ class ShotEncoder:
 
         fit = state["fit"]
         if fit:
+            b = fit["beta"]
             self._mem_log(
                 "verified gpu probing: {} of {} shot(s) seeded from "
-                "CRF = {:.2f}q {:+.2f} (residual {:.2f} CRF over {} pairs), "
-                "{} needed more than one step to bracket".format(
-                    state["seeded"], len(shots), fit["a"], fit["b"],
-                    fit["sd"], fit["n"], state["walked"]))
+                "CRF = {:.2f}q {:+.2f}log(bytes/frame) {:+.2f} (residual "
+                "{:.2f} CRF over {} pairs), {} needed more than one step to "
+                "bracket".format(state["seeded"], len(shots), b[1], b[2], b[0],
+                                 fit["sd"], fit["n"], state["walked"]))
         else:
             self._mem_log("verified gpu probing: the line never fitted; every "
                           "shot probed from the grid")
