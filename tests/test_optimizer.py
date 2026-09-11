@@ -3567,6 +3567,29 @@ def test_vram_calibration_pulls_the_model_towards_the_measurement():
     assert b._ratio > 1.5
 
 
+def test_vram_calibration_measures_the_peak_not_a_quiet_moment():
+    """A SYCL context allocates a second or two after its ffmpeg starts, so
+    most samples catch operations mid-ramp. Dividing an instantaneous reading
+    by the reservation pulled the model to its floor on a real episode - a
+    quarter of an estimate that run showed was already 21% low."""
+    used = {"mb": 1200.0}
+    b = opt.VramBudget(100000, max_ops=6, measure=lambda: used["mb"])
+    b.reserve(400, 0.0)                    # three ops, 1200MB estimated
+    b.reserve(400, 0.0)
+    b.reserve(400, 0.0)
+    for _ in range(200):                   # the busy sample: usage matches
+        b._calibrated_at = 0.0
+        b._measured_at = 0.0
+        b.calibrate()
+    assert b._ratio == pytest.approx(1.0, abs=0.05)
+    used["mb"] = 50.0                      # now everything is mid-ramp
+    for _ in range(200):
+        b._calibrated_at = 0.0
+        b._measured_at = 0.0
+        b.calibrate()
+    assert b._ratio == pytest.approx(1.0, abs=0.05)   # the worst case rules
+
+
 def test_vram_calibration_ignores_an_idle_card():
     """Nothing in flight says nothing about the size of an operation."""
     b = opt.VramBudget(100000, max_ops=6, measure=lambda: 0.0)

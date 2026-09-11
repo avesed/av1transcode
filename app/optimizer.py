@@ -601,6 +601,10 @@ class VramBudget:
         self._measured = 0.0
         self._measured_at = 0.0
         self._peak = 0.0
+        # worst megabytes-actually-held per megabyte-estimated seen so far.
+        # Keyed on the reservation rather than on the peak reading, because
+        # the largest reading can land at a moment with nothing booked.
+        self._worst = 0.0
         self._readable: Optional[bool] = None
         # model correction, in the shape MemCalibration uses for RSS: the
         # ratio of what operations really cost to what they were estimated at
@@ -630,6 +634,8 @@ class VramBudget:
         self._readable = True
         self._measured = mb
         self._peak = max(self._peak, mb)
+        if self._reserved > 0:
+            self._worst = max(self._worst, mb / (self._reserved / self._ratio))
         return mb
 
     @property
@@ -687,13 +693,26 @@ class VramBudget:
 
     # -- calibration ---------------------------------------------------
     def calibrate(self) -> None:
-        """Pull the model towards what the card actually holds.
+        """Pull the model towards what the card actually holds AT ITS PEAK.
 
-        Only while something is in flight and only from a reading that is
-        larger than nothing - an empty card says nothing about the size of an
-        operation. The correction is deliberately slow (a twentieth of the
-        gap per sample) because the measurement is instantaneous and an
-        operation's footprint is not flat over its life.
+        The instantaneous reading is the wrong number to divide by the
+        reservation, and measuring said so: a SYCL context does not allocate
+        until libvmaf has initialised the device a second or two into the
+        run, and a 120-frame 4K score is over in a few seconds, so most
+        samples catch operations mid-ramp. On a 163-shot episode that pulled
+        the model to its floor, x0.25 - a quarter of an estimate that the
+        same run showed was already 21% LOW (peak 3967MB over six concurrent
+        scores is 661MB each against an estimate of 524MB). Only the
+        operation-count cap stopped that from over-admitting, which is not a
+        safety margin to rely on.
+
+        So the target is the WORST megabytes-held per megabyte-booked seen so
+        far, not the latest one. That is the case admission has to be sized
+        for, and no quiet moment can drag it down. Keyed on the reservation
+        rather than on the largest reading, because the largest reading can
+        land at a moment with nothing booked at all. The approach stays slow
+        - a twentieth of the gap per sample - and the floor is no longer low
+        enough to matter.
         """
         now = time.monotonic()
         with self._cv:
@@ -702,15 +721,12 @@ class VramBudget:
             if now - self._calibrated_at < self._CALIBRATE_EVERY_S:
                 return
             self._calibrated_at = now
-        mb = self.measured_mb(force=True)
-        if mb <= 0:
-            return
+        self.measured_mb(force=True)
         with self._cv:
-            if self._ops <= 0 or self._reserved <= 0:
+            if self._worst <= 0:
                 return
-            want = mb / (self._reserved / self._ratio)
-            self._ratio += (want - self._ratio) / 20.0
-            self._ratio = min(4.0, max(0.25, self._ratio))
+            self._ratio += (self._worst - self._ratio) / 20.0
+            self._ratio = min(4.0, max(0.5, self._ratio))
             self._samples += 1
 
     def summary(self) -> str:
@@ -3531,8 +3547,10 @@ class ShotEncoder:
         v = float(self.opt.gpu_vram_budget_mb or 0)
         return v if v > 0 else self._VRAM_BUDGET_AUTO_MB
 
-    # Per megapixel, from the fdinfo measurement behind _gpu_workers: one 4K
-    # SYCL score is one DRM client at ~440MB (~55MB per megapixel), and with
+    # Per megapixel. The figure behind _gpu_workers - one 4K score, one DRM
+    # client, ~440MB - was read off a run whose windows were shorter; a
+    # 163-shot episode of 3840x2160 peaked at 3967MB over six concurrent
+    # scores, which is 661MB each, or 80MB per megapixel. With
     # reference_hwaccel on a VA-API decode session with its own surface pool
     # sits beside it for about as much again.
     #
@@ -3541,7 +3559,7 @@ class ShotEncoder:
     # per-client figure did not move with it; if that turns out to be wrong
     # on some other content, `calibrate` corrects the model from what the
     # card actually holds rather than waiting for someone to remeasure.
-    _VRAM_MB_PER_MPX = 55.0
+    _VRAM_MB_PER_MPX = 80.0
     # Over-booking leaves the card idle; under-booking is what turns into
     # OUT_OF_DEVICE_MEMORY and then a device that needs a reboot, so the
     # estimate is biased the safe way.
