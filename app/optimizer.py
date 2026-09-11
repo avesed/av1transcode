@@ -2713,26 +2713,37 @@ class ShotEncoder:
 
     def _probe_shot_qsv(self, idx: int, s0: int, s1: int,
                         qgrid: List[int]) -> Dict[int, float]:
-        """The same bisection _probe_shot runs, on the QSV quality index.
+        """Find where the QSV curve crosses the target: both ends, then one
+        interpolated point between them.
 
-        Deliberately a separate function rather than a parameter on the SVT
-        one: this path is opt-in and must not be able to change the behaviour
-        of the path everything has been validated against.
+        NOT the bisection the SVT path runs, and deliberately so. There the
+        probed CRF is the answer, so the bracket has to be narrow enough to
+        interpolate inside. Here q* is only fed to a fitted line, and that
+        line carries its own residual - 4.14 CRF measured on a 163-shot 4K
+        episode at target 96-97, against a slope of 1.46 CRF per q. So q*
+        is worth knowing to about +-2.8 q and no better: everything past
+        that is spent on precision the mapping throws away. Bisecting to a
+        bracket of 6 cost 3.84 probes a shot on that episode; false position
+        gets inside the same tolerance in three.
+
+        Three rather than two because the curve is convex over a span this
+        wide: the ends alone place the crossing by a straight line drawn
+        across the whole grid, and the third probe is what corrects for the
+        bend. If the ends do not bracket the target at all there is no
+        crossing to find and no third probe is worth spending.
         """
         self._check_cancel()
         w0, w1 = self._probe_window(s0, s1)
-        scores: Dict[int, float] = {}
-        width = max(1, int(self.opt.probe_bracket_width or 0))
-        for q in seed_crfs(qgrid):
-            scores[q] = self._qsv_score(idx, w0, w1, q)
-        while True:
-            self._check_cancel()
-            span = bracket_for(list(scores.items()), self.target)
-            if span is None or span[1] - span[0] <= width:
-                break
-            mid = (span[0] + span[1]) // 2
-            if mid in scores:
-                break
+        lo, hi = min(qgrid), max(qgrid)
+        scores: Dict[int, float] = {lo: self._qsv_score(idx, w0, w1, lo)}
+        self._check_cancel()
+        scores[hi] = self._qsv_score(idx, w0, w1, hi)
+        if bracket_for(list(scores.items()), self.target) is None:
+            return scores            # the target is outside the grid entirely
+        self._check_cancel()
+        mid = int(round(pick_crf(list(scores.items()), self.target)))
+        mid = min(hi - 1, max(lo + 1, mid))
+        if mid not in scores:
             scores[mid] = self._qsv_score(idx, w0, w1, mid)
         return scores
 

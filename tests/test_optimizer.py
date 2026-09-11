@@ -3810,3 +3810,38 @@ def test_the_first_fit_does_not_land_on_the_minimum_sample(settings, info, plan,
     assert enc._refit_verified(pairs[:enc._VERIFY_MIN_PAIRS - 1]) is None
     fit = enc._refit_verified(pairs[:enc._VERIFY_MIN_PAIRS])
     assert fit is not None and fit["a"] == pytest.approx(2.0)
+
+
+def test_the_qsv_search_stops_at_the_mapping_s_tolerance(settings, info, plan, tmp_path, monkeypatch):
+    """q* is fed to a line whose residual is 4.14 CRF over a slope of 1.46
+    CRF per q, so it is worth knowing to about +-2.8 q and no better.
+    Bisecting to a bracket of 6 spent 3.84 probes a shot on a real episode;
+    both ends plus one interpolated point gets inside the same tolerance in
+    three."""
+    enc, _ = _verified_encoder(settings, info, plan, tmp_path)
+    qgrid = enc._qsv_grid()
+    spent = []
+    # a convex curve crossing the target at q = 24.5
+    def fake(idx, w0, w1, q):
+        spent.append(q)
+        return enc.target + (24.5 - q) * (1.0 + (38 - q) * 0.02)
+    monkeypatch.setattr(enc, "_qsv_score", fake)
+    monkeypatch.setattr(enc, "_probe_window", lambda a, b: (a, b))
+    scores = enc._probe_shot_qsv(0, 0, 120, qgrid)
+    assert spent[:2] == [min(qgrid), max(qgrid)]      # the ends come first
+    assert len(spent) == 3                            # and exactly one more
+    assert abs(enc._crossing(scores) - 24.5) <= 2.8   # inside the tolerance
+
+
+def test_the_qsv_search_spends_nothing_when_the_ends_do_not_bracket(
+        settings, info, plan, tmp_path, monkeypatch):
+    """No crossing to find, no third probe worth spending."""
+    enc, _ = _verified_encoder(settings, info, plan, tmp_path)
+    spent = []
+    monkeypatch.setattr(enc, "_qsv_score",
+                        lambda idx, w0, w1, q: (spent.append(q),
+                                                enc.target - 5.0)[1])
+    monkeypatch.setattr(enc, "_probe_window", lambda a, b: (a, b))
+    scores = enc._probe_shot_qsv(0, 0, 120, enc._qsv_grid())
+    assert len(spent) == 2
+    assert enc._crossing(scores) is None
