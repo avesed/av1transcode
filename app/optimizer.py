@@ -605,6 +605,11 @@ class VramBudget:
         # Keyed on the reservation rather than on the peak reading, because
         # the largest reading can land at a moment with nothing booked.
         self._worst = 0.0
+        self._booked = 0.0
+        # the same reservations before the model's correction is applied:
+        # the denominator calibration divides by, so that the sample is not
+        # a function of the very ratio it is meant to correct
+        self._reserved_raw = 0.0
         self._readable: Optional[bool] = None
         # model correction, in the shape MemCalibration uses for RSS: the
         # ratio of what operations really cost to what they were estimated at
@@ -618,6 +623,13 @@ class VramBudget:
     # recalibrating on every one would walk /proc thousands of times for a
     # number that moves slowly.
     _CALIBRATE_EVERY_S = 5.0
+    # Most any single sample may claim an operation costs against its
+    # booking. Without it one mistimed reading pinned the model at its
+    # ceiling for the whole job and the pool collapsed to one operation.
+    _SAMPLE_CEILING = 4.0
+    # The worst case decays, so it is the worst RECENT case. A permanent
+    # high-water mark cannot recover from a bad sample by construction.
+    _WORST_DECAY = 0.98
 
     def measured_mb(self, force: bool = False) -> float:
         """Current usage, cached for a second - admission runs per operation
@@ -634,8 +646,6 @@ class VramBudget:
         self._readable = True
         self._measured = mb
         self._peak = max(self._peak, mb)
-        if self._reserved > 0:
-            self._worst = max(self._worst, mb / (self._reserved / self._ratio))
         return mb
 
     @property
@@ -649,6 +659,20 @@ class VramBudget:
         return max(self._reserved, self.measured_mb())
 
     # -- admission -----------------------------------------------------
+    def booked(self, mb: float) -> float:
+        """What `reserve` would actually book for an estimate of `mb`.
+
+        Callers hold on to this and hand it back to `release`: recomputing
+        it there reads a _ratio that calibration has moved in between, so
+        releases over- or under-subtracted and _reserved drifted to zero (or
+        upward forever). Zero reserved silently deletes the half of the model
+        that covers the ramp - the seconds before a VA-API pool or a SYCL
+        context shows up in fdinfo - which is the path to
+        OUT_OF_DEVICE_MEMORY this class exists to prevent.
+        """
+        with self._cv:
+            return max(0.0, float(mb)) * self._ratio
+
     def reserve(self, mb: float, timeout: float) -> bool:
         """Book `mb` for one operation. False when the wait ran out.
 
@@ -657,15 +681,17 @@ class VramBudget:
         fallback the caller takes on failure is meant for contention, not for
         an impossible sum.
         """
-        want = max(0.0, float(mb)) * self._ratio
         deadline = time.monotonic() + max(0.0, timeout)
         self.measured_mb()          # cached; the reservation alone is half the story
         with self._cv:
+            want = max(0.0, float(mb)) * self._ratio
             while True:
                 free = self.budget - max(self._reserved, self._measured)
                 if self._ops == 0 or (want <= free and self._ops < self.max_ops):
                     self._reserved += want
+                    self._reserved_raw += max(0.0, float(mb))
                     self._ops += 1
+                    self._booked = want
                     return True
                 left = deadline - time.monotonic()
                 if left <= 0:
@@ -673,15 +699,17 @@ class VramBudget:
                 self._cv.wait(min(left, self._CACHE_S))
                 self.measured_mb()
 
-    def release(self, mb: float) -> None:
-        want = max(0.0, float(mb)) * self._ratio
+    def release(self, booked: float, mb: float = 0.0) -> None:
+        """Give back exactly what `reserve` took - see `booked`."""
         with self._cv:
-            self._reserved = max(0.0, self._reserved - want)
+            self._reserved = max(0.0, self._reserved - max(0.0, float(booked)))
+            self._reserved_raw = max(0.0, self._reserved_raw - max(0.0, float(mb)))
             self._ops = max(0, self._ops - 1)
             self._cv.notify_all()
 
     @contextlib.contextmanager
     def hold(self, mb: float, timeout: float, what: str) -> Iterator[None]:
+        want = self.booked(mb)
         if not self.reserve(mb, timeout):
             raise TranscodeError(
                 f"no room on the GPU for {what} within {timeout:.0f}s "
@@ -689,7 +717,7 @@ class VramBudget:
         try:
             yield
         finally:
-            self.release(mb)
+            self.release(want, mb)
 
     # -- calibration ---------------------------------------------------
     def calibrate(self) -> None:
@@ -721,10 +749,24 @@ class VramBudget:
             if now - self._calibrated_at < self._CALIBRATE_EVERY_S:
                 return
             self._calibrated_at = now
-        self.measured_mb(force=True)
+        mb = self.measured_mb(force=True)
         with self._cv:
-            if self._worst <= 0:
+            if self._ops <= 0 or self._reserved <= 0 or mb <= 0:
                 return
+            # Under the lock, so _reserved cannot be zeroed by a release
+            # between the two reads - which raised ZeroDivisionError, and a
+            # ZeroDivisionError is not a TranscodeError, so it failed the job
+            # rather than falling back to the CPU.
+            raw = self._reserved_raw
+            if raw <= 0:
+                return
+            # One sample, clamped: a reading taken while a finished ffmpeg is
+            # still tearing down counts memory whose booking has already gone,
+            # and an unbounded high-water mark turned one such sample into a
+            # permanent x4.0 for the rest of the job.
+            sample = min(self._SAMPLE_CEILING, mb / raw)
+            # decay, so the worst case is the worst RECENT case
+            self._worst = max(sample, self._worst * self._WORST_DECAY)
             self._ratio += (self._worst - self._ratio) / 20.0
             self._ratio = min(4.0, max(0.5, self._ratio))
             self._samples += 1
@@ -882,7 +924,12 @@ class ShotEncoder:
                 with open(path, "a") as fh:
                     fh.write(json.dumps(row, separators=(",", ":"),
                                         default=float) + "\n")
-        except OSError as e:
+        except Exception as e:
+            # Not just OSError. This runs inside the scheduler's on_done,
+            # which holds the condition variable: anything raised there skips
+            # the budget release and the notify, and the phase waits forever
+            # for a worker slot that never comes back. A diagnostics file must
+            # not be able to do that, whatever json.dumps decides to raise.
             if not self._dataset_warned:
                 self._dataset_warned = True
                 logger.warning("optimizer: cannot write the probe dataset "
@@ -895,7 +942,7 @@ class ShotEncoder:
             "width": self.info.width, "height": self.info.height,
             "fps": self.info.fps, "duration": self.info.duration,
             "src_bitrate": self.info.bitrate,
-            "codec": getattr(self.info, "codec", ""),
+            "codec": getattr(self.info, "video_codec", ""),
             "shots": len(shots), "frames": sum(b - a for a, b in shots),
             "metric": self.metric, "target": self.target,
             "preset": self.video.preset, "probe_preset": self._probe_preset(),
@@ -2794,9 +2841,17 @@ class ShotEncoder:
 
         rc_mode=ICQ, not the CQP the option names suggest: with CQP the
         driver ignores -qp outright and returns the same 35690 KiB at 20, 32
-        and 44. ICQ's global_quality lands within 2% of what av1_qsv produced
-        at the same number (386 KiB against 392 at ~30), so gpu_probe_qs
-        keeps its meaning.
+        and 44.
+
+        The two encoders' quality indices are NOT the same scale, and an
+        earlier note here claiming they agreed "within 2%" was one window at
+        one q extrapolated across the grid. Measured shot for shot on the
+        same windows at the same q, av1_vaapi spends 1.32x the bytes of
+        av1_qsv (331 points, both ends of the grid) and scores +1.44 VMAF
+        (279 points); the crossing moves +2.2 q. Nothing breaks, because the
+        map refits online from whatever the card produces - but every offline
+        number that justified the byte feature was computed from av1_qsv
+        output and does not describe what this path now writes.
         """
         vf: List[str] = []
         rate = self._probing_rate()
@@ -2822,47 +2877,41 @@ class ShotEncoder:
 
     def _probe_shot_qsv(self, idx: int, s0: int, s1: int,
                         qgrid: List[int]) -> Tuple[Dict[int, float], Dict[int, float]]:
-        """Find where the QSV curve crosses the target: both ends, then one
-        interpolated point between them.
+        """Both ends of the q grid. Two probes, and the chord between them.
 
         NOT the bisection the SVT path runs, and deliberately so. There the
-        probed CRF is the answer, so the bracket has to be narrow enough to
-        interpolate inside. Here q* is only fed to a fitted line, and that
-        line carries its own residual - 4.14 CRF measured on a 163-shot 4K
-        episode at target 96-97, against a slope of 1.46 CRF per q. So q*
-        is worth knowing to about +-2.8 q and no better: everything past
-        that is spent on precision the mapping throws away. Bisecting to a
-        bracket of 6 cost 3.84 probes a shot on that episode; false position
-        gets inside the same tolerance in three.
+        probed CRF is the answer, so the bracket has to be tight enough to
+        interpolate inside. Here q* only feeds a fitted plane, and a chord
+        drawn across the whole grid is a perfectly good input to a fit.
 
-        Three rather than two, and now measured. Dropping to the ends alone
-        and taking the chord moves the crossing by -2.46 q on average
-        (sd 1.20) against the three-point answer, over 156 shots of a 4K
-        episode - a systematic underestimate, which is the bend the third
-        point exists to correct. The mean an intercept can absorb; the
-        spread it cannot, and 1.20 q over the map's 1.76 CRF per q is ~2 CRF
-        added to a residual of 2.44. One score saved is not worth taking the
-        prediction from 2.44 to ~3.1.
+        A third, interpolated point used to be probed, on the reasoning that
+        the chord must miss a curve that bends - and it does, by -2.46 q on
+        average. That measurement was the wrong test. The shift is not noise
+        around a mean, it is a LINEAR FUNCTION of q* itself (slope -0.37,
+        R^2 0.96 over 156 shots), so refitting simply re-estimates the slope
+        and absorbs it. The test that decides is the refit, and it says the
+        third probe is worth nothing:
 
-        If the ends do not bracket the target at all there is no crossing to
-        find and no third probe is worth spending.
+            run    n     3-point LOO   ends-only LOO
+            feat  100       2.58           2.53
+            wide   99       2.58           2.54
+            card  115       2.63           2.63
+
+        So the pass costs two probes a shot rather than three - a third of
+        all the card's probe work, and a third of the VMAF scores that go
+        with it, which are the part that is actually scarce.
+
+        Ends that do not bracket the target mean the shot has no crossing on
+        this curve, and no fit can use it.
         """
         self._check_cancel()
         w0, w1 = self._probe_window(s0, s1)
         lo, hi = min(qgrid), max(qgrid)
         scores: Dict[int, float] = {}
         bpf: Dict[int, float] = {}
-        def one(q: int) -> None:
+        for q in (lo, hi):
             self._check_cancel()
             scores[q], bpf[q] = self._qsv_score(idx, w0, w1, q)
-        one(lo)
-        one(hi)
-        if bracket_for(list(scores.items()), self.target) is None:
-            return scores, bpf       # the target is outside the grid entirely
-        mid = int(round(pick_crf(list(scores.items()), self.target)))
-        mid = min(hi - 1, max(lo + 1, mid))
-        if mid not in scores:
-            one(mid)
         return scores, bpf
 
     def _qsv_score(self, idx: int, w0: int, w1: int, q: int) -> Tuple[float, float]:
@@ -3093,7 +3142,9 @@ class ShotEncoder:
         this opens on the prediction, walks outward geometrically until the
         target is bracketed, and then bisects the bracket exactly as the
         plain path does. A prediction that is right saves the walk; one that
-        is wrong costs the walk and lands in the same place.
+        is wrong costs the walk and lands in the same place - which requires
+        spending the last probe on the grid endpoint, because that is what
+        pick_crf's clamping assumes it was given. See the walk below.
         """
         self._check_cancel()
         w0, w1 = self._probe_window(s0, s1)
@@ -3107,36 +3158,56 @@ class ShotEncoder:
             first = min(hi, max(lo, int(round(seed))))
             _, _, scores[first] = self._probe_encode_and_score(
                 idx, w0, w1, first, lp, shard)
+            d = step
             while len(scores) < budget:
                 self._check_cancel()
                 if bracket_for(list(scores.items()), self.target) is not None:
                     break                     # enclosed; the bisection below
                 pts = sorted(scores.items())
-                # Walk from the EXTREME probed point, not from the last one:
-                # after a seed and one step the last point can be the inner
-                # of the two, and stepping from there wanders back over
-                # ground already probed.
+                # Walk from the EXTREME probed point, not the last one: after
+                # a seed and one step the last point can be the inner of the
+                # two, and stepping from there goes back over probed ground.
                 if pts[-1][1] >= self.target:
-                    # even the highest crf probed still beats the target, so
-                    # the crossing is above it
-                    cur, up = pts[-1][0], True
+                    cur, up, edge = pts[-1][0], True, hi
                 elif pts[0][1] <= self.target:
-                    cur, up = pts[0][0], False
+                    cur, up, edge = pts[0][0], False, lo
                 else:
                     break
-                if (up and cur >= hi) or (not up and cur <= lo):
+                if cur == edge:
                     break                     # pinned at the end of the grid
-                nxt, d = None, step
-                while d <= (hi - lo):
-                    cand = min(hi, max(lo, cur + d if up else cur - d))
-                    if cand not in scores:
-                        nxt = cand
-                        break
-                    d *= 2
-                if nxt is None:
+                if len(scores) >= budget - 1:
+                    # THE LAST PROBE GOES TO THE GRID'S END, always.
+                    #
+                    # pick_crf clamps a shot whose probes never straddle the
+                    # target to the outermost CRF it was handed, and that is
+                    # only the right answer when the outermost CRF is the
+                    # grid's own end - which _probe_shot guarantees, because
+                    # seed_crfs always includes both ends. Walking outward
+                    # from a seed does not, and on three real episodes 11 of
+                    # 163 shots ran out of budget with every probed score
+                    # still ABOVE the target: they clamped to the highest
+                    # point they happened to reach (26 where the curve
+                    # crosses near 33) and shipped ~7 CRF low, a larger file
+                    # for quality nobody asked for. It went unnoticed because
+                    # the A/B that checked the invariant ran before the fit
+                    # was good enough to seed those shots.
+                    nxt = edge
+                else:
+                    nxt = min(hi, max(lo, cur + d if up else cur - d))
+                    while nxt in scores and d <= (hi - lo):
+                        d *= 2
+                        nxt = min(hi, max(lo, cur + d if up else cur - d))
+                    if nxt in scores:
+                        nxt = edge
+                if nxt in scores:
                     break
                 _, _, scores[nxt] = self._probe_encode_and_score(
                     idx, w0, w1, nxt, lp, shard)
+                d *= 2                        # and it STAYS geometric:
+                                              # resetting d each iteration
+                                              # made the walk linear, so a
+                                              # seed error of E cost E/step
+                                              # probes instead of log2(E)
             while len(scores) < budget:
                 self._check_cancel()
                 span = bracket_for(list(scores.items()), self.target)
@@ -3213,13 +3284,19 @@ class ShotEncoder:
         if sd > 0:
             keep = [k for k in range(len(recent)) if abs(res[k]) <= 3 * sd]
             if self._VERIFY_MIN_PAIRS <= len(keep) < len(recent):
-                X2 = [X[k] for k in keep]
-                y2 = [y[k] for k in keep]
-                beta = self._lstsq(X2, y2)
-                res = [y2[i] - sum(beta[j] * X2[i][j] for j in range(len(beta)))
-                       for i in range(len(X2))]
-                sd = statistics.stdev(res) if len(res) > 1 else sd
-        return {"beta": beta, "sd": sd, "n": len(recent)}
+                X, y = [X[k] for k in keep], [y[k] for k in keep]
+                beta = self._lstsq(X, y)
+        # Leave-one-out, not the fit's own residual. _fit_gpu_map says it in
+        # the same file - "a line always fits its own points" - and this path
+        # had quietly abandoned the principle for the two decisions that use
+        # the number: the seeding gate and the step size. The trim makes it
+        # worse, because it drops exactly the tail the step has to cover.
+        loo = []
+        for k in range(len(X)):
+            b = self._lstsq(X[:k] + X[k + 1:], y[:k] + y[k + 1:])
+            loo.append(y[k] - sum(b[j] * X[k][j] for j in range(len(b))))
+        sd = statistics.stdev(loo) if len(loo) > 1 else sd
+        return {"beta": beta, "sd": sd, "n": len(X)}
 
     def _predict_crf(self, fit: Dict[str, object], q: float, bpf: float,
                      grid: List[int]) -> float:
@@ -3229,9 +3306,14 @@ class ShotEncoder:
 
     @staticmethod
     def _log_bpf(bpf: Optional[Dict[int, float]]) -> Optional[float]:
-        """log bytes per frame at the highest q probed - the bit-starved end,
-        which discriminated content better than the low-q end (2.72 CRF
-        against 2.87 when both were measured)."""
+        """log bytes per frame at the highest q probed - the bit-starved end.
+
+        The margin over the low-q end is much larger than first reported: as
+        single extra features on top of q*, bytes at q38 give 2.72 CRF and
+        q34 2.95, while q18 and q14 give 4.34 and 4.33 against 4.53 for q*
+        alone - i.e. the low end is worth essentially nothing. The 2.87 once
+        quoted here was a different, two-column model.
+        """
         if not bpf:
             return None
         v = bpf[max(bpf)]
@@ -3861,6 +3943,7 @@ class ShotEncoder:
         """
         sycl = self._sycl_device()
         need = self._est_score_mb(frames)
+        booked = self._gpu_vram.booked(need)
         if sycl >= 0 and not self._gpu_vram.reserve(need, self._GPU_SLOT_WAIT):
             # The card is full and staying full. Scoring on the CPU is slower
             # per shot but it is not queued behind anything, and the point of
@@ -3927,7 +4010,7 @@ class ShotEncoder:
                         "preflight again", sycl, n)
             finally:
                 self._gpu_vram.calibrate()
-                self._gpu_vram.release(need)
+                self._gpu_vram.release(booked, need)
         return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,
                                    threads, timeout=3600)
 

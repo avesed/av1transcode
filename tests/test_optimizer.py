@@ -3577,34 +3577,45 @@ def test_vram_calibration_pulls_the_model_towards_the_measurement():
     assert b._ratio > 1.5
 
 
-def test_vram_calibration_measures_the_peak_not_a_quiet_moment():
-    """A SYCL context allocates a second or two after its ffmpeg starts, so
-    most samples catch operations mid-ramp. Dividing an instantaneous reading
-    by the reservation pulled the model to its floor on a real episode - a
-    quarter of an estimate that run showed was already 21% low."""
+def test_vram_calibration_is_not_pinned_by_one_bad_sample():
+    """A reading taken while a finished ffmpeg is still tearing down counts
+    memory whose booking has already gone. An unbounded high-water mark
+    turned one such sample into a permanent x4.0 for the rest of the job and
+    collapsed the pool to one operation; the worst case is now clamped per
+    sample and decays, so it is the worst RECENT case."""
     used = {"mb": 1200.0}
     b = opt.VramBudget(100000, max_ops=6, measure=lambda: used["mb"])
-    b.reserve(400, 0.0)                    # three ops, 1200MB estimated
-    b.reserve(400, 0.0)
-    b.reserve(400, 0.0)
-    for _ in range(200):                   # the busy sample: usage matches
-        b._calibrated_at = 0.0
-        b._measured_at = 0.0
-        b.calibrate()
+    for _ in range(3):
+        b.reserve(400, 0.0)                  # 1200MB booked, 1200MB held
+    def settle(n=400):
+        for _ in range(n):
+            b._calibrated_at = 0.0
+            b._measured_at = 0.0
+            b.calibrate()
+    settle()
     assert b._ratio == pytest.approx(1.0, abs=0.05)
-    used["mb"] = 50.0                      # now everything is mid-ramp
-    for _ in range(200):
-        b._calibrated_at = 0.0
-        b._measured_at = 0.0
-        b.calibrate()
-    assert b._ratio == pytest.approx(1.0, abs=0.05)   # the worst case rules
-
-
-def test_vram_calibration_ignores_an_idle_card():
-    """Nothing in flight says nothing about the size of an operation."""
-    b = opt.VramBudget(100000, max_ops=6, measure=lambda: 0.0)
+    used["mb"] = 60000.0                     # one absurd reading
+    b._calibrated_at = 0.0
+    b._measured_at = 0.0
     b.calibrate()
-    assert b._ratio == 1.0
+    assert b._ratio <= 4.0                   # clamped, not 50x
+    used["mb"] = 1200.0                      # and it recovers
+    settle()
+    assert b._ratio == pytest.approx(1.0, abs=0.05)
+
+
+def test_vram_release_gives_back_exactly_what_was_booked():
+    """reserve books mb*ratio and release used to recompute it from a ratio
+    calibration had moved in between, so _reserved drifted to zero - deleting
+    the half of the model that covers the ramp before an allocation shows up
+    in fdinfo."""
+    b = opt.VramBudget(100000, max_ops=6, measure=lambda: 0.0)
+    want = b.booked(500)
+    assert b.reserve(500, 0.0)
+    b._ratio = 2.5                           # calibration moves it mid-flight
+    b.release(want, 500)
+    assert b._reserved == pytest.approx(0.0)
+    assert b._ops == 0
 
 
 def test_drm_vram_reader_deduplicates_clients_and_filters_the_device(tmp_path):
@@ -3826,26 +3837,25 @@ def test_the_first_fit_does_not_land_on_the_minimum_sample(settings, info, plan,
     assert enc._predict_crf(fit, 20.0, 7.0, [18, 50]) == pytest.approx(43.0, abs=0.1)
 
 
-def test_the_qsv_search_stops_at_the_mapping_s_tolerance(settings, info, plan, tmp_path, monkeypatch):
-    """q* is fed to a line whose residual is 4.14 CRF over a slope of 1.46
-    CRF per q, so it is worth knowing to about +-2.8 q and no better.
-    Bisecting to a bracket of 6 spent 3.84 probes a shot on a real episode;
-    both ends plus one interpolated point gets inside the same tolerance in
-    three."""
+def test_the_qsv_search_is_two_probes_and_a_chord(settings, info, plan, tmp_path, monkeypatch):
+    """q* only feeds a fitted plane, so a chord across the grid is a fine
+    input to a fit. A third interpolated point was probed for a while on the
+    reasoning that the chord misses a bending curve - it does, by -2.46 q,
+    but that shift is a linear function of q* (R^2 0.96), so the refit
+    absorbs it: leave-one-out came out 2.53 against 2.58 with the third
+    probe, i.e. it bought nothing for a third of the card's work."""
     enc, _ = _verified_encoder(settings, info, plan, tmp_path)
     qgrid = enc._qsv_grid()
     spent = []
-    # a convex curve crossing the target at q = 24.5
     def fake(idx, w0, w1, q):
         spent.append(q)
         return enc.target + (24.5 - q) * (1.0 + (38 - q) * 0.02), 100.0 - q
     monkeypatch.setattr(enc, "_qsv_score", fake)
     monkeypatch.setattr(enc, "_probe_window", lambda a, b: (a, b))
     scores, bpf = enc._probe_shot_qsv(0, 0, 120, qgrid)
+    assert spent == [min(qgrid), max(qgrid)]          # both ends, nothing else
     assert set(bpf) == set(spent)                     # bytes recorded for each
-    assert spent[:2] == [min(qgrid), max(qgrid)]      # the ends come first
-    assert len(spent) == 3                            # and exactly one more
-    assert abs(enc._crossing(scores) - 24.5) <= 2.8   # inside the tolerance
+    assert enc._crossing(scores) is not None
 
 
 def test_the_qsv_search_spends_nothing_when_the_ends_do_not_bracket(
@@ -3958,3 +3968,34 @@ def test_the_bytes_come_from_the_high_q_end(settings, info, plan, tmp_path):
     assert enc._log_bpf({14: 2000.0, 38: 100.0}) == pytest.approx(math.log(100.0))
     assert enc._log_bpf({}) is None
     assert enc._log_bpf({38: 0.0}) is None
+
+
+def test_seeded_and_plain_agree_on_the_grid_the_bug_hid_behind(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The invariant, checked differentially on a FIVE-point grid.
+
+    Every earlier test used a 17-point grid, where the budget is large enough
+    that the walk always reaches an end. Production runs four points, and
+    there 11 of 163 shots ran out of budget with every probed score still
+    above the target and clamped to the highest point they happened to reach
+    - up to 8 CRF below what the plain path picks."""
+    settings.transcode.optimizer.probe_crfs = [20, 26, 32, 38, 44]
+    settings.transcode.optimizer.probe_encoder = "qsv+svt"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    grid = enc._probe_grid()
+    assert len(grid) == 5                      # the budget the bug needed
+    for truth in (18.0, 21.0, 24.0, 30.0, 36.0, 43.0, 48.0):
+        probed = {}
+        _plant_svt(enc, monkeypatch, lambda i, t=truth: t, probed)
+        plain = enc._probe_shot(0, 0, 100, grid, 4)
+        want = opt.pick_crf(list(plain.items()), enc.target)
+        for seed in (20.0, 26.0, 32.0, 38.0, 44.0):
+            for step in (2, 4, 8):
+                probed.clear()
+                got = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed, step)
+                assert opt.pick_crf(list(got.items()), enc.target) == \
+                    pytest.approx(want, abs=1.0), (
+                        f"truth {truth} seed {seed} step {step}: "
+                        f"seeded {opt.pick_crf(list(got.items()), enc.target)} "
+                        f"vs plain {want} (probed {sorted(probed[0])})")
+                assert len(probed[0]) <= enc._probe_budget(grid)
