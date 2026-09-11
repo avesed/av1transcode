@@ -2726,11 +2726,16 @@ class ShotEncoder:
         bracket of 6 cost 3.84 probes a shot on that episode; false position
         gets inside the same tolerance in three.
 
-        Three rather than two because the curve is convex over a span this
-        wide: the ends alone place the crossing by a straight line drawn
-        across the whole grid, and the third probe is what corrects for the
-        bend. If the ends do not bracket the target at all there is no
-        crossing to find and no third probe is worth spending.
+        The third probe is NOT justified by a measurement. The reasoning is
+        that a chord drawn across the whole grid should miss a curve that
+        bends, and the third point corrects it - but how far a two-point
+        chord actually lands from the crossing over q 14..38 has never been
+        measured, and it may well be inside the tolerance on its own. Worth
+        an hour with the card before anyone assumes otherwise; two probes
+        would make the pass a third cheaper again.
+
+        If the ends do not bracket the target at all there is no crossing to
+        find and no third probe is worth spending.
         """
         self._check_cancel()
         w0, w1 = self._probe_window(s0, s1)
