@@ -440,7 +440,14 @@ class OptimizerSettings(BaseModel):
     # crossed at their ends where the inversion is worst. Real episodes are
     # the opposite - 4 shots of 1035 on one measured episode - which is why
     # this needs an episode-scale trial before it is worth anyone turning on.
-    probe_encoder: Literal["svt", "qsv"] = "svt"
+    probe_encoder: Literal["svt", "qsv", "qsv+svt"] = "svt"
+    # "qsv+svt" is the same card work used differently: the mapped CRF only
+    # says WHERE to probe, and the answer still comes from SVT probes scored
+    # the usual way, so a mapping that is off costs a probe instead of
+    # shipping a CRF nobody measured. That is what lets it drop the refusal
+    # gate "qsv" needs, and what lets the line keep learning from every shot
+    # it verifies instead of from a fixed set of anchors.
+    #
     # Quality indices swept on the QSV side. Same role as probe_crfs, and the
     # search over them is the same bisection; av1_qsv saturates above ~50 on
     # 4K, so there is nothing to learn past the top of this.

@@ -2634,14 +2634,26 @@ class ShotEncoder:
     # falls back to the SVT probe rather than degrading a shot silently.
     # ------------------------------------------------------------------
 
-    def _gpu_probe_on(self) -> bool:
-        if (self.opt.probe_encoder or "svt").lower() != "qsv":
-            return False
+    def _probe_mode(self) -> str:
+        """"svt", "qsv" or "qsv+svt" - what the probe phase actually runs.
+
+        Both card modes need a render node; without one they degrade to the
+        SVT path rather than failing the job.
+        """
+        mode = (self.opt.probe_encoder or "svt").lower()
+        if mode == "svt":
+            return "svt"
         if not self._hwdec_args():
-            logger.warning("optimizer: probe_encoder=qsv needs a /dev/dri render "
-                           "node; probing with SVT instead")
-            return False
-        return True
+            logger.warning("optimizer: probe_encoder={} needs a /dev/dri render "
+                           "node; probing with SVT instead", mode)
+            return "svt"
+        return mode
+
+    def _gpu_probe_on(self) -> bool:
+        """Whether the card is doing probe ENCODES this job - either card
+        mode. Sizes the SYCL timeout, which cares that the card is busy and
+        not why."""
+        return self._probe_mode() in ("qsv", "qsv+svt")
 
     def _qsv_grid(self) -> List[int]:
         g = sorted(set(self.opt.gpu_probe_qs or []))
@@ -2840,6 +2852,264 @@ class ShotEncoder:
                       f"{len(samples)} probed with SVT "
                       f"({len(anchors)} of them calibration anchors)")
         return samples, chosen
+
+    # ------------------------------------------------------------------
+    # Predict on the card, confirm with SVT (probe_encoder="qsv+svt").
+    #
+    # The difference from the block above is where the answer comes from.
+    # There the mapped CRF IS the answer for a bulk shot, so the mapping has
+    # to be trusted outright, which is why it carries a refusal gate and why
+    # a job whose line does not hold throws its whole QSV pass away. Here the
+    # mapped CRF only chooses where to put the first SVT probe: the CRF that
+    # ships still comes from SVT probes scored the usual way and interpolated
+    # by pick_crf, exactly as the plain path produces it.
+    #
+    # That changes what a bad prediction costs. It cannot ship a CRF nobody
+    # measured any more - the worst it can do is start the bisection in the
+    # wrong place and spend an extra probe getting back, which is bounded by
+    # the same probe budget. So the gate can go, and with it the case that
+    # kept this path out of production: a 150s clip refused calibration at
+    # target 94 (leave-one-out 3.00 CRF against a 2.00 limit) because 12 of
+    # its 22 shots could not reach 94 at any CRF, and both curves had to be
+    # crossed at their ends where inverting them is worst conditioned.
+    #
+    # It also lets the line keep learning. Every verified shot yields another
+    # (q*, crf*) pair, so the fit runs on hundreds of them by mid-episode
+    # instead of on the anchors alone - and on the most recent hundreds, so
+    # it tracks content that drifts across an episode rather than averaging
+    # over it.
+    # ------------------------------------------------------------------
+
+    # Refit this often. Theil-Sen is quadratic in the pairs, so refitting on
+    # every shot would grow into real time by the end of an episode.
+    _VERIFY_REFIT_EVERY = 25
+    # Pairs the fit looks at, most recent first. Bounds the refit cost and
+    # gives the line locality: an episode's content is not one population.
+    _VERIFY_FIT_WINDOW = 200
+    def _verify_max_sd(self, grid: List[int]) -> float:
+        """Residual spread above which the prediction is not worth following.
+
+        Not a correctness gate - it only decides whether to seed from the
+        line or from the middle of the grid, the way the plain path always
+        does. A sixth of the grid is where the arithmetic stops working: at
+        that spread the second probe goes out at _verify_step's ceiling and
+        still misses more often than not, so the walk costs the probes the
+        prediction was supposed to save.
+        """
+        span = max(grid) - min(grid) if len(grid) > 1 else 0
+        return max(3.0, span / 6.0)
+
+    def _verify_step(self, sd: float) -> int:
+        """How far from the prediction to place the SECOND probe.
+
+        Far enough that the two straddle the target most of the time - the
+        prediction lands on one side of it and the pair has to enclose it
+        before pick_crf can interpolate - and no further, because a probe
+        spent out in the tail measures a part of the curve nothing will use.
+        1.5 sd covers ~87% of a normal residual; the floor keeps it useful
+        when the fit looks better than the measurement underneath it really
+        is, and the ceiling keeps one bad episode from throwing probes at the
+        end of the grid.
+        """
+        return int(max(2, min(8, round(1.5 * max(0.0, sd)))))
+
+    def _probe_shot_seeded(self, idx: int, s0: int, s1: int, grid: List[int],
+                           lp: int, seed: float, step: int) -> Dict[int, float]:
+        """The SVT bisection of _probe_shot, started from a predicted CRF.
+
+        Same probes, same scores, same budget - only the first point moves.
+        Where _probe_shot opens on the grid's seed points and bisects down,
+        this opens on the prediction, walks outward geometrically until the
+        target is bracketed, and then bisects the bracket exactly as the
+        plain path does. A prediction that is right saves the walk; one that
+        is wrong costs the walk and lands in the same place.
+        """
+        self._check_cancel()
+        w0, w1 = self._probe_window(s0, s1)
+        _, probe_vf = self._probe_input(w0, w1)
+        shard = self._acquire_shard(idx, w0, w1, probe_vf)
+        scores: Dict[int, float] = {}
+        try:
+            lo, hi = min(grid), max(grid)
+            budget = self._probe_budget(grid)
+            width = max(1, int(self.opt.probe_bracket_width or 0))
+            first = min(hi, max(lo, int(round(seed))))
+            _, _, scores[first] = self._probe_encode_and_score(
+                idx, w0, w1, first, lp, shard)
+            while len(scores) < budget:
+                self._check_cancel()
+                if bracket_for(list(scores.items()), self.target) is not None:
+                    break                     # enclosed; the bisection below
+                pts = sorted(scores.items())
+                # Walk from the EXTREME probed point, not from the last one:
+                # after a seed and one step the last point can be the inner
+                # of the two, and stepping from there wanders back over
+                # ground already probed.
+                if pts[-1][1] >= self.target:
+                    # even the highest crf probed still beats the target, so
+                    # the crossing is above it
+                    cur, up = pts[-1][0], True
+                elif pts[0][1] <= self.target:
+                    cur, up = pts[0][0], False
+                else:
+                    break
+                if (up and cur >= hi) or (not up and cur <= lo):
+                    break                     # pinned at the end of the grid
+                nxt, d = None, step
+                while d <= (hi - lo):
+                    cand = min(hi, max(lo, cur + d if up else cur - d))
+                    if cand not in scores:
+                        nxt = cand
+                        break
+                    d *= 2
+                if nxt is None:
+                    break
+                _, _, scores[nxt] = self._probe_encode_and_score(
+                    idx, w0, w1, nxt, lp, shard)
+            while len(scores) < budget:
+                self._check_cancel()
+                span = bracket_for(list(scores.items()), self.target)
+                if span is None or span[1] - span[0] <= width:
+                    break
+                mid = (span[0] + span[1]) // 2
+                if mid in scores:
+                    break
+                _, _, scores[mid] = self._probe_encode_and_score(
+                    idx, w0, w1, mid, lp, shard)
+            return scores
+        finally:
+            self._release_shard(idx)
+
+    def _refit_verified(self, pairs: List[Tuple[float, float]]
+                        ) -> Optional[Dict[str, float]]:
+        """Refit the q -> CRF line on what has been verified so far.
+
+        Theil-Sen for the same reason _fit_gpu_map uses it - one easy shot
+        whose target CRF sits far above the bulk would tilt a least-squares
+        line for every other shot - and the residual spread is reported in
+        sample, not leave-one-out: LOO on hundreds of pairs is quadratic on
+        top of a quadratic fit, and here the number only sizes a probe step.
+        In-sample is optimistic, which _verify_step's 1.5 multiplier and
+        floor of 2 already allow for.
+        """
+        if len(pairs) < 4:
+            return None
+        recent = pairs[-self._VERIFY_FIT_WINDOW:]
+        a, b = self._theil_sen(recent)
+        res = [c - (a * q + b) for q, c in recent]
+        sd = statistics.stdev(res) if len(res) > 1 else 0.0
+        return {"a": a, "b": b, "sd": sd, "n": len(recent)}
+
+    def probe_all_verified(self, shots: List[Shot],
+                           grid: List[int]) -> ProbeSamples:
+        """Probe every shot with SVT, using the card to choose where to start.
+
+        Returns ordinary ProbeSamples - {crf: score} per shot from real SVT
+        probes - so everything downstream (pick_all_crfs, smoothing, the
+        verification report) sees exactly what the plain path produces and
+        needs no knowledge of this mode at all.
+        """
+        qgrid = self._qsv_grid()
+        ladder = self._lp_ladder()
+        # The shots that start the line off, stratified by length the same way
+        # the "qsv" path picks its anchors. They pay a QSV pass on top of a
+        # full SVT bisection; at 16 of a 1400-shot episode that is ~1% of the
+        # phase.
+        seeds = set(self._gpu_anchor_indices(shots))
+        samples: ProbeSamples = {}
+        pairs: List[Tuple[float, float]] = []
+        state: Dict[str, object] = {"fit": None, "since": 0, "warned": False,
+                                    "seeded": 0, "walked": 0}
+        lock = threading.Lock()
+        self._log(f"verified gpu probing: {len(seeds)} seed shot(s) of "
+                  f"{len(shots)}, q grid {qgrid}")
+
+        def cost(idx: int, lp: int) -> float:
+            w0, w1 = self._probe_window(*shots[idx])
+            return self._est_probe_gb(w1 - w0, lp)
+
+        def run_one(idx: int, lp: int, _slot: int, _threads: int) -> object:
+            s0, s1 = shots[idx]
+            q_star = None
+            try:
+                q_star = self._crossing(self._probe_shot_qsv(idx, s0, s1, qgrid))
+            except TranscodeError as e:
+                # the card is busy, wedged, or this shot simply never crosses
+                # on the QSV curve. None of that is a reason not to probe it.
+                self._log(f"qsv prediction failed for shot {idx:05d}: {e}")
+            with lock:
+                fit = state["fit"]
+            seed = None
+            if q_star is not None and fit and idx not in seeds \
+                    and fit["sd"] <= self._verify_max_sd(grid):
+                # the raw line, NOT _map_crf: probe_crf_offset corrects the
+                # delivered CRF and pick_all_crfs already applies it at the
+                # end, so adding it here would shift where we probe by a
+                # correction that gets made again downstream
+                seed = min(float(max(grid)),
+                           max(self._crf_floor(min(grid)),
+                               fit["a"] * q_star + fit["b"]))
+            if seed is None:
+                scores = self._probe_shot(idx, s0, s1, grid, lp)
+            else:
+                scores = self._probe_shot_seeded(
+                    idx, s0, s1, grid, lp, seed,
+                    self._verify_step(float(fit["sd"])))
+            crf_star = self._crossing(scores)
+            with lock:
+                samples[idx] = scores
+                if seed is not None:
+                    state["seeded"] = int(state["seeded"]) + 1
+                    if crf_star is not None:
+                        state["walked"] = int(state["walked"]) + \
+                            (1 if abs(crf_star - seed) > self._verify_step(
+                                float(fit["sd"])) else 0)
+                snapshot = None
+                if q_star is not None and crf_star is not None:
+                    pairs.append((q_star, crf_star))
+                    state["since"] = int(state["since"]) + 1
+                    if (state["fit"] is None
+                            or int(state["since"]) >= self._VERIFY_REFIT_EVERY):
+                        state["since"] = 0
+                        snapshot = list(pairs)
+            if snapshot is not None:
+                # outside the lock: Theil-Sen is quadratic in the pairs and
+                # every other probe worker wants this lock
+                new = self._refit_verified(snapshot)
+                if new is not None:
+                    with lock:
+                        state["fit"] = new
+                        warn = (new["sd"] > self._verify_max_sd(grid)
+                                and not state["warned"])
+                        if warn:
+                            state["warned"] = True
+                    if warn:
+                        logger.warning(
+                            "optimizer: the QSV prediction is not worth "
+                            "following on this source (residual {:.2f} CRF "
+                            "over {}); probing from the grid instead",
+                            new["sd"], new["n"])
+            return None
+
+        self._schedule(list(range(len(shots))), phase="probing", cost=cost,
+                       run_one=run_one, on_done=lambda *_: None,
+                       progress=lambda d: self._report(d / max(len(shots), 1) * 100,
+                                                       d, len(shots)),
+                       max_conc=self._max_probe_concurrency(len(shots)),
+                       ladder=ladder, cpu_charge=self.opt.probe_cpu_charge)
+
+        fit = state["fit"]
+        if fit:
+            self._mem_log(
+                "verified gpu probing: {} of {} shot(s) seeded from "
+                "CRF = {:.2f}q {:+.2f} (residual {:.2f} CRF over {} pairs), "
+                "{} needed more than one step to bracket".format(
+                    state["seeded"], len(shots), fit["a"], fit["b"],
+                    fit["sd"], fit["n"], state["walked"]))
+        else:
+            self._mem_log("verified gpu probing: the line never fitted; every "
+                          "shot probed from the grid")
+        return samples
 
     def _fit_gpu_map(self, pairs: List[Tuple[float, float]]) -> Optional[Dict[str, float]]:
         """Fit CRF = a*q + b and refuse the mapping when it does not hold.
@@ -4106,10 +4376,12 @@ class ShotEncoder:
             self._stage("probing", 0.0)
             self._report(0.0, 0, len(shots))  # surface the shot count to the UI
             grid = self._probe_grid()
-            if self._gpu_probe_on():
+            mode = self._probe_mode()
+            if mode == "qsv":
                 samples, chosen = self.probe_all_gpu(shots, grid)
             else:
-                samples = self.probe_all(shots, grid)
+                samples = (self.probe_all_verified(shots, grid)
+                           if mode == "qsv+svt" else self.probe_all(shots, grid))
                 chosen = self.pick_all_crfs(samples, grid)
             if float(self.opt.max_crf_delta or 0) > 0:
                 ideal = ", ".join(f"{i}:{chosen[i]:g}" for i in sorted(chosen))

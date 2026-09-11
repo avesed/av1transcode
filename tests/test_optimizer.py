@@ -3600,3 +3600,177 @@ def test_score_estimate_doubles_with_the_hardware_reference_read(settings, info,
     cpu_read = enc._est_score_mb(120)
     enc._hwdec_ok = True
     assert enc._est_score_mb(120) == pytest.approx(cpu_read * 2)
+
+
+# ---------------------------------------------------------------------------
+# probe_encoder="qsv+svt": the card predicts, SVT confirms
+# ---------------------------------------------------------------------------
+
+def _verified_encoder(settings, info, plan, tmp_path, shots=40):
+    settings.transcode.optimizer.probe_encoder = "qsv+svt"
+    settings.transcode.optimizer.gpu_probe_anchors = 6
+    settings.transcode.optimizer.probe_crfs = list(range(18, 51, 2))
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    return enc, [(i * 100, (i + 1) * 100) for i in range(shots)]
+
+
+def _plant_svt(enc, monkeypatch, crf_of, probed):
+    """Make an SVT probe return a planted linear curve and record every CRF
+    it actually spends a probe on."""
+    monkeypatch.setattr(enc, "_acquire_shard", lambda *a, **k: None)
+    monkeypatch.setattr(enc, "_release_shard", lambda *a, **k: None)
+    monkeypatch.setattr(enc, "_probe_window", lambda s0, s1: (s0, s1))
+    monkeypatch.setattr(enc, "_probe_input", lambda *a, **k: ([], []))
+
+    def fake(idx, w0, w1, crf, lp, shard):
+        probed.setdefault(idx, []).append(crf)
+        return idx, crf, enc.target + (crf_of(idx) - crf)
+    monkeypatch.setattr(enc, "_probe_encode_and_score", fake)
+
+
+def test_verified_mode_is_off_unless_asked_for(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._probe_mode() == "svt"
+    settings.transcode.optimizer.probe_encoder = "qsv+svt"
+    assert enc._probe_mode() == "qsv+svt"
+    assert enc._gpu_probe_on() is True     # the card is busy either way
+
+
+def test_a_right_prediction_costs_two_probes(settings, info, plan, tmp_path, monkeypatch):
+    """The point of the mode: land on the answer, confirm it, stop."""
+    enc, _ = _verified_encoder(settings, info, plan, tmp_path)
+    grid = list(range(18, 51, 2))
+    probed = {}
+    _plant_svt(enc, monkeypatch, lambda i: 30.5, probed)
+    scores = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed=30.0, step=2)
+    assert probed[0] == [30, 32]
+    assert opt.pick_crf(list(scores.items()), enc.target) == pytest.approx(30.5)
+
+
+def test_a_wrong_prediction_costs_probes_but_not_the_answer(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A prediction at the wrong end of the grid must still converge on the
+    CRF the SVT curve actually crosses at - that is the whole invariant this
+    mode buys over mapping the answer outright."""
+    enc, _ = _verified_encoder(settings, info, plan, tmp_path)
+    grid = list(range(18, 51, 2))
+    probed = {}
+    _plant_svt(enc, monkeypatch, lambda i: 24.0, probed)
+    scores = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed=50.0, step=2)
+    assert probed[0][0] == 50                      # it did start where told
+    assert len(probed[0]) <= len(grid)             # and stayed inside the budget
+    assert opt.pick_crf(list(scores.items()), enc.target) == pytest.approx(24.0)
+
+
+def test_the_seeded_walk_stops_at_the_edge_of_the_grid(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A shot that cannot reach the target at any probed CRF must stop, not
+    spin at the boundary."""
+    enc, _ = _verified_encoder(settings, info, plan, tmp_path)
+    grid = list(range(18, 51, 2))
+    probed = {}
+    _plant_svt(enc, monkeypatch, lambda i: 4.0, probed)   # crosses below the grid
+    scores = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed=30.0, step=2)
+    assert 18 in scores and len(probed[0]) <= len(grid)
+
+
+def test_verified_probing_never_takes_its_answer_from_the_map(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Plant a mapping that is wrong by 10 CRF on every shot. The delivered
+    CRF must still be the one the SVT probes measured."""
+    enc, shots = _verified_encoder(settings, info, plan, tmp_path)
+    grid = list(range(18, 51, 2))
+    qgrid = enc._qsv_grid()
+    crf_of = lambda i: 24.0 + (i % 3) * 2
+    probed = {}
+    _plant_svt(enc, monkeypatch, crf_of, probed)
+    # q* maps to a CRF 10 too high through any line fitted on these pairs
+    monkeypatch.setattr(enc, "_probe_shot_qsv",
+                        lambda idx, s0, s1, qg: _curve(qgrid, 20.0, enc.target))
+    samples = enc.probe_all_verified(shots, grid)
+    chosen = enc.pick_all_crfs(samples, grid)
+    assert len(chosen) == len(shots)
+    for idx, crf in chosen.items():
+        assert crf == pytest.approx(crf_of(idx), abs=0.01)
+
+
+def test_verified_probing_seeds_from_the_line_once_it_has_learned_one(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The anchors start it off; after that every verified shot feeds the fit,
+    so the later shots are seeded rather than probed from the grid."""
+    enc, shots = _verified_encoder(settings, info, plan, tmp_path, shots=60)
+    grid = list(range(18, 51, 2))
+    qgrid = enc._qsv_grid()
+    crf_of = lambda i: 24.0 + (i % 4)
+    q_of = lambda i: (crf_of(i) + 14.0) / 2.0
+    seeded, plain = [], []
+    monkeypatch.setattr(enc, "_probe_shot_qsv",
+                        lambda idx, s0, s1, qg: _curve(qgrid, q_of(idx), enc.target))
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: (plain.append(idx),
+                                                    _curve(grid, crf_of(idx), enc.target))[1])
+    monkeypatch.setattr(enc, "_probe_shot_seeded",
+                        lambda idx, s0, s1, g, lp, seed, step: (
+                            seeded.append((idx, seed)),
+                            _curve(grid, crf_of(idx), enc.target))[1])
+    samples = enc.probe_all_verified(shots, grid)
+    assert len(samples) == len(shots)
+    assert len(seeded) > len(shots) // 2          # most shots used the line
+    for idx, seed in seeded:                      # and it pointed at the answer
+        assert abs(seed - crf_of(idx)) <= 2.0
+
+
+def test_verified_probing_falls_back_to_the_grid_when_the_line_is_useless(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Above _VERIFY_MAX_SD the prediction is noise. It is not a correctness
+    gate - it only decides whether to seed from the line or from the middle of
+    the grid, the way the plain path always does."""
+    enc, shots = _verified_encoder(settings, info, plan, tmp_path, shots=60)
+    grid = list(range(18, 51, 2))
+    qgrid = enc._qsv_grid()
+    import random
+    rnd = random.Random(7)
+    truth = {i: 20.0 + rnd.random() * 28 for i in range(len(shots))}
+    crf_of = truth.__getitem__            # no relation to q at all
+    monkeypatch.setattr(enc, "_probe_shot_qsv",
+                        lambda idx, s0, s1, qg: _curve(qgrid, 20.0 + (idx % 7),
+                                                       enc.target))
+    seeded, plain = [], []
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: (plain.append(idx),
+                                                    _curve(grid, crf_of(idx), enc.target))[1])
+    monkeypatch.setattr(enc, "_probe_shot_seeded",
+                        lambda idx, s0, s1, g, lp, seed, step: (
+                            seeded.append(idx),
+                            _curve(grid, crf_of(idx), enc.target))[1])
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: None)
+    samples = enc.probe_all_verified(shots, grid)
+    assert len(samples) == len(shots)
+    assert len(plain) > len(seeded)
+
+
+def test_a_failed_qsv_prediction_still_probes_the_shot(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The card being busy or wedged is not a reason to skip a shot."""
+    enc, shots = _verified_encoder(settings, info, plan, tmp_path, shots=10)
+    grid = list(range(18, 51, 2))
+    def boom(idx, s0, s1, qg):
+        raise opt.TranscodeError("no room on the GPU")
+    monkeypatch.setattr(enc, "_probe_shot_qsv", boom)
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: _curve(grid, 26.0, enc.target))
+    samples = enc.probe_all_verified(shots, grid)
+    assert len(samples) == len(shots)
+    chosen = enc.pick_all_crfs(samples, grid)
+    assert all(c == pytest.approx(26.0) for c in chosen.values())
+
+
+def test_the_second_probe_is_placed_from_the_residual_spread(settings, info, plan, tmp_path):
+    """Far enough that the pair straddles the target most of the time, and no
+    further - a probe out in the tail measures a part of the curve nothing
+    will use."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc._verify_step(0.0) == 2          # floor
+    assert enc._verify_step(2.0) == 3          # 1.5 sd
+    assert enc._verify_step(40.0) == 8         # ceiling
