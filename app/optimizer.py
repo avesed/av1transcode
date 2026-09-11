@@ -2835,13 +2835,14 @@ class ShotEncoder:
         bracket of 6 cost 3.84 probes a shot on that episode; false position
         gets inside the same tolerance in three.
 
-        The third probe is NOT justified by a measurement. The reasoning is
-        that a chord drawn across the whole grid should miss a curve that
-        bends, and the third point corrects it - but how far a two-point
-        chord actually lands from the crossing over q 14..38 has never been
-        measured, and it may well be inside the tolerance on its own. Worth
-        an hour with the card before anyone assumes otherwise; two probes
-        would make the pass a third cheaper again.
+        Three rather than two, and now measured. Dropping to the ends alone
+        and taking the chord moves the crossing by -2.46 q on average
+        (sd 1.20) against the three-point answer, over 156 shots of a 4K
+        episode - a systematic underestimate, which is the bend the third
+        point exists to correct. The mean an intercept can absorb; the
+        spread it cannot, and 1.20 q over the map's 1.76 CRF per q is ~2 CRF
+        added to a residual of 2.44. One score saved is not worth taking the
+        prediction from 2.44 to ~3.1.
 
         If the ends do not bracket the target at all there is no crossing to
         find and no third probe is worth spending.
