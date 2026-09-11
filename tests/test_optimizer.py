@@ -3797,3 +3797,16 @@ def test_the_second_probe_is_placed_from_the_residual_spread(settings, info, pla
     assert enc._verify_step(0.0) == 2          # floor
     assert enc._verify_step(2.0) == 3          # 1.5 sd
     assert enc._verify_step(40.0) == 8         # ceiling
+
+
+def test_the_first_fit_does_not_land_on_the_minimum_sample(settings, info, plan, tmp_path):
+    """Four pairs is enough to draw a line and far too few to trust one: on a
+    real episode the first fit came out at 6.06 CRF over four pairs - above
+    the threshold, so nothing was seeded for the next 25 pairs - while the
+    same content fitted to 4.14 over 104."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    pairs = [(float(q), 2.0 * q + 3.0) for q in range(14, 40, 2)]
+    assert enc._refit_verified(pairs[:4]) is None
+    assert enc._refit_verified(pairs[:enc._VERIFY_MIN_PAIRS - 1]) is None
+    fit = enc._refit_verified(pairs[:enc._VERIFY_MIN_PAIRS])
+    assert fit is not None and fit["a"] == pytest.approx(2.0)

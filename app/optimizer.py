@@ -2896,9 +2896,19 @@ class ShotEncoder:
     # over it.
     # ------------------------------------------------------------------
 
+    # Pairs the FIRST fit needs. Four is enough to draw a line and far too
+    # few to trust one: measured on a 163-shot episode the first fit landed
+    # on four pairs at a residual of 6.06 CRF, which is above the threshold,
+    # so nothing was seeded until the next refit 25 pairs later - and the
+    # same episode's fit over 104 pairs came out at 4.14. Only 48 of 163
+    # shots ended up seeded, and the QSV pass was paid for all 163.
+    _VERIFY_MIN_PAIRS = 12
     # Refit this often. Theil-Sen is quadratic in the pairs, so refitting on
-    # every shot would grow into real time by the end of an episode.
+    # every shot would grow into real time by the end of an episode. While
+    # there is no fit worth following yet, refit sooner: every 25 pairs is a
+    # long time to keep probing from the grid because of one noisy line.
     _VERIFY_REFIT_EVERY = 25
+    _VERIFY_REFIT_EVERY_UNUSABLE = 10
     # Pairs the fit looks at, most recent first. Bounds the refit cost and
     # gives the line locality: an episode's content is not one population.
     _VERIFY_FIT_WINDOW = 200
@@ -3008,7 +3018,7 @@ class ShotEncoder:
         In-sample is optimistic, which _verify_step's 1.5 multiplier and
         floor of 2 already allow for.
         """
-        if len(pairs) < 4:
+        if len(pairs) < self._VERIFY_MIN_PAIRS:
             return None
         recent = pairs[-self._VERIFY_FIT_WINDOW:]
         a, b = self._theil_sen(recent)
@@ -3036,6 +3046,7 @@ class ShotEncoder:
         pairs: List[Tuple[float, float]] = []
         state: Dict[str, object] = {"fit": None, "since": 0, "warned": False,
                                     "seeded": 0, "walked": 0}
+        qsv_spent = [0]
         lock = threading.Lock()
         self._log(f"verified gpu probing: {len(seeds)} seed shot(s) of "
                   f"{len(shots)}, q grid {qgrid}")
@@ -3048,7 +3059,10 @@ class ShotEncoder:
             s0, s1 = shots[idx]
             q_star = None
             try:
-                q_star = self._crossing(self._probe_shot_qsv(idx, s0, s1, qgrid))
+                qs = self._probe_shot_qsv(idx, s0, s1, qgrid)
+                with lock:
+                    qsv_spent[0] += len(qs)
+                q_star = self._crossing(qs)
             except TranscodeError as e:
                 # the card is busy, wedged, or this shot simply never crosses
                 # on the QSV curve. None of that is a reason not to probe it.
@@ -3084,8 +3098,12 @@ class ShotEncoder:
                 if q_star is not None and crf_star is not None:
                     pairs.append((q_star, crf_star))
                     state["since"] = int(state["since"]) + 1
-                    if (state["fit"] is None
-                            or int(state["since"]) >= self._VERIFY_REFIT_EVERY):
+                    cur = state["fit"]
+                    usable = bool(cur) and cur["sd"] <= self._verify_max_sd(grid)
+                    every = (self._VERIFY_REFIT_EVERY if usable
+                             else self._VERIFY_REFIT_EVERY_UNUSABLE)
+                    if (len(pairs) >= self._VERIFY_MIN_PAIRS
+                            and int(state["since"]) >= every):
                         state["since"] = 0
                         snapshot = list(pairs)
             if snapshot is not None:
@@ -3107,12 +3125,22 @@ class ShotEncoder:
                             new["sd"], new["n"])
             return None
 
-        self._schedule(list(range(len(shots))), phase="probing", cost=cost,
-                       run_one=run_one, on_done=lambda *_: None,
-                       progress=lambda d: self._report(d / max(len(shots), 1) * 100,
-                                                       d, len(shots)),
-                       max_conc=self._max_probe_concurrency(len(shots)),
-                       ladder=ladder, cpu_charge=self.opt.probe_cpu_charge)
+        stop, peak = self._start_mem_sampler()
+        try:
+            self._schedule(list(range(len(shots))), phase="probing", cost=cost,
+                           run_one=run_one, on_done=lambda *_: None,
+                           progress=lambda d: self._report(d / max(len(shots), 1) * 100,
+                                                           d, len(shots)),
+                           max_conc=self._max_probe_concurrency(len(shots)),
+                           ladder=ladder, cpu_charge=self.opt.probe_cpu_charge)
+        finally:
+            stop.set()
+        self._log_phase_memory("probing", peak[0])
+        spent = sum(len(v) for v in samples.values())
+        if samples:
+            self._mem_log(f"probes: {spent} for {len(samples)} shot(s), "
+                          f"{spent / len(samples):.2f} per shot (SVT), plus "
+                          f"{qsv_spent[0]} on the card")
 
         fit = state["fit"]
         if fit:
