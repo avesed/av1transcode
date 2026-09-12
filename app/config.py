@@ -539,6 +539,21 @@ class OptimizerSettings(BaseModel):
     # back to the lowest probed CRF, i.e. the most expensive setting available,
     # and the output ends up larger than the source.
     min_crf: int = 0
+    # Hard ceiling, the mirror of min_crf (0 = the top of probe_crfs).
+    #
+    # It exists so the probe RANGE and the delivery RANGE can be different
+    # things. Measured on a 163-shot 4K episode, 17 shots still beat the
+    # target at the top of the grid and 10 still missed it at the bottom -
+    # both groups spend the whole probe budget discovering that, and both
+    # are then clamped to a grid end anyway. Widening probe_crfs finds their
+    # real crossing (the easiest extrapolated to CRF 87), but widening it is
+    # only safe if "probed at 63" does not mean "delivered at 63".
+    #
+    # So: probe_crfs says where to LOOK, min_crf/max_crf say what may be
+    # SHIPPED. With the two separated, the probe range costs nothing to widen
+    # - the card probes only the two ends of its own grid, and the seeded SVT
+    # search probes around a prediction rather than sweeping the grid.
+    max_crf: int = 0
     # Added to every interpolated CRF before clamping, to trade the probe's
     # systematic bias back for size. 0 = off.
     #

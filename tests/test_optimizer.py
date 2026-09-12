@@ -3688,8 +3688,9 @@ def test_a_right_prediction_costs_two_probes(settings, info, plan, tmp_path, mon
     probed = {}
     _plant_svt(enc, monkeypatch, lambda i: 30.5, probed)
     scores = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed=30.0, step=2)
-    assert probed[0] == [30, 32]
-    assert opt.pick_crf(list(scores.items()), enc.target) == pytest.approx(30.5)
+    # both points at once, no direction-finding probe between them
+    assert probed[0] == [28, 32]
+    assert opt.pick_crf(list(scores.items()), enc.target) == pytest.approx(30.5, abs=0.1)
 
 
 def test_a_wrong_prediction_costs_probes_but_not_the_answer(
@@ -4016,3 +4017,69 @@ def test_luminance_qp_bias_reaches_the_encoder_only_when_set(settings, info, pla
     enc.video.luminance_qp_bias = 50
     assert "luminance-qp-bias=50" in ":".join(
         f"{k}={x}" for k, x in opt._svt_params_dict(enc.video).items())
+
+
+def test_a_prediction_past_a_bound_is_settled_by_one_probe(
+        settings, info, plan, tmp_path, monkeypatch):
+    """27 of 163 shots on the measured episode have no crossing at all. In the
+    plain path they burn the whole budget discovering that. Here the
+    prediction points at a bound and one probe confirms the target is out of
+    reach there - which IS the answer."""
+    settings.transcode.optimizer.probe_crfs = [20, 26, 32, 38, 44]
+    settings.transcode.optimizer.probe_encoder = "qsv+svt"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    grid = enc._probe_grid()
+    probed = {}
+    # a shot whose curve crosses far below the grid: nothing reaches the target
+    _plant_svt(enc, monkeypatch, lambda i: 8.0, probed)
+    scores = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed=12.0, step=4)
+    assert probed[0] == [20]                      # one probe at the floor
+    assert opt.pick_crf(list(scores.items()), enc.target) == 20.0
+    # and the mirror: a shot so easy it beats the target at the ceiling
+    probed.clear()
+    _plant_svt(enc, monkeypatch, lambda i: 70.0, probed)
+    scores = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed=61.0, step=4)
+    assert probed[0] == [44]
+    assert opt.pick_crf(list(scores.items()), enc.target) == 44.0
+
+
+def test_a_wrong_out_of_range_guess_costs_one_probe_not_the_answer(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Outside the fitted range the prediction is poor - 7.70 CRF mean error
+    against 2.4 inside it, because the fit only ever sees shots that cross. So
+    it picks which bound to try, never the value, and being wrong costs a
+    probe."""
+    settings.transcode.optimizer.probe_crfs = [20, 26, 32, 38, 44]
+    settings.transcode.optimizer.probe_encoder = "qsv+svt"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    grid = enc._probe_grid()
+    probed = {}
+    _plant_svt(enc, monkeypatch, lambda i: 31.0, probed)     # really in range
+    scores = enc._probe_shot_seeded(0, 0, 100, grid, 4, seed=18.0, step=4)
+    spent = len(probed[0])
+    got = opt.pick_crf(list(scores.items()), enc.target)
+    probed.clear()
+    plain = opt.pick_crf(list(enc._probe_shot(0, 0, 100, grid, 4).items()), enc.target)
+    assert got == pytest.approx(plain, abs=1.0)
+    assert spent <= enc._probe_budget(grid)
+
+
+def test_max_crf_caps_delivery_without_narrowing_the_probe_range(
+        settings, info, plan, tmp_path):
+    """probe_crfs says where to look; min_crf/max_crf say what may be shipped.
+    Separating them is what makes widening the probe range free."""
+    settings.transcode.optimizer.probe_crfs = [20, 30, 40, 50, 60]
+    settings.transcode.optimizer.max_crf = 45
+    settings.transcode.optimizer.min_crf = 25
+    enc = make_encoder(settings, info, plan, tmp_path)
+    grid = enc._probe_grid()
+    assert min(grid) == 20 and max(grid) == 60        # the probe range is intact
+    assert enc._crf_floor(min(grid)) == 25.0
+    assert enc._crf_ceiling(max(grid)) == 45.0
+    # a shot too easy to be worth any probed CRF ships the ceiling; one that
+    # never reaches the target ships the floor
+    t = enc.target
+    easy = {20: t + 9.0, 60: t + 1.0}      # beats the target everywhere
+    hard = {20: t - 1.0, 60: t - 6.0}      # misses it everywhere
+    chosen = enc.pick_all_crfs({0: easy, 1: hard}, grid)
+    assert chosen[0] == 45.0 and chosen[1] == 25.0
