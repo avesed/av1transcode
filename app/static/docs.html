@@ -19,6 +19,16 @@
     header nav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-left: 14px; }
     header nav a:hover { color: var(--text); }
     main { padding: 20px 22px; max-width: 960px; margin: 0 auto; }
+    main :is(pre, table) { max-width: 100%; overflow-x: auto; }
+    main img { max-width: 100%; height: auto; }
+    @media (max-width: 620px) {
+      header { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+      header h1 { font-size: 16px; }
+      header nav { margin-left: auto; }
+      header nav a { margin-left: 10px; }
+      main { padding: 14px 12px; }
+      main code { word-break: break-word; }
+    }
     h2 { font-size: 17px; margin: 32px 0 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
     h3 { font-size: 14px; margin: 20px 0 6px; color: var(--accent); }
     p { font-size: 13.5px; }

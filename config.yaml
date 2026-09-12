@@ -62,6 +62,14 @@ transcode:
     preset: 4
     film_grain: 0              # 0=off, 8-10 good for grainy film
     film_grain_denoise: false
+    luminance_qp_bias: 0        # SVT --luminance-qp-bias，按帧平均亮度降 QP(0 = 关，1-100)，
+                               # 也就是给暗帧更多比特。逐预设开关,不设全局默认值。
+                               # 两段 90s 4K 实测(值 50,同配置对照)：体积 +9.8%(暗场)
+                               # 和 +8.9%(亮场)，交付 VMAF 中位 +0.37 / +0.06，任何
+                               # 探测 CRF 都够不到目标的镜头 6/23 → 2/23。所以它确实
+                               # 打到了目标镜头,但**不只作用于暗帧**(亮场也涨),而且
+                               # CRF 搜索不会把多给的比特换成更高的 CRF——值不值是对
+                               # 片库的取舍判断,不是技术默认值。
     passes: 1
     keyint: 240
     tune: 0                    # 0=VQ, 1=PSNR, 2=SSIM

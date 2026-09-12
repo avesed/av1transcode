@@ -3999,3 +3999,20 @@ def test_seeded_and_plain_agree_on_the_grid_the_bug_hid_behind(
                         f"seeded {opt.pick_crf(list(got.items()), enc.target)} "
                         f"vs plain {want} (probed {sorted(probed[0])})")
                 assert len(probed[0]) <= enc._probe_budget(grid)
+
+
+def test_luminance_qp_bias_reaches_the_encoder_only_when_set(settings, info, plan, tmp_path):
+    """Per-preset, not a global default: measured on two 90s 4K cuts it costs
+    ~9% of the output for +0.06 to +0.37 delivered VMAF, while halving the
+    shots that cannot reach the target at any probed CRF. That trade is a
+    judgement about the library, not a default."""
+    v = VideoParams(engine="optimizer")
+    assert "luminance-qp-bias" not in opt._svt_params_dict(v)
+    v.luminance_qp_bias = 50
+    assert opt._svt_params_dict(v)["luminance-qp-bias"] == 50
+    # and it rides along into the probe encodes, or the search would be
+    # picking CRFs for an encoder configured differently from the delivery
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc.video.luminance_qp_bias = 50
+    assert "luminance-qp-bias=50" in ":".join(
+        f"{k}={x}" for k, x in opt._svt_params_dict(enc.video).items())

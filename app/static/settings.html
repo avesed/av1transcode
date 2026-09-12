@@ -120,6 +120,26 @@
       .rail a { white-space: nowrap; } .rail a.sub { display: none; }
       .grid { grid-template-columns: 1fr; }
     }
+    /* Phones. The preset cards are a flex row of name + a long monospace
+       parameter string, which on a narrow screen squeezes the name to one
+       character per line; stack them instead. */
+    @media (max-width: 620px) {
+      header { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+      header h1 { font-size: 16px; }
+      header nav { margin-left: auto; }
+      header nav a { margin-left: 10px; }
+      .wrap { padding: 10px; }
+      section.card { padding: 14px 12px; }
+      .plist .card { flex-direction: column; align-items: flex-start; gap: 8px; }
+      .plist .name { min-width: 0; }
+      .plist .params { font-size: 11px; word-break: break-word; }
+      .paths div { flex-direction: column; gap: 0; }
+      .paths .k { min-width: 0; }
+      .field input, .field select { font-size: 16px; }   /* iOS zooms below 16 */
+      .actions { gap: 6px; }
+      .actions button { flex: 1 1 auto; }
+      #toast { left: 10px; right: 10px; bottom: 10px; max-width: none; }
+    }
   </style>
 </head>
 <body>
@@ -242,6 +262,7 @@
         <div class="field"><label>SVT-AV1 速度 <code>preset</code></label><div class="ctl"><input type="number" id="f-preset" value="4" min="0" max="13"></div><div class="help">0 最慢最好，13 最快。</div></div>
         <div class="field"><label>胶片颗粒合成 <code>film_grain</code></label><div class="ctl"><input type="number" id="f-film_grain" value="0" min="0" max="50"></div><div class="help">0 关；颗粒电影 8-10。</div></div>
         <div class="field"><label>先去噪再合成颗粒 <code>film_grain_denoise</code></label><div class="ctl"><select id="f-film_grain_denoise"><option value="false">关</option><option value="true">开</option></select></div></div>
+        <div class="field"><label>暗帧 QP 偏置 <code>luminance_qp_bias</code></label><div class="ctl"><input type="number" id="f-luminance_qp_bias" value="0" min="0" max="100"></div><div class="help">0 关。按帧平均亮度降 QP，给暗帧更多比特。实测 50：体积 +9~10%，交付中位 +0.06~0.37 分，够不到目标的镜头 6/23 → 2/23。亮场也会涨，不只作用于暗帧。</div></div>
         <div class="field"><label>编码遍数 <code>passes</code></label><div class="ctl"><input type="number" id="f-passes" value="1" min="1" max="2"></div></div>
         <div class="field"><label>关键帧间隔 <code>keyint</code></label><div class="ctl"><input type="number" id="f-keyint" value="240" min="0"><span class="unit">帧</span></div></div>
         <div class="field"><label>长场景再切分 <code>extra_split_sec</code></label><div class="ctl"><input type="number" id="f-extra_split_sec" value="60" min="0"><span class="unit">秒</span></div></div>
@@ -581,6 +602,7 @@ async function loadList() {
     if (p.engine === "optimizer") lines.push(`engine=optimizer · metric=${p.target_metric}${p.target_quality ? ` · target=${p.target_quality}` : ""}`);
     else if (p.target_quality) lines.push(`target_quality=${p.target_quality}`);
     if (p.film_grain) lines.push(`film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
+    if (p.luminance_qp_bias) lines.push(`luminance_qp_bias=${p.luminance_qp_bias}`);
     if (p.vmaf_threads) lines.push(`vmaf_threads=${p.vmaf_threads}`);
     if (p.additional_video_params) lines.push(esc(p.additional_video_params));
     const card = document.createElement("div");
@@ -593,10 +615,10 @@ async function loadList() {
     list.appendChild(card);
   }
 }
-const PRESET_KEYS = ["engine", "target_metric", "crf", "preset", "film_grain", "film_grain_denoise", "passes", "keyint", "extra_split_sec",
+const PRESET_KEYS = ["engine", "target_metric", "crf", "preset", "film_grain", "film_grain_denoise", "luminance_qp_bias", "passes", "keyint", "extra_split_sec",
   "min_scene_len", "tune", "pixel_format", "target_quality", "probes", "probing_rate", "probe_res", "probing_vmaf_features",
   "vmaf_threads", "probe_video_params", "additional_video_params"];
-const PRESET_INT = new Set(["crf", "preset", "film_grain", "passes", "keyint", "extra_split_sec", "min_scene_len", "tune", "probes", "probing_rate", "vmaf_threads"]);
+const PRESET_INT = new Set(["crf", "preset", "film_grain", "luminance_qp_bias", "passes", "keyint", "extra_split_sec", "min_scene_len", "tune", "probes", "probing_rate", "vmaf_threads"]);
 function fillForm(name, p) {
   $("f-name").value = name; $("f-name").disabled = !!name;
   for (const k of PRESET_KEYS) {

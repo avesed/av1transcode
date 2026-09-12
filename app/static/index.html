@@ -24,11 +24,13 @@
             padding: 10px 18px; }
     .stat b { display: block; font-size: 20px; }
     .stat span { color: var(--muted); font-size: 12px; }
+    .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     table { width: 100%; border-collapse: collapse; background: var(--panel);
             border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
     th, td { text-align: left; padding: 10px 14px; font-size: 13px; border-bottom: 1px solid var(--border); }
     th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; }
-    .bar { width: 120px; height: 6px; background: #2a2f3a; border-radius: 4px; overflow: hidden; }
+    .bar { width: 120px; max-width: 100%; height: 6px; background: #2a2f3a;
+           border-radius: 4px; overflow: hidden; }
     .bar > div { height: 100%; background: var(--accent); }
     .st-done { color: var(--ok); } .st-failed { color: var(--err); }
     .st-pending { color: var(--warn); } .st-running { color: var(--accent); }
@@ -36,6 +38,34 @@
              padding: 6px 12px; cursor: pointer; font-size: 12px; }
     button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
     form { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+
+    /* Phones. A seven-column table of 4K filenames cannot be made to fit by
+       shrinking, so below this width each row becomes a stacked card with
+       its column name as the label - the header row is what carries the
+       labels on a wide screen, and it is the first thing that has to go. */
+    @media (max-width: 720px) {
+      main { padding: 14px 12px; }
+      header { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+      header h1 { font-size: 16px; }
+      header nav { margin-left: auto; }
+      .stats { gap: 8px; }
+      .stat { padding: 8px 12px; flex: 1 1 30%; }
+      .stat b { font-size: 17px; }
+      form { gap: 6px; }
+      form input[type=text], form select, form button { flex: 1 1 100%; max-width: none; }
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { position: absolute; left: -9999px; }        /* labels move inline */
+      table { border: 0; background: transparent; }
+      tr { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 10px; margin-bottom: 10px; padding: 4px 0; }
+      td { border-bottom: 0; padding: 6px 12px; display: flex; gap: 10px;
+           align-items: baseline; }
+      td::before { content: attr(data-label); color: var(--muted); font-size: 11px;
+                   text-transform: uppercase; flex: 0 0 4.2em; }
+      td:empty { display: none; }
+      td > .muted { word-break: break-all; }
+      .bar { width: 100%; }
+    }
     input[type=text] { flex: 1; min-width: 200px; background: var(--panel); border: 1px solid var(--border);
       border-radius: 6px; padding: 8px 12px; color: var(--text); }
     select { max-width:180px; background: var(--panel); border: 1px solid var(--border);
@@ -116,12 +146,14 @@
     </select>
     <button type="button" class="ghost" id="pruneBtn" title="删除所有已结束（完成/失败/取消/跳过）的记录">清除历史记录</button>
   </div>
-  <table>
-    <thead><tr>
-      <th>状态</th><th>文件</th><th>进度</th><th>阶段</th><th>预设</th><th>大小</th><th>操作</th>
-    </tr></thead>
-    <tbody id="jobs"></tbody>
-  </table>
+  <div class="tablewrap">
+    <table>
+      <thead><tr>
+        <th>状态</th><th>文件</th><th>进度</th><th>阶段</th><th>预设</th><th>大小</th><th>操作</th>
+      </tr></thead>
+      <tbody id="jobs"></tbody>
+    </table>
+  </div>
   <div class="empty" id="empty" style="display:none">暂无任务</div>
 </main>
 <script src="/static/apikey.js"></script>
@@ -221,15 +253,15 @@ async function refresh() {
     const err = j.error ? `<div class="muted" style="color:var(--err)">${esc(j.error)}</div>` : "";
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td class="${stCls(j.status)}">${esc(j.status)}</td>
-      <td>${esc((j.meta&&j.meta.display)||(j.source||"").split("/").pop())}
-          <div class="muted">${esc(j.source||"")}</div>${err}</td>
-      <td><div class="bar"><div style="width:${j.progress||0}%"></div></div>
-          <span class="muted">${(j.progress||0).toFixed(0)}%${esc(liveStats(j))}</span></td>
-      <td class="muted">${esc(stageLabel(j.stage))}</td>
-      <td class="muted">${paramCell}</td>
-      <td class="muted">${size}</td>
-      <td>${["running","pending","analyzing"].includes(j.status)
+      <td data-label="状态" class="${stCls(j.status)}">${esc(j.status)}</td>
+      <td data-label="文件"><div>${esc((j.meta&&j.meta.display)||(j.source||"").split("/").pop())}
+          <div class="muted">${esc(j.source||"")}</div>${err}</div></td>
+      <td data-label="进度"><div style="flex:1"><div class="bar"><div style="width:${j.progress||0}%"></div></div>
+          <span class="muted">${(j.progress||0).toFixed(0)}%${esc(liveStats(j))}</span></div></td>
+      <td data-label="阶段" class="muted">${esc(stageLabel(j.stage))}</td>
+      <td data-label="预设" class="muted">${paramCell}</td>
+      <td data-label="大小" class="muted">${size}</td>
+      <td data-label="操作">${["running","pending","analyzing"].includes(j.status)
         ? `<button class="ghost" data-id="${j.id}">取消</button>` : ""}
           ${["running","analyzing","done","failed","cancelled"].includes(j.status)
             ? `<button class="ghost" data-log="${j.id}">日志</button>` : ""}</td>`;

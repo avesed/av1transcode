@@ -80,6 +80,19 @@ class VideoParams(BaseModel):
     # Film grain synthesis level 0-50, 0 = disabled. 8-10 for grainy live action.
     film_grain: int = 0
     film_grain_denoise: bool = False
+    # SVT-AV1 --luminance-qp-bias: lowers a frame's QP according to its
+    # average luma, i.e. spends more bits on dark frames. 0 = off, 1-100.
+    #
+    # Measured on two 90s 4K cuts against the same configuration without it:
+    # output +9.8% (dark passage) and +8.9% (bright), delivered VMAF median
+    # +0.37 and +0.06, and shots that could not reach the target at any
+    # probed CRF fell from 6/23 to 2/23. So it does reach the shots it is
+    # aimed at, it is NOT confined to dark frames (the bright cut paid too),
+    # and the quality it buys is small against what it costs - the CRF
+    # search does not convert the extra bits back into a higher CRF.
+    # Whether that trade is worth taking is a judgement about the library,
+    # which is why it is a per-preset switch and not a global default.
+    luminance_qp_bias: int = 0
     passes: int = 1
     keyint: int = 240
     # extra split in seconds: av1an will subdivide long scenes to keep chunks

@@ -150,7 +150,7 @@ def _parse_custom(items: Optional[List[str]]) -> dict:
         key, _, val = item.partition("=")
         key = key.strip()
         val = val.strip()
-        if key in ("crf", "preset", "film_grain", "passes", "keyint",
+        if key in ("crf", "preset", "film_grain", "luminance_qp_bias", "passes", "keyint",
                    "extra_split_sec", "min_scene_len", "tune",
                    "probes", "probing_rate", "vmaf_threads"):
             out[key] = int(val)

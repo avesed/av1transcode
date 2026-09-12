@@ -292,6 +292,8 @@ def _svt_params_dict(video: VideoParams) -> Dict[str, object]:
         svt["film-grain"] = video.film_grain
         if not video.film_grain_denoise:
             svt["film-grain-denoise"] = 0
+    if video.luminance_qp_bias:
+        svt["luminance-qp-bias"] = video.luminance_qp_bias
     if video.additional_video_params:
         toks = video.additional_video_params.split()
         i = 0
