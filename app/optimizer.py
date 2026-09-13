@@ -2252,9 +2252,22 @@ class ShotEncoder:
 
         -ss + -frames:v, the same frame-exact pairing the final encode uses; a
         `-t` duration here is what let windows come out a frame short.
+
+        But -frames:v counts the frames that LEAVE the chain, and a probe-side
+        `vf` does not emit one per frame it reads: at probing_rate 2 its fps=
+        keeps every other frame, so a shard capped by -frames:v alone read
+        twice the window and ran on into the next shot - which the probe
+        encode and its VMAF reference, both reading the shard, then measured.
+        Every DV P5 and SSIMULACRA2 probe at probing_rate > 1 did this.
+        Measured on a 23.976fps mkv: [0, 90) came out as source frames
+        0..178; with a timeline hole, [120, 240) reached 357. So the window is
+        bounded where the frames go IN, by trim ahead of every other filter
+        (after -ss has dropped the frames before w0): all 20 windows then held
+        exactly the live probe read's frames, at probing_rate 1 as before, and
+        the read stops at the window rather than decoding on to the end.
         """
         pre: List[str] = []
-        chain: List[str] = list(vf or [])
+        chain: List[str] = [f"trim=end_frame={w1 - w0}", *(vf or [])]
         if apply_dv:
             from app import dovi  # local import avoids a cycle
 

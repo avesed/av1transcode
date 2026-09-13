@@ -654,7 +654,9 @@ def test_staged_window_is_frame_exact_too(settings, info, plan, tmp_path):
     enc._extract_window(100, 220, tmp_path / "w.mkv")
     cmd = seen[0]
     assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
-    assert cmd[cmd.index("-vf") + 1] == "settb=AVTB,setpts=PTS-STARTPTS"
+    # the window is bounded on the way in as well as out: -frames:v alone
+    # counts what the chain emits (see test_p5_shard_holds_the_window_not_twice_it)
+    assert cmd[cmd.index("-vf") + 1] == "trim=end_frame=120,settb=AVTB,setpts=PTS-STARTPTS"
     assert cmd[cmd.index("-frames:v") + 1] == "120"
 
 
@@ -1151,6 +1153,42 @@ def test_p5_probe_converts_once_per_shot(settings, info, plan, tmp_path):
     for c in cmds:
         if "libsvtav1" in c or any("libvmaf=" in a for a in c):
             assert str(enc.source) not in c
+
+
+def test_p5_shard_holds_the_window_not_twice_it(settings, info, plan, tmp_path):
+    """-frames:v counts the frames that leave the chain, and at probing_rate 2
+    the probe-side fps= emits one for every two it reads: a shard capped by
+    -frames:v alone held twice the window and ran into the next shot, and the
+    probe encode and its reference both measured those frames. The window has
+    to be bounded where the frames go in, ahead of the subsampling."""
+    settings.transcode.optimizer.probing_rate = 2
+    cache = tmp_path / "shm"
+    cache.mkdir()
+    enc = _p5_encoder(settings, info, plan, tmp_path, cache)
+    cmds = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        if "ffv1" in args:
+            Path(args[-1]).write_bytes(b"shard")
+        elif any("libvmaf=" in a for a in args):
+            lavfi = args[args.index("-lavfi") + 1]
+            log_path = lavfi.split("log_path=")[1].split(":")[0]
+            Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 92.0}}}))
+        elif "-f" in args and args[args.index("-f") + 1] == "ivf":
+            Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc._probe_shot(0, 0, 90, [32], lp=4)
+
+    shard_cmd = [c for c in cmds if "ffv1" in c][0]
+    chain = shard_cmd[shard_cmd.index("-vf") + 1].split(",")
+    w0, w1 = enc._probe_window(0, 90)
+    assert chain[0] == f"trim=end_frame={w1 - w0}"
+    fps = next(i for i, f in enumerate(chain) if f.startswith("fps="))
+    assert 0 < fps
 
 
 def test_p5_shard_falls_back_to_workdir_when_cache_is_small(settings, info, plan, tmp_path,
