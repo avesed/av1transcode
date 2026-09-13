@@ -103,6 +103,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     # noble ships meson 1.3.2; VMAFx's meson.build requires >= 1.4
     && pip3 install --break-system-packages --no-cache-dir 'meson>=1.4'
+# libva, for libvmaf's VA-API surface import (vmaf_sycl_import_va_surface, see
+# optimizer.vmaf_zero_copy). meson compiles the DMA-BUF path only when libva
+# and libva-drm are found, and without them the symbol is still exported - as
+# a stub returning -ENOTSUP, which is exactly what the previous image shipped.
+# Its own layer so the 3.7GB oneAPI layer above stays cached.
+RUN apt-get update && apt-get install -y --no-install-recommends libva-dev \
+    && rm -rf /var/lib/apt/lists/*
 RUN git clone --filter=blob:none https://github.com/VMAFx/vmafx.git vmafx && \
     cd vmafx && git checkout -q ${VMAFX_REF}
 # -Dsycl_icpx_aot_targets=bmg-g21: ahead-of-time compile for the B580 only.
@@ -126,6 +133,8 @@ RUN . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 && \
     meson install -C /bld --destdir /out --no-rebuild && \
     mkdir -p /out/lib /out/include /out/lib/pkgconfig /out/share/model /out/bin /out/oneapi && \
     cp -a /out/usr/local/lib/libvmaf.so* /out/lib/ && \
+    # the -ENOTSUP stub would pass every other check in this image
+    grep -aq vaExportSurfaceHandle "$(readlink -f /out/lib/libvmaf.so)" && \
     cp -a /out/usr/local/lib/pkgconfig/*.pc /out/lib/pkgconfig/ && \
     cp -a /out/usr/local/include/libvmaf /out/include/ && \
     # all of them: the 4k model is what a 4K source should be scored with,
@@ -207,11 +216,18 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 # our patch and not the fork's (theirs needs two of the fork's earlier patches
 # to place at all, and gates the code behind a CONFIG_ symbol it never
 # defines). Adds sycl_device/sycl_profile to the existing libvmaf filter.
+# The zerocopy patch adds the libvmaf_sycl filter, which takes VA-API frames;
+# keep-decoder-until-cleanup stops ffmpeg destroying a decoder's VA context
+# while its frames are still queued, which crashed that filter in iHD.
 COPY patches/ffmpeg-n9.0.1-libvmaf-sycl.patch /build/
+COPY patches/ffmpeg-n9.0.1-libvmaf-sycl-zerocopy.patch /build/
+COPY patches/ffmpeg-n9.0.1-keep-decoder-until-cleanup.patch /build/
 RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}.tar.gz" \
       | tar xz && \
     cd "FFmpeg-${FFMPEG_REF}" && \
     patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-libvmaf-sycl.patch && \
+    patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-libvmaf-sycl-zerocopy.patch && \
+    patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-keep-decoder-until-cleanup.patch && \
     ./configure --prefix=/usr/local \
         --enable-gpl --enable-nonfree \
         --enable-libvpx --enable-libx264 --enable-libx265 \
@@ -227,6 +243,9 @@ RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}
     # case sycl_device=0 would fail at run time with ENOSYS instead of here.
     ffmpeg -hide_banner -h filter=libvmaf 2>&1 | grep -q sycl_device && \
     grep -q "^#define CONFIG_LIBVMAF_SYCL 1" config.h && \
+    # component switches live in config_components.h, not config.h
+    grep -q "^#define CONFIG_LIBVMAF_SYCL_FILTER 1" config_components.h && \
+    ffmpeg -hide_banner -h filter=libvmaf_sycl 2>&1 | grep -q sycl_device && \
     mkdir -p /out/lib /out/bin && \
     cp -a /usr/local/lib/* /out/lib/ && \
     cp /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /out/bin/

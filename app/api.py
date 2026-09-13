@@ -253,7 +253,8 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
 
     # ---------- GPU ----------
     _GPU_KEYS = ("vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel",
-                 "reference_hwaccel", "vmaf_sycl_workers", "gpu_vram_budget_mb")
+                 "reference_hwaccel", "vmaf_zero_copy", "vmaf_sycl_workers",
+                 "gpu_vram_budget_mb")
 
     def _gpu_settings() -> dict:
         o = settings.transcode.optimizer
@@ -261,6 +262,7 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
                 "vmaf_sycl_min_width": o.vmaf_sycl_min_width,
                 "scenedetect_hwaccel": o.scenedetect_hwaccel,
                 "reference_hwaccel": o.reference_hwaccel,
+                "vmaf_zero_copy": o.vmaf_zero_copy,
                 "vmaf_sycl_workers": o.vmaf_sycl_workers,
                 "gpu_vram_budget_mb": o.gpu_vram_budget_mb,
                 "vulkan_device": settings.transcode.dovi.vulkan_device}

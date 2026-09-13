@@ -1,0 +1,314 @@
+--- a/configure
++++ b/configure
+@@ -4297,6 +4297,7 @@
+ vidstabtransform_filter_deps="libvidstab"
+ libvmaf_filter_deps="libvmaf"
+ libvmaf_cuda_filter_deps="libvmaf libvmaf_cuda ffnvcodec"
++libvmaf_sycl_filter_deps="libvmaf libvmaf_sycl vaapi"
+ zmq_filter_deps="libzmq"
+ zoompan_filter_deps="swscale"
+ zscale_filter_deps="libzimg const_nan"
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -376,6 +376,7 @@
+ OBJS-$(CONFIG_LIBPLACEBO_FILTER)             += vf_libplacebo.o vulkan.o vulkan_filter.o
+ OBJS-$(CONFIG_LIBVMAF_FILTER)                += vf_libvmaf.o framesync.o
+ OBJS-$(CONFIG_LIBVMAF_CUDA_FILTER)           += vf_libvmaf.o framesync.o
++OBJS-$(CONFIG_LIBVMAF_SYCL_FILTER)           += vf_libvmaf.o framesync.o
+ OBJS-$(CONFIG_LIMITDIFF_FILTER)              += vf_limitdiff.o framesync.o
+ OBJS-$(CONFIG_LIMITER_FILTER)                += vf_limiter.o
+ OBJS-$(CONFIG_LOOP_FILTER)                   += f_loop.o
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -350,6 +350,7 @@
+ extern const FFFilter ff_vf_libplacebo;
+ extern const FFFilter ff_vf_libvmaf;
+ extern const FFFilter ff_vf_libvmaf_cuda;
++extern const FFFilter ff_vf_libvmaf_sycl;
+ extern const FFFilter ff_vf_limitdiff;
+ extern const FFFilter ff_vf_limiter;
+ extern const FFFilter ff_vf_loop;
+--- a/libavfilter/vf_libvmaf.c
++++ b/libavfilter/vf_libvmaf.c
+@@ -50,6 +50,11 @@
+ #include <libvmaf/libvmaf_sycl.h>
+ #endif
+ 
++#if CONFIG_LIBVMAF_SYCL_FILTER
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_vaapi.h"
++#endif
++
+ typedef struct LIBVMAFContext {
+     const AVClass *class;
+     FFFrameSync fs;
+@@ -870,3 +875,269 @@
+     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
+ };
+ #endif
++
++#if CONFIG_LIBVMAF_SYCL_FILTER
++/*
++ * libvmaf_sycl: score VA-API decoded frames on SYCL without copying them back
++ * to system memory.
++ *
++ * Ported from VMAFx ffmpeg-patches/0005, which takes QSV frames and one VA
++ * display for both inputs. This one takes AV_PIX_FMT_VAAPI frames: the
++ * surface id is data[3] and the display comes from each frame's own device,
++ * so the reference and the distorted copy may decode on one device or two.
++ * libvmaf exports each surface as DMA-BUF, imports it through Level Zero and
++ * de-tiles the luma plane on the card (vmaf_sycl_import_va_surface).
++ *
++ * Unlike 0005, a failed import fails the run instead of skipping the frame: a
++ * score pooled over fewer frames than were compared is a wrong score.
++ */
++#define SYCL_FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
++static const AVOption libvmaf_sycl_options[] = {
++    {"log_path",  "Set the file path to be used to write log.",                         OFFSET(log_path), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, SYCL_FLAGS},
++    {"log_fmt",  "Set the format of the log (csv, json, xml, or sub).",                 OFFSET(log_fmt), AV_OPT_TYPE_STRING, {.str="xml"}, 0, 1, SYCL_FLAGS},
++    {"pool",  "Set the pool method to be used for computing vmaf.",                     OFFSET(pool), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, SYCL_FLAGS},
++    {"n_subsample", "Set interval for frame subsampling used when computing vmaf.",     OFFSET(n_subsample), AV_OPT_TYPE_INT, {.i64=1}, 1, UINT_MAX, SYCL_FLAGS},
++    {"model",  "Set the model to be used for computing vmaf.",                          OFFSET(model_cfg), AV_OPT_TYPE_STRING, {.str="version=vmaf_v0.6.1"}, 0, 1, SYCL_FLAGS},
++    {"feature",  "Set the feature to be used for computing vmaf.",                      OFFSET(feature_cfg), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 1, SYCL_FLAGS},
++    {"sycl_device", "Score on this SYCL device index (-1 = default device).",            OFFSET(sycl_device), AV_OPT_TYPE_INT, {.i64=-1}, -1, INT_MAX, SYCL_FLAGS},
++    {"sycl_profile", "Enable SYCL queue profiling.",                                     OFFSET(sycl_profile), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, SYCL_FLAGS},
++    { NULL }
++};
++#undef SYCL_FLAGS
++
++FRAMESYNC_DEFINE_CLASS(libvmaf_sycl, LIBVMAFContext, fs);
++
++static int vaapi_surface_of(AVFilterContext *ctx, const AVFrame *frame,
++                            void **display, unsigned *surface)
++{
++    AVHWFramesContext *frames;
++    AVVAAPIDeviceContext *hwctx;
++
++    if (frame->format != AV_PIX_FMT_VAAPI || !frame->hw_frames_ctx) {
++        av_log(ctx, AV_LOG_ERROR, "libvmaf_sycl takes VA-API frames, got %s.\n",
++               av_get_pix_fmt_name(frame->format));
++        return AVERROR(EINVAL);
++    }
++    frames   = (AVHWFramesContext *)frame->hw_frames_ctx->data;
++    hwctx    = frames->device_ctx->hwctx;
++    *display = hwctx->display;
++    *surface = (unsigned)(uintptr_t)frame->data[3];
++    return 0;
++}
++
++static int do_vmaf_sycl(FFFrameSync *fs)
++{
++    AVFilterContext *ctx = fs->parent;
++    LIBVMAFContext *s = ctx->priv;
++    AVFrame *ref, *dist;
++    void *ref_dpy, *dist_dpy;
++    unsigned ref_surf, dist_surf;
++    int ret, err;
++
++    ret = ff_framesync_dualinput_get(fs, &dist, &ref);
++    if (ret < 0)
++        return ret;
++    if (ctx->is_disabled || !ref)
++        return ff_filter_frame(ctx->outputs[0], dist);
++
++    if ((ret = vaapi_surface_of(ctx, ref, &ref_dpy, &ref_surf)) < 0 ||
++        (ret = vaapi_surface_of(ctx, dist, &dist_dpy, &dist_surf)) < 0)
++        goto fail;
++
++    /* the import writes the shared upload buffers: let the previous frame's
++     * feature kernels finish reading them first */
++    err = vmaf_sycl_wait_compute(s->vmaf);
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "vmaf_sycl_wait_compute failed: %d.\n", err);
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    err = vmaf_sycl_import_va_surface(s->sycl_state, ref_dpy, ref_surf, 1,
++                                      ref->width, ref->height, s->bpc);
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "importing reference surface %u (frame %u) failed: %d.\n",
++               ref_surf, s->frame_cnt, err);
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++    err = vmaf_sycl_import_va_surface(s->sycl_state, dist_dpy, dist_surf, 0,
++                                      dist->width, dist->height, s->bpc);
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "importing distorted surface %u (frame %u) failed: %d.\n",
++               dist_surf, s->frame_cnt, err);
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    /* waits for the de-tile kernels before it returns, so both surfaces may
++     * go back to their decoders' pools once the frame is passed on */
++    err = vmaf_read_pictures_sycl(s->vmaf, s->frame_cnt++);
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "vmaf_read_pictures_sycl failed: %d.\n", err);
++        ret = AVERROR_EXTERNAL;
++        goto fail;
++    }
++
++    return ff_filter_frame(ctx->outputs[0], dist);
++
++fail:
++    av_frame_free(&dist);
++    return ret;
++}
++
++static av_cold int init_sycl(AVFilterContext *ctx)
++{
++    LIBVMAFContext *s = ctx->priv;
++    s->fs.on_event = do_vmaf_sycl;
++    return 0;
++}
++
++static int config_props_sycl(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    LIBVMAFContext *s = ctx->priv;
++    FilterLink *il = ff_filter_link(ctx->inputs[0]);
++    FilterLink *ol = ff_filter_link(outlink);
++    VmafConfiguration cfg;
++    VmafSyclConfiguration sycl_cfg;
++    unsigned depth[2];
++    int err;
++
++    for (int i = 0; i < 2; i++) {
++        FilterLink *l = ff_filter_link(ctx->inputs[i]);
++        AVHWFramesContext *frames;
++        if (!l->hw_frames_ctx) {
++            av_log(ctx, AV_LOG_ERROR, "input %d carries no hardware frames: decode it "
++                   "with -hwaccel vaapi -hwaccel_output_format vaapi.\n", i);
++            return AVERROR(EINVAL);
++        }
++        frames = (AVHWFramesContext *)l->hw_frames_ctx->data;
++        if (frames->device_ctx->type != AV_HWDEVICE_TYPE_VAAPI) {
++            av_log(ctx, AV_LOG_ERROR, "input %d is not on a VA-API device.\n", i);
++            return AVERROR(EINVAL);
++        }
++        depth[i] = av_pix_fmt_desc_get(frames->sw_format)->comp[0].depth;
++    }
++    if (depth[0] != depth[1]) {
++        av_log(ctx, AV_LOG_ERROR, "inputs differ in bit depth (%u vs %u).\n",
++               depth[0], depth[1]);
++        return AVERROR(EINVAL);
++    }
++    s->bpc = depth[0];
++
++    cfg = (VmafConfiguration) {
++        .log_level   = log_level_map(av_log_get_level()),
++        .n_subsample = s->n_subsample,
++        .n_threads   = 0,
++    };
++    err = vmaf_init(&s->vmaf, cfg);
++    if (err)
++        return AVERROR(EINVAL);
++
++    sycl_cfg = (VmafSyclConfiguration) {
++        .device_index     = s->sycl_device,
++        .enable_profiling = !!s->sycl_profile,
++    };
++    err = vmaf_sycl_state_init(&s->sycl_state, sycl_cfg);
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "vmaf_sycl_state_init(%d) failed: %d.\n",
++               s->sycl_device, err);
++        return AVERROR_EXTERNAL;
++    }
++    err = vmaf_sycl_import_state(s->vmaf, s->sycl_state);
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "vmaf_sycl_import_state failed: %d.\n", err);
++        return AVERROR_EXTERNAL;
++    }
++    err = vmaf_sycl_init_frame_buffers(s->vmaf, ctx->inputs[0]->w,
++                                       ctx->inputs[0]->h, s->bpc);
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "vmaf_sycl_init_frame_buffers failed: %d.\n", err);
++        return AVERROR_EXTERNAL;
++    }
++
++    err = parse_models(ctx);
++    if (err)
++        return err;
++    err = parse_features(ctx);
++    if (err)
++        return err;
++
++    err = config_output(outlink);
++    if (err < 0)
++        return err;
++    if (il->hw_frames_ctx) {
++        av_buffer_unref(&ol->hw_frames_ctx);
++        ol->hw_frames_ctx = av_buffer_ref(il->hw_frames_ctx);
++        if (!ol->hw_frames_ctx)
++            return AVERROR(ENOMEM);
++    }
++    return 0;
++}
++
++static av_cold void uninit_sycl(AVFilterContext *ctx)
++{
++    LIBVMAFContext *s = ctx->priv;
++    int err = 0;
++
++    ff_framesync_uninit(&s->fs);
++
++    if (!s->frame_cnt)
++        goto clean_up;
++
++    err = vmaf_flush_sycl(s->vmaf);
++    if (err)
++        av_log(ctx, AV_LOG_ERROR, "problem flushing libvmaf context: %d.\n", err);
++
++    for (unsigned i = 0; i < s->model_cnt; i++) {
++        double vmaf_score = 0.0;
++        err = vmaf_score_pooled(s->vmaf, s->model[i], pool_method_map(s->pool),
++                                &vmaf_score, 0, s->frame_cnt - 1);
++        if (err)
++            av_log(ctx, AV_LOG_ERROR, "problem getting pooled vmaf score.\n");
++        av_log(ctx, AV_LOG_INFO, "VMAF score: %f\n", vmaf_score);
++    }
++
++    if (s->vmaf && s->log_path && !err)
++        vmaf_write_output(s->vmaf, s->log_path, log_fmt_map(s->log_fmt));
++
++clean_up:
++    if (s->model) {
++        for (unsigned i = 0; i < s->model_cnt; i++) {
++            if (s->model[i])
++                vmaf_model_destroy(s->model[i]);
++        }
++        av_free(s->model);
++    }
++
++    if (s->vmaf)
++        vmaf_close(s->vmaf);
++    if (s->sycl_state)
++        vmaf_sycl_state_free(&s->sycl_state);
++}
++
++static const AVFilterPad libvmaf_sycl_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = config_props_sycl,
++    },
++};
++
++const FFFilter ff_vf_libvmaf_sycl = {
++    .p.name         = "libvmaf_sycl",
++    .p.description  = NULL_IF_CONFIG_SMALL("Calculate VMAF on SYCL from VA-API frames "
++                                           "without downloading them."),
++    .p.priv_class   = &libvmaf_sycl_class,
++    .preinit        = libvmaf_sycl_framesync_preinit,
++    .init           = init_sycl,
++    .uninit         = uninit_sycl,
++    .activate       = activate,
++    .priv_size      = sizeof(LIBVMAFContext),
++    FILTER_INPUTS(libvmaf_inputs),
++    FILTER_OUTPUTS(libvmaf_sycl_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VAAPI),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};
++#endif

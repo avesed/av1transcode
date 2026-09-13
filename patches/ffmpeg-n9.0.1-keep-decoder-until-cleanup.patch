@@ -1,0 +1,17 @@
+--- a/fftools/ffmpeg_dec.c
++++ b/fftools/ffmpeg_dec.c
+@@ -1016,7 +1016,13 @@
+ 
+ finish:
+     dec_thread_uninit(&dt);
+-    avcodec_free_context(&dp->dec_ctx);
++    /* The codec context - and with it a hwaccel's decode context - is freed
++     * by dec_free() at cleanup, after the filtergraphs. Freeing it here, as
++     * the thread exits, destroys a VA-API decode context while frames it
++     * decoded are still queued downstream, and iHD's vaSyncSurface on one of
++     * those surfaces dereferences the destroyed context: SIGSEGV in
++     * iHD_drv_video.so on the filter thread, and a compute engine reset when
++     * a SYCL import of that surface is pending. */
+ 
+     return ret;
+ }

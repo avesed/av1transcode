@@ -3324,6 +3324,192 @@ def test_a_cancelled_job_does_not_retry_the_score_on_the_cpu(
         enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120)
 
 
+# ---------------------------------------------------------------- vmaf_zero_copy
+
+_ZC_LOG = ("libvmaf INFO SYCL: using device: Intel(R) Arc(TM) B580 Graphics\n"
+           "libvmaf INFO VA surface zero-copy: DMA-BUF → Level Zero → Tile4 "
+           "de-tile (3840x2160 @ 2 bpp, pitch=7680)\n")
+
+
+def _zc_encoder(settings, info, plan, tmp_path):
+    o = settings.transcode.optimizer
+    o.vmaf_sycl_device, o.vmaf_sycl_min_width, o.vmaf_zero_copy = 0, 0, "auto"
+    o.reference_hwaccel = "off"
+    info.width, info.height = 3840, 2160
+    info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
+    plan.params.pixel_format = "yuv420p10le"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    enc._sycl_ok = True                  # the SYCL preflight already passed
+    return enc
+
+
+def _write_score(args, mean):
+    lavfi = args[args.index("-lavfi") + 1]
+    Path(lavfi.split("log_path=")[1].split(":")[0]).write_text(
+        json.dumps({"pooled_metrics": {"vmaf": {"mean": mean}}}))
+
+
+def test_zero_copy_scores_probes_without_the_frames_leaving_the_card(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Measured on the B580 at 4K: 1.18s and 1.36 CPU-seconds per probe score
+    against 5.4s and 23 the usual way, identical to 0.0 on every frame over
+    247 runs. Both sides decode on VA-API and reach libvmaf_sycl as surfaces:
+    nothing downloads and nothing converts."""
+    settings.transcode.optimizer.probing_rate = 2
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    enc._zc_ok = True                    # the zero-copy preflight already passed
+    cmds = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        _write_score(args, 93.25)
+        return ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 93.25
+    assert len(cmds) == 1 and enc._zc_scored == 1
+    cmd = cmds[0]
+    assert cmd[cmd.index("-init_hw_device") + 1] == "vaapi=zc:/dev/dri/renderD129"
+    lavfi = cmd[cmd.index("-lavfi") + 1]
+    assert "libvmaf_sycl=" in lavfi and "sycl_device=0" in lavfi and "n_threads" not in lavfi
+    assert "format=" not in lavfi and "hwdownload" not in lavfi and "scale" not in lavfi
+    dist, ref = lavfi.split(";")[:2]
+    assert dist == "[0:v]setpts=PTS-STARTPTS[dist]"
+    # the subsampling the probe was encoded with, then the rebase, as always
+    assert ref.index("fps=") < ref.index("setpts=PTS-STARTPTS")
+    # both inputs decode on the zero-copy device, each with its own options
+    inputs = [i for i, a in enumerate(cmd) if a == "-i"]
+    assert [cmd[i + 1] for i in inputs] == [str(tmp_path / "d.ivf"), str(enc.source)]
+    hw = [i for i, a in enumerate(cmd) if a == "-hwaccel"]
+    assert len(hw) == 2 and hw[0] < inputs[0] < hw[1] < inputs[1]
+    assert cmd.count("zc") == 2 and "vaapi" in cmd
+
+
+@pytest.mark.parametrize("case", ["off", "shard", "8-bit source", "features",
+                                  "1080p model", "no sycl"])
+def test_zero_copy_stays_off_where_it_cannot_apply(
+        settings, info, plan, tmp_path, monkeypatch, case):
+    """A DV shard is an FFV1 file for the CPU; the import carries luma only,
+    so luma-only is all a feature list may ask for, and there is none;
+    libvmaf_sycl compares frames as decoded, so no 1080p-model downscale and
+    no 8-bit source against 10-bit probes; and none of it without SYCL."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    shard = None
+    if case == "off":
+        settings.transcode.optimizer.vmaf_zero_copy = "off"
+    elif case == "shard":
+        shard = tmp_path / "s.mkv"
+    elif case == "8-bit source":
+        info.color.bit_depth, info.color.pix_fmt = 8, "yuv420p"
+    elif case == "features":
+        plan.params.probing_vmaf_features = "name=psnr"
+    elif case == "1080p model":
+        info.width, info.height = 1920, 1080
+    elif case == "no sycl":
+        enc._sycl_ok = False
+    monkeypatch.setattr(enc, "_zc_preflight",
+                        lambda sycl: pytest.fail("no preflight where it cannot apply"))
+    calls = _capture_scores(enc, monkeypatch)
+    enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30, shard=shard)
+    assert len(calls) == 1 and enc._zc_scored == 0      # scored the usual way
+
+
+def test_zero_copy_failure_rescores_the_window_the_usual_way(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A failed zero-copy score is not a failed probe. The window is scored
+    again the usual way and remembered, so its other probes skip the attempt;
+    and a run of failures with nothing getting through retires zero-copy for
+    the job - the same shape as reference_hwaccel's reads."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    enc._zc_ok = True
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    attempts = []
+    mode = {"fail": True}
+
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout, zero_copy=False):
+        attempts.append(zero_copy)
+        if zero_copy and mode["fail"]:
+            raise opt.TranscodeError("ffmpeg failed (rc=-11):\nSegmentation fault")
+        return 88.0
+
+    monkeypatch.setattr(enc, "_score_vmaf_on", on)
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 88.0
+    assert attempts == [True, False]
+    assert len(warnings) == 1 and "[600, 720)" in warnings[0] and "Segmentation fault" in warnings[0]
+    attempts.clear()
+    enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 34)
+    assert attempts == [False]
+    # a success between failures resets the streak
+    mode["fail"] = False
+    enc._score_probe(720, 840, tmp_path / "d.ivf", 0, 30)
+    assert enc._zc_streak == 0 and enc._zc_scored == 1
+    mode["fail"] = True
+    for k in range(enc._ZC_MAX_STREAK):
+        enc._score_probe(1000 + 120 * k, 1120 + 120 * k, tmp_path / "d.ivf", 0, 30)
+    assert enc._zc_ok is False
+    assert any("the rest of the job scores the usual way" in w for w in warnings)
+    attempts.clear()
+    enc._score_probe(5000, 5120, tmp_path / "d.ivf", 0, 30)
+    assert attempts == [False]
+    assert enc._zc_summary() == f"; 1 score(s) zero-copy, {enc._ZC_MAX_STREAK + 1} fell back"
+
+
+def test_zero_copy_failure_of_a_cancelled_job_is_not_rescored(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    enc._zc_ok = True
+    enc.cancel_flag = lambda: True
+    monkeypatch.setattr(enc, "_score_vmaf_on",
+                        lambda *a, **k: (_ for _ in ()).throw(opt.TranscodeError("Job cancelled by user")))
+    with pytest.raises(opt.TranscodeError, match="cancelled"):
+        enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
+
+
+@pytest.mark.parametrize("outcome", ["agrees", "readback", "disagrees", "fails"])
+def test_zero_copy_preflight_decides_once_per_job(
+        settings, info, plan, tmp_path, monkeypatch, outcome):
+    """libvmaf either imports the surfaces or quietly reads them back - it says
+    which only at INFO - and a wrong de-tile or a missed P010 shift still
+    produces a score. So each job encodes one short window, scores it both
+    ways, and keeps zero-copy only when the import stayed on the card and the
+    two scores agree."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(enc, "_hwdec_preflight", lambda: True)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    ran = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "libsvtav1" in args:
+            Path(args[-1]).write_bytes(b"ivf")
+            return ""
+        lavfi = args[args.index("-lavfi") + 1]
+        if "libvmaf_sycl=" in lavfi:
+            if outcome == "fails":
+                raise opt.TranscodeError("ffmpeg failed (rc=234)")
+            _write_score(args, 91.0 if outcome == "disagrees" else 90.0)
+            if outcome == "readback":
+                return _ZC_LOG + "libvmaf INFO DMA-BUF import failed (-5) - using readback path\n"
+            return _ZC_LOG
+        _write_score(args, 90.0)
+        return ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    for _ in range(3):
+        assert enc._zero_copy() is (outcome == "agrees")
+    assert len(ran) == 3        # the encode, the usual score, the zero-copy score - once
+    assert ran[2][ran[2].index("-loglevel") + 1] == "info"
+    assert len(warnings) == (0 if outcome == "agrees" else 1)
+    assert not list(enc.probe_dir.glob("zc_preflight*"))
+
+
 # ---------------------------------------------------------------- gpu probe path
 
 def _curve(idxs, crossing, target, slope=1.0):

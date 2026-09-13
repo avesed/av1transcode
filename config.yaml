@@ -235,6 +235,16 @@ transcode:
                                  # 上去反而会被 GPU 卡住；AV1 探测文件用 dav1d 比 QSV+回传更快
                                  # (120 帧 10.1s 对 13.5s)。实测 120 帧 4K SYCL 打分 39.4→22.1
                                  # CPU 秒、墙钟 -12%，解码帧逐比特一致，分数不变。
+    vmaf_zero_copy: "off"        # 探测打分时两路(源窗口 + 探测 ivf)都在 VA-API 上解码，帧以显存形式
+                                 # 直接交给 libvmaf_sycl，不回传内存(auto/off)。B580 实测 4K 探测窗口:
+                                 # 常规 5.4s / 23 CPU 秒 / 661MB，零拷贝 1.18s / 1.36 CPU 秒 / 1.55GB，
+                                 # 247 次打分逐帧分数完全一致；3 个并发 7.2s/87 CPU 秒 对 2.6s/7.5 CPU 秒，
+                                 # 显存成为并发上限。需要 vmaf_sycl_device、4K 模型(不缩放)、不设
+                                 # probing_vmaf_features(只导入亮度)、源位深与探测编码一致；每个作业先用
+                                 # 一个窗口两种方式各打一次分，差 >1e-3 则整个作业走常规读取；单个窗口
+                                 # 失败退回常规打分，连续失败则本作业关闭。镜像需带 libva 编译的 libvmaf
+                                 # 和 keep-decoder-until-cleanup 的 ffmpeg 补丁，否则 iHD 驱动约 9% 的
+                                 # 打分会段错误并重置计算引擎。
     vmaf_sycl_workers: 0         # 同时最多几个探测在 GPU 上打分(0 = 自动，6)。这不是探测池宽度：
                                  # 显卡只有一块显存，每个 GPU 打分占一个 SYCL 上下文，开了
                                  # reference_hwaccel 还要一个 VA-API 解码会话(4K surface 池)。

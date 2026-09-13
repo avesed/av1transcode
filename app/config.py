@@ -386,6 +386,31 @@ class OptimizerSettings(BaseModel):
     # what exhausted a 12GB B580 mid-episode and cost a reboot. Turn it on
     # for a CPU-starved host, not otherwise.
     reference_hwaccel: Literal["auto", "off"] = "off"
+    # Score probes without their frames ever leaving the card (auto) or the
+    # usual way (off). With auto both sides of a probe score - the source
+    # window and the probe's ivf - decode on VA-API and reach libvmaf_sycl as
+    # surfaces: libvmaf imports each as a DMA-BUF through Level Zero and
+    # de-tiles the luma plane on the GPU, where reference_hwaccel downloads
+    # every 4K frame only for libvmaf to upload it again.
+    #
+    # Measured on the B580, 4K probe windows at probing_rate 2: 5.4s / 23
+    # CPU-s / 661MB per score the usual way, 1.18s / 1.36 CPU-s / 1.55GB
+    # zero-copy, scores identical to 0.0 on every frame over 247 runs (DV
+    # P7/P8, HDR10 with a 2s lead, SVT and av1_vaapi probes). Three at once:
+    # 7.2s / 87 CPU-s against 2.6s / 7.5 CPU-s. The card saturates early
+    # (1.16s -> 2.33s per score from one to three), so VRAM rather than
+    # cores is the limit.
+    #
+    # Needs vmaf_sycl_device, a 4K-model score (no scale), no
+    # probing_vmaf_features (the import carries luma only) and a source whose
+    # bit depth matches the probes; each job also scores one window both ways
+    # and keeps the usual read unless they agree to 1e-3. A window that fails
+    # is scored again the usual way, and a run of failures turns it off for
+    # the job. And it needs the image's libvmaf built with libva plus ffmpeg's
+    # keep-decoder-until-cleanup patch: without that the decoder thread
+    # destroys its VA context while its frames are still queued, and iHD
+    # segfaulted in ~9% of scores, resetting the compute engine each time.
+    vmaf_zero_copy: Literal["auto", "off"] = "off"
     # How many probes may score on the GPU at once (0 = auto, 6). NOT the
     # probe pool's width: the card is one device with one pool of memory and
     # each GPU score holds a SYCL context plus, with reference_hwaccel on, a
@@ -501,7 +526,7 @@ class OptimizerSettings(BaseModel):
     # mapping above was measured at.
     gpu_probe_preset: int = 4
 
-    @field_validator("reference_hwaccel", "scenedetect_hwaccel", mode="before")
+    @field_validator("reference_hwaccel", "scenedetect_hwaccel", "vmaf_zero_copy", mode="before")
     @classmethod
     def _yaml_reads_off_as_false(cls, v: object) -> object:
         """YAML 1.1 parses a bare `off` as the boolean False (and `on` as

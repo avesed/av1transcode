@@ -370,10 +370,11 @@ const GPU_FIELDS = [
   F("max_crf", "CRF 上限", "交付 CRF 的硬上限，0 = probe_crfs 的顶端；min_crf 的镜像。它让\u201c探测范围\u201d和\u201c交付范围\u201d成为两件事：probe_crfs 管去哪看，min_crf/max_crf 管能发什么。分开之后放宽探测范围几乎不花钱，而探到极端值不等于会用极端值。", { min: 0, max: 63 }),
   F("gpu_vram_budget_mb", "显存预算 (MB)", "本作业最多占用显卡多少显存，0 = 自动（6000）。worker 数管并发个数，这个管字节数——显卡耗尽的是后者。占用量用 DRM fdinfo 实测，但只看得见本容器的进程，Plex 的那份看不到，所以默认给 12GB 的卡留了一半。", { min: 0, max: 65536 }),
   F("vmaf_sycl_workers", "GPU 打分并发上限", "同时最多几个探测在 GPU 上打分，0 = 自动（6）。显卡只有一块显存：各 10 个 SYCL 上下文 + VA-API 解码会话曾把 B580 撑爆并弄坏设备。加宽也没用，实测吞吐 4 个就到顶。", { min: 0, max: 32 }),
+  F("vmaf_zero_copy", "零拷贝打分", "探测打分时源窗口和探测文件两路都在 GPU（VA-API）上解码，帧直接交给 libvmaf 的 SYCL 后端，不回传内存。B580 4K 实测：常规每次打分 5.4s / 23 CPU 秒，零拷贝 1.18s / 1.36 CPU 秒，247 次打分逐帧分数完全一致；代价是每次打分约 1.55GB 显存，并发上限由显存决定。需要 SYCL 打分、4K 模型、源位深与探测编码一致；每个作业先两种方式各打一个窗口，不一致整个作业走常规读取，单个窗口失败退回常规打分。镜像需带 libva 的 libvmaf 和配套 ffmpeg 补丁。", { type: "select", options: [["auto", "auto：预检通过就用"], ["off", "off：常规读取"]] }),
   F("reference_hwaccel", "打分参考解码", "探测打分和验证时读源片的那一路是否用 GPU（VA-API）解码。默认 off：40 核实测它反而更慢（探测 401s→448s），只有 CPU 是瓶颈的机器才值得开（20 核上 826s→592s）。auto = 作业开始先各解 8 帧（带定位）做软解/硬解逐帧对比，不一致整个作业软解。用 VA-API 不用 QSV：QSV 解码器定位后保留的帧在部分源上和软解不同（像素一致、帧全错），VA-API 只给 ffmpeg 自带解码器加速，选帧和软解一样。只放这一路上 GPU：4K 帧回传 CPU 约 130 帧/秒封顶，探测池本来就吃到这个量。实测每次打分省 44% CPU、墙钟 -12%，分数不变。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
   F("vulkan_device", "Dolby Vision P5 转换设备", "libplacebo 应用 RPU 用的 Vulkan 设备，ffmpeg 的 -init_hw_device 选择器：序号或名字片段。空 = 让 ffmpeg 挑，有 GPU 就用 GPU；写 llvmpipe 强制软件渲染。", { type: "vulkan", wide: true }),
 ];
-const GPU_KEYS = new Set(["vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel", "reference_hwaccel", "vmaf_sycl_workers", "gpu_vram_budget_mb"]);
+const GPU_KEYS = new Set(["vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel", "reference_hwaccel", "vmaf_zero_copy", "vmaf_sycl_workers", "gpu_vram_budget_mb"]);
 
 let optDefaults = {}, optValues = {};
 const fieldEl = new Map();   // key -> .field element

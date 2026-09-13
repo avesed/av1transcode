@@ -859,6 +859,14 @@ class ShotEncoder:
         self._hwdec_streak = 0        # hardware reads failed in a row, reset on success
         self._hwdec_bad: Set[Tuple[int, int]] = set()   # windows that failed once
         self._hwdec_lock = threading.Lock()
+        # vmaf_zero_copy: None until the first probe score runs the preflight
+        # (see _zero_copy); the rest mirrors the reference_hwaccel bookkeeping
+        self._zc_ok: Optional[bool] = None
+        self._zc_lock = threading.Lock()
+        self._zc_bad: Set[Tuple[int, int]] = set()
+        self._zc_streak = 0
+        self._zc_scored = 0
+        self._zc_fallbacks = 0
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0        # consecutive; a good score clears it
         self._sycl_retired_at: Optional[float] = None   # when the device was given up
@@ -2706,7 +2714,7 @@ class ShotEncoder:
             self._mem_log(
                 f"probes: {spent} for {len(results)} shot(s), "
                 f"{spent / len(results):.2f} per shot "
-                f"(a full grid would have been {len(grid)})")
+                f"(a full grid would have been {len(grid)}){self._zc_summary()}")
         return results
 
     def _max_probe_concurrency(self, n_tasks: int) -> int:
@@ -3448,7 +3456,7 @@ class ShotEncoder:
         if samples:
             self._mem_log(f"probes: {spent} for {len(samples)} shot(s), "
                           f"{spent / len(samples):.2f} per shot (SVT), plus "
-                          f"{qsv_spent[0]} on the card")
+                          f"{qsv_spent[0]} on the card{self._zc_summary()}")
 
         fit = state["fit"]
         if fit:
@@ -3505,9 +3513,23 @@ class ShotEncoder:
     def _score_probe(self, w0: int, w1: int, dist: Path, idx: int, crf: int,
                      shard: Optional[Path] = None,
                      threads: Optional[int] = None) -> float:
-        """Score a distorted window that already exists as a file."""
+        """Score a distorted window that already exists as a file.
+
+        Zero-copy first when the job has it (see _zero_copy); a window that
+        fails there is scored again the usual way.
+        """
         if self.metric == "ssimulacra2":
             return self._score_ssimulacra2(w0, w1, dist, idx, crf, shard)
+        frames = (w1 - w0) // self._probing_rate()
+        if shard is None and (w0, w1) not in self._zc_bad and self._zero_copy():
+            try:
+                score = self._score_zero_copy(w0, w1, dist, idx, crf, frames)
+            except TranscodeError as e:
+                if not self._zc_fallback(w0, w1, e):
+                    raise
+                score = None
+            if score is not None:
+                return score
         ref_args, ref_vf = self._probe_input(w0, w1, shard)
         hw = False
         if shard is None and (w0, w1) not in self._hwdec_bad:
@@ -3515,7 +3537,6 @@ class ShotEncoder:
             # filters; only the 4K source read is worth the GPU
             ref_args, ref_vf, hw = self._reference_read(ref_args, ref_vf)
         dist_args = ["-i", str(dist)]
-        frames = (w1 - w0) // self._probing_rate()
         try:
             score = self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
         except TranscodeError as e:
@@ -3714,6 +3735,185 @@ class ShotEncoder:
                     "({}); {} frames after a seek verified frame-identical",
                     self.source.name, self._surface_format(), len(got))
         return True
+
+    # ---------- zero-copy scoring: VA-API decode straight into libvmaf_sycl ----------
+    _ZC_DEVICE = "zc"
+    # framesync holds frames of whichever input runs ahead while the other
+    # catches up, and the decoder's surface pool must not run dry under it
+    _ZC_EXTRA_HW_FRAMES = 8
+    _ZC_MAX_STREAK = 8
+    # scored frames in the preflight window: enough for motion and the
+    # de-tile to see real content, cheap enough to run once per job
+    _ZC_PREFLIGHT_FRAMES = 24
+
+    def _zero_copy(self) -> bool:
+        """Whether probe scores keep their frames on the card (vmaf_zero_copy).
+
+        Both inputs - the source window and the probe's ivf - decode on
+        VA-API and reach libvmaf_sycl as surfaces, which libvmaf imports as
+        DMA-BUFs and de-tiles on the GPU. Measured on the B580 at 4K: 1.18s
+        and 1.36 CPU-seconds per score against 5.4s and 23, scores identical
+        to 0.0 on every frame over 247 runs. Decided once per job, like the
+        SYCL and reference_hwaccel preflights, and under a lock for the same
+        reason: probe workers ask concurrently.
+        """
+        if (self.opt.vmaf_zero_copy or "off").lower() == "off":
+            return False
+        sycl = self._sycl_device()
+        if sycl < 0:
+            return False
+        with self._zc_lock:
+            if self._zc_ok is None:
+                why = self._zc_unsupported()
+                if why:
+                    logger.info("optimizer: vmaf_zero_copy stays off for this job: {}", why)
+                    self._zc_ok = False
+                else:
+                    self._zc_ok = self._zc_preflight(sycl)
+            return bool(self._zc_ok)
+
+    def _zc_unsupported(self) -> Optional[str]:
+        """Why this job cannot score zero-copy, or None when it can."""
+        if not self._hwdec_args():
+            return "no /dev/dri render node in this container"
+        if self._vmaf_scale_filter():
+            return ("scores are scaled for the 1080p model, and libvmaf_sycl "
+                    "compares the frames as decoded")
+        if self._probe_scale():
+            return "probe_scale is set"
+        if self._vmaf_features():
+            return "probing_vmaf_features is set, and the import carries luma only"
+        src = self.info.color.bit_depth or 8
+        probe = 10 if "10" in self._pix_fmt() else 8
+        if src != probe:
+            return (f"the source is {src}-bit and the probes {probe}-bit, and both "
+                    "sides have to decode to the same surface format")
+        return None
+
+    def _zc_input_args(self) -> List[str]:
+        """Input options that decode one side of a zero-copy score on the card."""
+        return ["-hwaccel", "vaapi", "-hwaccel_device", self._ZC_DEVICE,
+                "-hwaccel_output_format", "vaapi",
+                "-extra_hw_frames", str(self._ZC_EXTRA_HW_FRAMES)]
+
+    def _zc_preflight(self, sycl: int) -> bool:
+        """Prove a zero-copy score is the score before any probe relies on one.
+
+        Three things have to hold. The seeked VA-API read must keep the frames
+        the software read does - the reference_hwaccel preflight, reused. The
+        import must really stay on the card: libvmaf falls back to vaGetImage
+        plus an upload without failing and says so only at INFO. And the
+        score must equal the usual read's on the same pair, which a wrong
+        de-tile or a missed P010 shift would not.
+        """
+        if not self._hwdec_preflight():
+            logger.info("optimizer: vmaf_zero_copy stays off for this job (the "
+                        "seeked VA-API read above did not match software)")
+            return False
+        n = self._ZC_PREFLIGHT_FRAMES * self._probing_rate()
+        w0 = min(int(round(2 * self.fps)), max(self.total_frames - n, 0))
+        w1 = min(w0 + n, max(self.total_frames, w0 + 1))
+        ivf = self.probe_dir / "zc_preflight.ivf"
+        out_json = self.probe_dir / "zc_preflight.json"
+        ref_args, ref_vf = self._probe_input(w0, w1)
+        exact_vf, exact_out = self._exact_frames()
+        encode = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *ref_args,
+                   "-vf", ",".join(ref_vf + exact_vf), *exact_out, "-map", "0:v:0",
+                   "-c:v", "libsvtav1", "-preset", "12", "-crf", "40",
+                   "-pix_fmt", self._pix_fmt(), "-f", "ivf", str(ivf)])
+        try:
+            self._run(encode, timeout=600)
+            want = self._score_vmaf_on(sycl, ["-i", str(ivf)], ref_args, ref_vf,
+                                       -1, 0, None, timeout=300)
+            out = self._run(self._vmaf_cmd(sycl, ["-i", str(ivf)], ref_args, ref_vf,
+                                           out_json, None, zero_copy=True,
+                                           loglevel="info"), timeout=300)
+            got = parse_score(out_json, self.metric)
+        except (TranscodeError, OSError, ValueError) as e:
+            self._check_cancel()
+            detail = "; ".join(
+                [ln for ln in str(e).strip().splitlines() if ln.strip()][-3:])
+            logger.warning("optimizer: vmaf_zero_copy stays off for this job: the "
+                           "preflight could not score ({})", detail)
+            return False
+        finally:
+            _unlink(ivf)
+            _unlink(out_json)
+        if "readback path" in out or "de-tile" not in out:
+            logger.warning(
+                "optimizer: vmaf_zero_copy stays off for this job: libvmaf {} "
+                "instead of importing the surfaces in place",
+                "read the surfaces back" if "readback path" in out
+                else "never reported a zero-copy import")
+            return False
+        if abs(got - want) > self._SYCL_MAX_DELTA:
+            logger.warning(
+                "optimizer: vmaf_zero_copy stays off for this job: it scores "
+                "{:.6f} where the usual read scores {:.6f} on the same pair",
+                got, want)
+            return False
+        logger.info("optimizer: probe scores decode on VA-API and stay on the card "
+                    "(zero-copy agrees with the usual read to {:.2e})", abs(got - want))
+        return True
+
+    def _score_zero_copy(self, w0: int, w1: int, dist: Path, idx: int, crf: int,
+                         frames: int) -> Optional[float]:
+        """One probe score with both sides decoded on the card, or None when
+        there is no room on the card for it now and the usual read should run."""
+        sycl = self._sycl_device()
+        if sycl < 0:
+            return None
+        need = self._est_zc_score_mb()
+        booked = self._gpu_vram.booked(need)
+        if not self._gpu_vram.reserve(need, self._GPU_SLOT_WAIT):
+            return None
+        ref_args, ref_vf = self._probe_input(w0, w1)
+        try:
+            score = self._score_vmaf_on(sycl, ["-i", str(dist)], ref_args, ref_vf,
+                                        idx, crf, None,
+                                        timeout=self._sycl_timeout(frames),
+                                        zero_copy=True)
+        finally:
+            self._gpu_vram.calibrate()
+            self._gpu_vram.release(booked, need)
+        with self._zc_lock:
+            self._zc_streak = 0
+            self._zc_scored += 1
+        self._sycl_scored_ok()
+        return score
+
+    def _zc_fallback(self, w0: int, w1: int, err: TranscodeError) -> bool:
+        """Whether a failed zero-copy score of [w0, w1) should be scored again
+        the usual way: always, unless the job was cancelled.
+
+        The same shape as _hwdec_fallback: the window is remembered so its
+        other probes skip the attempt, and consecutive failures - reset by any
+        success - retire zero-copy for the rest of the job.
+        """
+        if self.cancel_flag and self.cancel_flag():
+            return False
+        with self._zc_lock:
+            self._zc_bad.add((w0, w1))
+            self._zc_streak += 1
+            self._zc_fallbacks += 1
+            n = self._zc_streak
+            flip = n >= self._ZC_MAX_STREAK and bool(self._zc_ok)
+            if flip:
+                self._zc_ok = False
+        text = str(err).strip()
+        tail = text.splitlines()[-1][:160] if text else err.__class__.__name__
+        logger.warning("optimizer: zero-copy scoring of frames [{}, {}) failed ({}); "
+                       "scoring that window the usual way{}", w0, w1, tail,
+                       f"; {n} in a row, the rest of the job scores the usual way"
+                       if flip else "")
+        return True
+
+    def _zc_summary(self) -> str:
+        """The zero-copy share of the probe phase, for its summary line."""
+        if not (self._zc_scored or self._zc_fallbacks):
+            return ""
+        fell = f", {self._zc_fallbacks} fell back" if self._zc_fallbacks else ""
+        return f"; {self._zc_scored} score(s) zero-copy{fell}"
 
     def _score_windows(self, w0: int, w1: int, idx: int, crf: int,
                        threads: int) -> float:
@@ -3921,6 +4121,15 @@ class ShotEncoder:
         return (self._megapixels() * self._VRAM_MB_PER_MPX * 2.5
                 * self._VRAM_SAFETY)
 
+    # A zero-copy score holds two VA-API decode sessions beside its SYCL
+    # context: measured 1.49-1.61GB per 4K probe window on the B580, against
+    # 661MB for a score fed by the CPU - about 200MB per megapixel.
+    _VRAM_MB_PER_MPX_ZC = 200.0
+
+    def _est_zc_score_mb(self) -> float:
+        """Card memory one zero-copy score holds, in MB (see _zero_copy)."""
+        return self._megapixels() * self._VRAM_MB_PER_MPX_ZC * self._VRAM_SAFETY
+
     def _sycl_timeout(self, frames: Optional[int]) -> int:
         """Seconds a SYCL scoring may take before it is killed and retried.
 
@@ -4043,9 +4252,38 @@ class ShotEncoder:
 
     def _score_vmaf_on(self, sycl: int, dist_args: List[str], ref_args: List[str],
                        ref_vf: List[str], idx: int, crf: int,
-                       threads: Optional[int], timeout: int) -> float:
-        """One libvmaf run on the given backend (`sycl` < 0 = CPU)."""
+                       threads: Optional[int], timeout: int,
+                       zero_copy: bool = False) -> float:
+        """One libvmaf run on the given backend (`sycl` < 0 = CPU); with
+        `zero_copy` both inputs decode on the card instead (see _zero_copy)."""
         out_json = self.probe_dir / f"score_{idx:05d}_{crf}.json"
+        args = self._vmaf_cmd(sycl, dist_args, ref_args, ref_vf, out_json, threads,
+                              zero_copy=zero_copy)
+        try:
+            self._run(args, timeout=timeout)
+        except CommandTimeout:
+            raise
+        except TranscodeError as e:
+            raise TranscodeError(
+                f"{e}\n"
+                f"Hint: the quality probe could not run (model={self._model_cfg()}). "
+                "If target_metric=ssimulacra2, note stock libvmaf has no ssimulacra2 "
+                "built in - set transcode.optimizer.ssimulacra2_model to a compatible "
+                "model (e.g. path=/path/to/ssimulacra2.json) or use target_metric=vmaf."
+            ) from e
+        score = parse_score(out_json, self.metric)
+        self._log(f"shot {idx:05d} crf {crf} {self.metric}={score:.3f}")
+        if not self.opt.keep_probes:
+            try:
+                out_json.unlink()
+            except OSError:
+                pass
+        return score
+
+    def _vmaf_cmd(self, sycl: int, dist_args: List[str], ref_args: List[str],
+                  ref_vf: List[str], out_json: Path, threads: Optional[int],
+                  zero_copy: bool = False, loglevel: str = "error") -> List[str]:
+        """The ffmpeg command behind one libvmaf run (see _score_vmaf_on)."""
         # ts_sync_mode=nearest is NOT optional. The reference is read straight
         # from the source container while the distorted side is an ivf carrying
         # an exact frame-rate timebase, and matroska stores timestamps in whole
@@ -4110,37 +4348,32 @@ class ShotEncoder:
         # verification reads both files with the same seek, which the
         # half-frame lead makes land on the same index either side.
         rebase = "setpts=PTS-STARTPTS"
-        dist_chain = ",".join(f for f in (rebase, scale, fmt) if f)
-        # the reference goes through the same probe-side filters the distorted
-        # copy was encoded with, then both land on the same comparison raster.
-        # The rebase comes AFTER those filters: fps= subsampling re-times its
-        # output, and it is that output the ivf holds.
-        ref_chain = ",".join(f for f in (*ref_vf, rebase, scale, fmt) if f)
+        hw: List[str] = []
+        scorer = "libvmaf"
+        if zero_copy:
+            # Surfaces all the way in: libvmaf_sycl takes the frames as the
+            # card decoded them, so there is no format= to convert and no
+            # scale (see _zc_unsupported). The fps= subsampling and the
+            # rebases only re-time frames and run on surfaces unchanged.
+            scorer = "libvmaf_sycl"
+            hw = ["-init_hw_device", f"vaapi={self._ZC_DEVICE}:{_render_nodes()[0]}"]
+            dist_args = [*self._zc_input_args(), *dist_args]
+            ref_args = [*self._zc_input_args(), *ref_args]
+            dist_chain = rebase
+            ref_chain = ",".join((*ref_vf, rebase))
+        else:
+            dist_chain = ",".join(f for f in (rebase, scale, fmt) if f)
+            # the reference goes through the same probe-side filters the
+            # distorted copy was encoded with, then both land on the same
+            # comparison raster. The rebase comes AFTER those filters: fps=
+            # subsampling re-times its output, and it is that output the ivf
+            # holds.
+            ref_chain = ",".join(f for f in (*ref_vf, rebase, scale, fmt) if f)
         lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
-                 f"[dist][ref]libvmaf={':'.join(opts)}")
-        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+                 f"[dist][ref]{scorer}={':'.join(opts)}")
+        return ([self.ffmpeg, "-hide_banner", "-loglevel", loglevel, "-y", *hw]
                 + dist_args + ref_args
                 + ["-lavfi", lavfi, *self._VIDEO_ONLY_OUTPUT, "-f", "null", "-"])
-        try:
-            self._run(args, timeout=timeout)
-        except CommandTimeout:
-            raise
-        except TranscodeError as e:
-            raise TranscodeError(
-                f"{e}\n"
-                f"Hint: the quality probe could not run (model={self._model_cfg()}). "
-                "If target_metric=ssimulacra2, note stock libvmaf has no ssimulacra2 "
-                "built in - set transcode.optimizer.ssimulacra2_model to a compatible "
-                "model (e.g. path=/path/to/ssimulacra2.json) or use target_metric=vmaf."
-            ) from e
-        score = parse_score(out_json, self.metric)
-        self._log(f"shot {idx:05d} crf {crf} {self.metric}={score:.3f}")
-        if not self.opt.keep_probes:
-            try:
-                out_json.unlink()
-            except OSError:
-                pass
-        return score
 
     # ---------- phase 3: per-shot CRF selection ----------
     def _crf_floor(self, grid_lo: int) -> float:

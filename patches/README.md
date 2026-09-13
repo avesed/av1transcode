@@ -41,3 +41,35 @@ existing `libvmaf_cuda` one, mirroring how FFmpeg already handles the CUDA
 backend. It applies to n9.0.1 at `--fuzz=0`. Taking the fork's other patches
 was never wanted anyway - `0001`/`0002` pull in tiny models and a DNN filter
 that need ONNX Runtime, which the libvmaf build deliberately disables.
+
+## `ffmpeg-n9.0.1-libvmaf-sycl-zerocopy.patch`
+
+Adds a `libvmaf_sycl` filter that scores **VA-API frames without downloading
+them** (`optimizer.vmaf_zero_copy`). Each input's surface (`data[3]`) and the
+display of that frame's own device go to libvmaf's
+`vmaf_sycl_import_va_surface`, which exports the surface as a DMA-BUF, imports
+it through Level Zero and de-tiles the luma plane on the GPU.
+
+Ported from the fork's `ffmpeg-patches/0005`, which needs the fork's
+`0001`-`0004` to apply, takes only QSV frames with one display for both inputs,
+and on a failed import **skips the frame** and scores the rest. A score pooled
+over fewer frames than were compared is a wrong score, so here a failed import
+fails the run. Applies on top of `ffmpeg-n9.0.1-libvmaf-sycl.patch` at
+`--fuzz=0`; it needs libvmaf built with libva (see the Dockerfile).
+
+## `ffmpeg-n9.0.1-keep-decoder-until-cleanup.patch`
+
+One line out of `fftools/ffmpeg_dec.c`: the decoder thread no longer frees its
+codec context as it exits. `dec_free()` frees it at cleanup anyway, after the
+filtergraphs.
+
+Freeing it early destroys a hwaccel's VA-API decode context while frames it
+decoded are still queued in the filtergraph, and iHD's `vaSyncSurface` on one
+of those surfaces dereferences the destroyed context. With `libvmaf_sycl` that
+was a segfault in `iHD_drv_video.so` on the filter thread in ~9% of 4K probe
+scores (gdb: `vmaf_sycl_import_va_surface -> vaSyncSurface` on `fc0` while
+`decoder_thread -> avcodec_free_context -> ff_vaapi_decode_uninit ->
+vaDestroyContext` ran on the AV1 decoder thread), each one resetting the
+B580's compute engine. With the patch, 247 zero-copy scores ran with no
+segfault and no engine reset. Any filter-thread sync of VA-API frames after
+their decoder exits (hwdownload, hwmap) is exposed to the same race.
