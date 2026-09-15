@@ -505,6 +505,19 @@ class OptimizerSettings(BaseModel):
     # gate "qsv" needs, and what lets the line keep learning from every shot
     # it verifies instead of from a fixed set of anchors.
     #
+    # Measured 2026-09-14 in production's job shape (preset 1080p, target
+    # 96-97, probes 4, zero-copy scoring on, 40 cpus) on three 4K Dolby
+    # Vision clips, 912 shots, stopped at the CRF pick: probe phase -23.4%,
+    # -23.4% and -32.7% against "svt" (-26.9% overall). SVT probes went from
+    # 3.83-3.91 to 2.34-2.59 a shot plus two on the card, 71-86% of shots
+    # were seeded, and the chosen CRFs sat within 1 of the svt path on
+    # 96-100% of shots, never more than 2 apart. The >1 ones were smoothing
+    # carried over from neighbours and chords across different brackets,
+    # 10 up and 6 down. Whole-card VRAM peaks ran 1-2 GB higher.
+    # Before zero-copy scoring, the same design only broke even (+2.1% on
+    # 163 shots). The scores it shares with "svt" were CPU-bound then, so
+    # card probes competed with SVT probes for the same cores.
+    #
     # Quality indices swept on the QSV side. Same role as probe_crfs, and the
     # search over them is the same bisection; av1_qsv saturates above ~50 on
     # 4K, so there is nothing to learn past the top of this.
