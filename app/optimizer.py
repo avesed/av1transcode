@@ -122,6 +122,46 @@ def _csv_first(line: str) -> str:
     return line.split(",", 1)[0].strip()
 
 
+# What fftools prints at INFO when it tears a running filter graph down and
+# configures a new one (ffmpeg_filter.c:3183), with " because <reasons>".
+_GRAPH_REBUILT = "Reconfiguring filter graph"
+# av_dump_format's metadata lines, "      title           : <value>" - the
+# one place those words can come from the file rather than from ffmpeg
+_DUMP_METADATA = re.compile(r"[ \t]+[^:\r\n]*: ")
+
+
+def graph_rebuilt(text: Optional[str]) -> Optional[str]:
+    """The reason ffmpeg gave for rebuilding a filter graph mid-run, or None.
+
+    Every stateful filter in the new graph starts over - setpts' STARTPTS,
+    the trim behind an input's -t, fps' held frame, libvmaf and its log - so
+    the read is no longer the window it was built for. Measured with VA-API
+    decode across an in-band SPS change: a card probe of a 64-frame window
+    wrote 77 frames or failed outright, and a zero-copy score kept 59 of 84.
+
+    Matched anywhere on a line, not after av_log's "[vf#0:0 @ 0x..] " prefix.
+    libavutil keeps ONE print_prefix for the whole process (log.c:382), so
+    when another thread's last message lacked its newline this one comes out
+    bare, glued to the end of that message - and an anchored match misses it
+    silently, the one failure this check exists to catch. A stream title that
+    happens to say the same thing costs a software read at worst, and the
+    input dump's metadata form is excluded anyway.
+    """
+    if not text or _GRAPH_REBUILT not in text:
+        return None
+    for line in re.split(r"[\r\n]", text):
+        at = line.find(_GRAPH_REBUILT)
+        if at < 0:
+            continue
+        meta = _DUMP_METADATA.match(line)
+        if meta is not None and meta.end() == at:
+            continue
+        rest = line[at + len(_GRAPH_REBUILT):]
+        reason = rest[len(" because "):] if rest.startswith(" because ") else ""
+        return reason.strip() or "unspecified"
+    return None
+
+
 def concat_quote(path: Path) -> str:
     """`path` as one field of an ffmpeg concat demuxer list.
 
@@ -312,8 +352,33 @@ def _svt_params_dict(video: VideoParams) -> Dict[str, object]:
 
 
 def parse_score(json_path: Path, metric: str) -> float:
-    """Extract the pooled-mean metric score from a libvmaf JSON log."""
-    data = json.loads(json_path.read_text())
+    """Extract the pooled-mean metric score from a libvmaf JSON log.
+
+    A log that is missing, empty, cut short or not a libvmaf object is a
+    failed scoring like any other, and raises TranscodeError so it reaches the
+    fallbacks - the SYCL run retried on the CPU, a zero-copy or hardware read
+    scored again the usual way, verification skipping the shot - instead of
+    killing the job. libvmaf writes its log only at uninit and only when it
+    scored a frame, so a run that exits 0 without one is not hypothetical,
+    and a graph rebuilt mid-run is one way to get there (see graph_rebuilt).
+    """
+    try:
+        data = json.loads(json_path.read_text())
+    except (OSError, ValueError) as e:   # FileNotFoundError, JSONDecodeError, UnicodeDecodeError
+        raise TranscodeError(f"could not read the {metric} log {json_path}: {e}") from e
+    if not isinstance(data, dict):
+        raise TranscodeError(f"{json_path} is not a libvmaf JSON log")
+    try:
+        score = _pooled_score(data, metric, json_path)
+    except (TypeError, ValueError, AttributeError) as e:   # e.g. a mean that is not a number
+        raise TranscodeError(f"could not parse {metric} score from {json_path}: {e}") from e
+    if not math.isfinite(score):
+        raise TranscodeError(f"{json_path} reports a non-finite {metric} score ({score})")
+    return score
+
+
+def _pooled_score(data: dict, metric: str, json_path: Path) -> float:
+    """The pooled mean of `metric` in a parsed libvmaf log (see parse_score)."""
     pooled = data.get("pooled_metrics") or {}
     if metric in pooled:
         mean = pooled[metric].get("mean")
@@ -784,6 +849,24 @@ class CommandTimeout(TranscodeError):
     """A subprocess hit its _run timeout and was killed."""
 
 
+class GraphRebuilt(TranscodeError):
+    """ffmpeg rebuilt the filter graph of a hardware-decoded read mid-run.
+
+    With -hwaccel vaapi an in-band SPS/PPS change makes the decoder allocate
+    a new frames context, and fftools rebuilds the whole graph for that alone
+    ("hwaccel changed"); every stateful filter then restarts (see
+    graph_rebuilt) and the read is not the window it was built for. Software
+    decode does not rebuild for those changes, so the same window read that
+    way is the fix. Not a device failure, and counted as none.
+    """
+
+    def __init__(self, reason: str, window: Optional[Tuple[int, int]] = None,
+                 read: str = "hardware read") -> None:
+        self.reason, self.window, self.read = reason, window, read
+        where = f" of frames [{window[0]}, {window[1]})" if window else ""
+        super().__init__(f"ffmpeg rebuilt the filter graph of the {read}{where} ({reason})")
+
+
 class ShotEncoder:
     """Parallel shot-based encoder with per-shot interpolated CRF selection."""
 
@@ -867,6 +950,12 @@ class ShotEncoder:
         self._zc_streak = 0
         self._zc_scored = 0
         self._zc_fallbacks = 0
+        # windows whose hardware read had its filter graph rebuilt, with
+        # ffmpeg's reason (see _note_rebuild), and every window already warned
+        # about for a rebuild, hardware or software
+        self._rebuild_lock = threading.Lock()
+        self._rebuilt: Dict[Tuple[int, int], str] = {}
+        self._rebuild_warned: Set[Optional[Tuple[int, int]]] = set()
         # scorings the SYCL backend failed to finish in time (see _score_vmaf)
         self._sycl_timeouts = 0        # consecutive; a good score clears it
         self._sycl_retired_at: Optional[float] = None   # when the device was given up
@@ -1419,6 +1508,12 @@ class ShotEncoder:
             out, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             self._terminate(proc)
+            # what it printed before the stall, which communicate() kept: a
+            # graph rebuilt mid-run is a cause worth recognising (see _run_read)
+            try:
+                partial, _ = proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                partial = ""
             # release the pipes so communicate()'s reader threads and fds
             # don't linger after we abandon the process
             for stream in (proc.stdout, proc.stderr):
@@ -1427,7 +1522,9 @@ class ShotEncoder:
                         stream.close()
                     except OSError:
                         pass
-            raise CommandTimeout(f"command timed out after {timeout}s: {args[0]}")
+            stalled = CommandTimeout(f"command timed out after {timeout}s: {args[0]}")
+            stalled.output = partial or ""
+            raise stalled
         finally:
             with self._proc_lock:
                 self._procs.discard(proc)
@@ -1452,7 +1549,47 @@ class ShotEncoder:
                     "encodes; each 4K instance holds a multi-GB frame pool) or "
                     "probe_workers."
                 )
-            raise TranscodeError(msg)
+            failed = TranscodeError(msg)
+            failed.output = out     # the tail above can miss a line logged before the failure
+            raise failed
+        return out
+
+    def _run_read(self, args: List[str], timeout: int, read: str,
+                  window: Optional[Tuple[int, int]] = None,
+                  strict: Optional[bool] = None) -> str:
+        """_run for a command that reads the source through a filter graph,
+        with its log checked for a graph rebuilt mid-run (see graph_rebuilt).
+
+        A card read (`-hwaccel` in the command) raises GraphRebuilt, whether
+        ffmpeg exited 0, failed or was killed for time: decoded in software
+        the same window does not rebuild for a new frames context, so the
+        caller reads it that way. A software read has nothing better to fall
+        back to - it IS the fallback - so the window is warned about once and
+        the read stands (see _note_software_rebuild); one that failed as well
+        fails as before, its error tagged `rebuilt` with the reason so a SYCL
+        score does not count it against the device (see _score_vmaf).
+        `strict` raises for both: a preflight moves on to another window
+        instead.
+
+        These commands run at -loglevel info, since the line is INFO.
+        """
+        strict = ("-hwaccel" in args) if strict is None else strict
+        try:
+            out = self._run(args, timeout=timeout)
+        except TranscodeError as e:
+            why = graph_rebuilt(getattr(e, "output", None) or str(e))
+            if why is None or (self.cancel_flag and self.cancel_flag()):
+                raise           # a cancel is a cancel, whatever ffmpeg logged first
+            if not strict:
+                self._note_software_rebuild(window, read, why)
+                e.rebuilt = why
+                raise
+            raise GraphRebuilt(why, window, read) from e
+        why = graph_rebuilt(out)
+        if why is not None:
+            if strict:
+                raise GraphRebuilt(why, window, read)
+            self._note_software_rebuild(window, read, why)
         return out
 
     def _terminate(self, proc: subprocess.Popen) -> None:
@@ -2223,7 +2360,92 @@ class ShotEncoder:
         lead = self._lead_of(path or self.source)
         return f"{max(0.0, lead + (self._slot(frame) - 0.5) / self.fps):.6f}"
 
-    def _exact_frames(self) -> Tuple[List[str], List[str]]:
+    def _first_pts_us(self, frame: int) -> int:
+        """Microseconds `frame` of the encode input carries once -ss
+        _seek(frame) has rebased the input: half a frame, _seek's own lead,
+        or the file's lead when the seek clamps at 0 on an early frame.
+
+        Known before the read starts, which is the point (see _window_encode).
+        The seek string's six decimals move it by a microsecond from window
+        to window, against half a period of rounding room in the encoder.
+        """
+        lead = self._lead_of(self.source)
+        ss = float(self._seek(frame))
+        return max(0, int(round((lead + self._slot(frame) / self.fps - ss) * 1e6)))
+
+    def _read_frames(self, w0: int, w1: int, rate: int) -> int:
+        """Frames an encoder read of [w0, w1) emits at probing rate `rate`.
+
+        At rate 1, every decoded frame: the window, holes or not.
+
+        Above that, fps= emits one frame per SLOT of its coarser grid, filling
+        a hole with a repeat. The frame s slots into the window lands
+        (s + delta) / rate periods in, delta being where the seek put w0, in
+        frames (see _first_pts_us). fps rounds that to the nearest period,
+        and a period takes the last frame that rounds onto it. So the last
+        period counted holds a frame from inside the window only while frame
+        w1 rounds past it - (S + delta) / rate >= N - 0.5 over the window's S
+        slots - kept 0.05 of a period clear: at least 4ms at 119.88fps
+        against a millisecond of container rounding. That is ceil(S / 2) at
+        rate 2 away from the start of the file, one more than
+        (w1 - w0) // 2 on an odd window: the 127-frame card window of the
+        measurement above is 64 frames, not 63. When the seek clamps, delta
+        is anything below half a frame, and at 0 an odd window loses that
+        last period - frame w1, the next shot, would take it about half the
+        time on Matroska. At least one.
+        """
+        if rate <= 1:
+            return w1 - w0
+        slots = self._slot(w1) - self._slot(w0)
+        delta = self._first_pts_us(w0) * 1e-6 * self.fps
+        return max(1, math.ceil((slots + delta) / rate - 0.55))
+
+    def _probe_fps_vf(self, rate: int) -> str:
+        """The subsampling filter of a probe read at probing_rate `rate` > 1.
+        Spelled once: an fps= rate written with more digits on one side of a
+        probe than the other rounds a frame onto a different period there, at
+        the ties the start of a file produces."""
+        return f"fps={self.fps / rate:g}"
+
+    def _window_encode(self, w0: int, w1: int,
+                       shard: Optional[Path] = None) -> Tuple[List[str], List[str]]:
+        """(video filters, output options) that end an encoder read of probe
+        window [w0, w1): _exact_frames with a constant rebase, and the window
+        bounded by a frame count on the output rather than a -t on the input.
+
+        With -hwaccel vaapi an in-band SPS/PPS change gives the decoder a new
+        frames context, and fftools rebuilds the whole filter graph for it
+        (see graph_rebuilt). Every stateful filter starts over mid-read:
+        STARTPTS rebases to 0 again, so timestamps run backwards, and the
+        input -t - a trim inside the graph - starts its duration again.
+        Measured across such a change: a card probe failed with AVERROR_BUG
+        or wrote 77 frames for a 64-frame window. -frames:v is counted in the
+        muxer, outside the graph, and survives the rebuild; the constant is
+        what STARTPTS would have subtracted, known before the read starts -
+        _first_pts_us at probing_rate 1, and 0 after fps=, whose first period
+        is always 0 (the half frame the seek leaves is at most a quarter of
+        one). A shard is read without -ss and starts at 0 too.
+
+        Probing_rate 1 never 0: every frame would sit exactly half a period
+        off, and the encoder's rounding would pick a slot per frame - the
+        duplicate _exact_frames exists to prevent.
+
+        Only encoder reads. A scorer keeps STARTPTS on both inputs: framesync
+        pairs the distorted frame 0 at exactly 0 with no reference at all
+        when the reference's first frame arrives even a microsecond after it,
+        and libvmaf passes that frame through unscored. Nor does the constant
+        protect a scorer - the scorer itself is a filter the rebuild restarts.
+
+        At probing_rate 2 a rebuild inside the window still drops the frame
+        fps= holds: one period skipped, and one frame from past w1 at the end.
+        The count and the timestamps are what this makes exact, not that.
+        """
+        rate = self._probing_rate()
+        rebase = 0 if shard is not None or rate > 1 else self._first_pts_us(w0)
+        vf, out = self._exact_frames(rebase)
+        return vf, [*out, "-frames:v", str(self._read_frames(w0, w1, rate))]
+
+    def _exact_frames(self, rebase_us: Optional[int] = None) -> Tuple[List[str], List[str]]:
         """(video filters, output options) that make an encoder read emit
         exactly one frame per decoded frame, each on its own timeline slot.
 
@@ -2240,16 +2462,18 @@ class ShotEncoder:
         gone, and everything after it is a frame late.
 
         So frame sync is switched off and the timestamps are the source's
-        own, rebased to the first frame in a fine timebase (AVTB is
-        microseconds; the millisecond one would round again). Rescaled to the
-        encoder's 1/fps that is the frame's slot: the millisecond jitter
-        rounds away, and a frame missing from the source leaves its slot
-        empty - which is exactly the hole the audio expects. Regenerating
-        from the frame INDEX would close that hole and let the picture creep.
-        Appended AFTER the read's other filters, which is where the frames
-        come out.
+        own, rebased in a fine timebase (AVTB is microseconds; the millisecond
+        one would round again) - to the first frame, or by `rebase_us` when
+        the read knows that offset in advance (see _window_encode). Rescaled
+        to the encoder's 1/fps that is the frame's slot: the millisecond
+        jitter rounds away, and a frame missing from the source leaves its
+        slot empty - which is exactly the hole the audio expects.
+        Regenerating from the frame INDEX would close that hole and let the
+        picture creep. Appended AFTER the read's other filters, which is
+        where the frames come out.
         """
-        return (["settb=AVTB", "setpts=PTS-STARTPTS"], ["-fps_mode", "passthrough"])
+        rebase = "STARTPTS" if rebase_us is None else str(rebase_us)
+        return (["settb=AVTB", f"setpts=PTS-{rebase}"], ["-fps_mode", "passthrough"])
 
     def _extract_window(self, w0: int, w1: int, dest: Path, *,
                         source: Optional[Path] = None,
@@ -2283,13 +2507,16 @@ class ShotEncoder:
             chain.append(dv)
         exact_vf, exact_out = self._exact_frames()
         chain += exact_vf
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *pre,
+        args = [self.ffmpeg, "-hide_banner", "-loglevel", "info", "-nostats", "-y", *pre,
                 "-ss", self._seek(w0, source), "-i", str(source or self.source),
                 "-frames:v", str(w1 - w0), "-map", "0:v:0",
                 "-vf", ",".join(chain), *exact_out]
         args += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le",
                  "-an", "-sn", "-f", "matroska", str(dest)]
-        self._run(args, timeout=3600)
+        # the only read of the source a shard's probes and scores make, so a
+        # parameter change inside the window has to be seen here: a software
+        # read, warned about once and the shard stands (see _run_read)
+        self._run_read(args, 3600, "staging read", (w0, w1))
         if not dest.exists() or dest.stat().st_size == 0:
             raise TranscodeError(
                 f"extracting frames [{w0}, {w1}) produced no output")
@@ -2584,13 +2811,17 @@ class ShotEncoder:
     # ---------- phase 2: parallel probing ----------
     def _probe_input(self, w0: int, w1: int,
                      shard: Optional[Path] = None,
-                     lp: Optional[int] = None) -> Tuple[List[str], List[str]]:
+                     lp: Optional[int] = None,
+                     encode: bool = False) -> Tuple[List[str], List[str]]:
         """(input args, video filters) reading frames [w0, w1) of the source.
 
-        Used identically by the probe encode and by the VMAF reference read, so
-        the two are frame-aligned by construction and there is no multi-GB y4m
-        intermediate to cache: at 4K 10-bit a y4m frame is 22MB, and the frames
-        would have to be re-read once per CRF anyway.
+        Used by the probe encode and by the VMAF reference read alike - the
+        same seek, the same filters - so the two are frame-aligned by
+        construction and there is no multi-GB y4m intermediate to cache: at 4K
+        10-bit a y4m frame is 22MB, and the frames would have to be re-read
+        once per CRF anyway. They differ in where the window ends. A score's
+        reference read keeps its -t; an encoder read (`encode`) has none,
+        because _window_encode bounds it by a frame count on the output.
 
         A DV shard already holds exactly these frames with the probe-side
         filters baked in, so it is read whole and needs no filters of its own.
@@ -2614,16 +2845,15 @@ class ShotEncoder:
         # read. That matters more than it sounds: the VMAF/CRF curve here runs
         # 0.14-0.36 VMAF per CRF (see pick_crf), so measuring a window the
         # encoder never sees is worth whole CRF steps.
-        args = threads + ["-ss", self._seek(w0),
-                          "-t", f"{self._span(w0, w1):.6f}",
-                          "-i", str(self.source)]
+        bound = [] if encode else ["-t", f"{self._span(w0, w1):.6f}"]
+        args = threads + ["-ss", self._seek(w0), *bound, "-i", str(self.source)]
         vf: List[str] = []
         rate = self._probing_rate()
         if rate > 1:
             # sample every nth frame by re-timing to fps/rate. Note: the
             # select='not(mod(n,N))' filter does NOT reliably drop frames on
             # ffmpeg master, while fps= cleanly subsamples.
-            vf.append(f"fps={self.fps / rate:g}")
+            vf.append(self._probe_fps_vf(rate))
         scale = self._probe_scale()
         if scale:
             vf.append(f"scale={scale}")
@@ -2775,9 +3005,9 @@ class ShotEncoder:
     def _probe_encode_and_score(self, idx: int, w0: int, w1: int, crf: int,
                                 lp: int, shard: Optional[Path]) -> Tuple[int, int, float]:
         ivf = self.probe_dir / f"probe_{idx:05d}_{crf}.ivf"
-        in_args, vf = self._probe_input(w0, w1, shard, lp=lp)
-        exact_vf, exact_out = self._exact_frames()
-        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        in_args, vf = self._probe_input(w0, w1, shard, lp=lp, encode=True)
+        exact_vf, exact_out = self._window_encode(w0, w1, shard)
+        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "info", "-nostats", "-y"]
                 + in_args + ["-vf", ",".join(vf + exact_vf)] + exact_out)
         # the probe must use the same encoder configuration as the final encode
         # (tune, film grain, keyint, extra params) or it measures a different
@@ -2791,7 +3021,7 @@ class ShotEncoder:
             args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]
         args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items()),
                  "-pix_fmt", self._pix_fmt(), "-f", "ivf", str(ivf)]
-        self._run(args, timeout=3600)
+        self._run_read(args, 3600, "probe encode", (w0, w1))
         score = self._score_probe(w0, w1, ivf, idx, crf, shard)
         if not self.opt.keep_probes:
             try:
@@ -2879,24 +3109,28 @@ class ShotEncoder:
         vf: List[str] = []
         rate = self._probing_rate()
         if rate > 1:
-            vf.append(f"fps={self.fps / rate:.6f}")
+            # the score's reference read subsamples with this very string
+            vf.append(self._probe_fps_vf(rate))
         scale = self._probe_scale()
         if scale:
             # on the card the scaler is the card's too, or the frames would
             # have to come back for it
             vf.append(f"scale_vaapi={scale.replace('x', ':')}")
-        exact_vf, exact_out = self._exact_frames()
-        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        exact_vf, exact_out = self._window_encode(w0, w1)
+        args = ([self.ffmpeg, "-hide_banner", "-loglevel", "info", "-nostats", "-y",
                  "-threads", "4", *self._hwdec_args(),
-                 "-ss", self._seek(w0), "-t", f"{self._span(w0, w1):.6f}",
-                 "-i", str(self.source), "-map", "0:v:0"]
+                 "-ss", self._seek(w0), "-i", str(self.source), "-map", "0:v:0"]
                 + (["-vf", ",".join(vf + exact_vf)] if (vf or exact_vf) else [])
                 + exact_out
                 + ["-c:v", "av1_vaapi", "-rc_mode", "ICQ",
                    "-global_quality", str(q), "-f", "ivf", str(out)])
         with self._gpu_slot(f"probe encode q={q}",
                             self._est_qsv_probe_mb(w1 - w0)):
-            self._run(args, timeout=3600)
+            # an in-band parameter change inside the window rebuilds this
+            # graph: measured, 77 frames written for 64, or AVERROR_BUG. The
+            # count and the timestamps now hold through it (_window_encode),
+            # the frames at probing_rate 2 do not, so it is still caught
+            self._run_read(args, 3600, "card probe encode", (w0, w1))
 
     def _probe_shot_qsv(self, idx: int, s0: int, s1: int,
                         qgrid: List[int]) -> Tuple[Dict[int, float], Dict[int, float]]:
@@ -2950,13 +3184,17 @@ class ShotEncoder:
         the encoder had to spend to get there.
         """
         ivf = self.probe_dir / f"gpuprobe_{idx:05d}_{q}.ivf"
-        self._qsv_probe_encode(w0, w1, q, ivf)
-        try:
-            size = ivf.stat().st_size
-        except OSError:
-            size = 0
+        # not _read_frames, though that is what the encode writes: bytes per
+        # frame is a fit feature, and its denominator stays the one the fit
+        # was built on - one frame apart on an odd window at probing_rate 2
         frames = max(1, (w1 - w0) // self._probing_rate())
         try:
+            # inside the try: a failed or rebuilt encode leaves a partial file
+            self._qsv_probe_encode(w0, w1, q, ivf)
+            try:
+                size = ivf.stat().st_size
+            except OSError:
+                size = 0
             return self._score_probe(w0, w1, ivf, idx, q), size / frames
         finally:
             if not self.opt.keep_probes:
@@ -3030,7 +3268,13 @@ class ShotEncoder:
             s0, s1 = shots[idx]
             svt = self._probe_shot(idx, s0, s1, grid, lp)
             crf_star = self._crossing(svt)
-            qs, _ = self._probe_shot_qsv(idx, s0, s1, qgrid)
+            try:
+                qs, _ = self._probe_shot_qsv(idx, s0, s1, qgrid)
+            except GraphRebuilt as e:
+                # the source changes parameters in this window: no pair from
+                # it, and nothing wrong with the card (see _note_rebuild)
+                self._note_rebuild(*self._probe_window(s0, s1), e)
+                qs = {}
             q_star = self._crossing(qs)
             with lock:
                 samples[idx] = svt
@@ -3059,7 +3303,11 @@ class ShotEncoder:
 
         def bulk_one(idx: int, lp: int, _slot: int, _threads: int) -> object:
             s0, s1 = shots[idx]
-            q_star = self._crossing(self._probe_shot_qsv(idx, s0, s1, qgrid)[0])
+            try:
+                q_star = self._crossing(self._probe_shot_qsv(idx, s0, s1, qgrid)[0])
+            except GraphRebuilt as e:
+                self._note_rebuild(*self._probe_window(s0, s1), e)
+                q_star = None
             if q_star is not None and fit["q_lo"] <= q_star <= fit["q_hi"]:
                 with lock:
                     mapped[idx] = self._map_crf(q_star, fit, grid)
@@ -3378,6 +3626,13 @@ class ShotEncoder:
                 with lock:
                     qsv_spent[0] += len(qs)
                 q_star = self._crossing(qs)
+            except GraphRebuilt as e:
+                # the source changes stream parameters inside this window,
+                # which is not the card failing: no seed, the shot is probed
+                # from the grid, and its SVT probes score without the
+                # zero-copy read that would rebuild the same way
+                self._note_rebuild(*self._probe_window(s0, s1), e)
+                self._log(f"qsv prediction skipped for shot {idx:05d}: {e}")
             except TranscodeError as e:
                 # the card is busy, wedged, or this shot simply never crosses
                 # on the QSV curve. None of that is a reason not to probe it.
@@ -3521,9 +3776,17 @@ class ShotEncoder:
         if self.metric == "ssimulacra2":
             return self._score_ssimulacra2(w0, w1, dist, idx, crf, shard)
         frames = (w1 - w0) // self._probing_rate()
-        if shard is None and (w0, w1) not in self._zc_bad and self._zero_copy():
+        window = (w0, w1)
+        if shard is None and window not in self._zc_bad and self._zero_copy():
             try:
                 score = self._score_zero_copy(w0, w1, dist, idx, crf, frames)
+            except GraphRebuilt as e:
+                # the source changes parameters in this window: scored again
+                # the usual way below, with no streak moved (see _note_rebuild)
+                if self.cancel_flag and self.cancel_flag():
+                    raise
+                self._note_rebuild(w0, w1, e)
+                score = None
             except TranscodeError as e:
                 if not self._zc_fallback(w0, w1, e):
                     raise
@@ -3532,29 +3795,36 @@ class ShotEncoder:
                 return score
         ref_args, ref_vf = self._probe_input(w0, w1, shard)
         hw = False
-        if shard is None and (w0, w1) not in self._hwdec_bad:
+        if shard is None and window not in self._hwdec_bad:
             # a DV shard is a small file already carrying the probe-side
             # filters; only the 4K source read is worth the GPU
             ref_args, ref_vf, hw = self._reference_read(ref_args, ref_vf)
         dist_args = ["-i", str(dist)]
         try:
-            score = self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
+            score = self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames, window)
+        except GraphRebuilt as e:
+            if not hw or (self.cancel_flag and self.cancel_flag()):
+                raise
+            self._note_rebuild(w0, w1, e)
+            ref_args, ref_vf = self._probe_input(w0, w1, shard)
+            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames, window)
         except TranscodeError as e:
             if not hw or not self._hwdec_fallback(w0, w1, e):
                 raise
             ref_args, ref_vf = self._probe_input(w0, w1, shard)
-            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames)
+            return self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, frames, window)
         if hw:
             self._hwdec_read_ok()
         return score
 
     def _score_pair(self, dist_args: List[str], ref_args: List[str],
                     ref_vf: List[str], idx: int, crf: int,
-                    threads: Optional[int], frames: int) -> float:
+                    threads: Optional[int], frames: int,
+                    window: Optional[Tuple[int, int]] = None) -> float:
         if self.metric == "xpsnr":
-            return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf)
+            return self._score_xpsnr(dist_args, ref_args, ref_vf, idx, crf, window=window)
         return self._score_vmaf(dist_args, ref_args, ref_vf, idx, crf,
-                                threads=threads, frames=frames)
+                                threads=threads, frames=frames, window=window)
 
     def _window_input(self, w0: int, w1: int, source: Path,
                       threads: int) -> List[str]:
@@ -3676,6 +3946,21 @@ class ShotEncoder:
                 self._hwdec_ok = self._hwdec_preflight()
             return self._hwdec_ok
 
+    def _preflight_starts(self, n: int) -> List[int]:
+        """First frames of the windows a preflight may read, in the order
+        they are tried.
+
+        Two seconds in, so the seek path is the one that is exercised, but
+        never past the end of a short source. The later ones are for a window
+        that crosses an in-band parameter change - a logo encoded apart from
+        the programme it precedes, say - whose graph is rebuilt mid-read (see
+        graph_rebuilt): that proves nothing about the decoder or the import
+        either way, and must not switch a feature off for the whole job.
+        """
+        last = max(self.total_frames - n, 0)
+        starts = (int(round(2 * self.fps)), self.total_frames // 2, self.total_frames * 3 // 4)
+        return list(dict.fromkeys(min(s, last) for s in starts))
+
     def _hwdec_preflight(self) -> bool:
         """Prove a seeked hardware read of this source is frame-identical to
         the software read before any score depends on it.
@@ -3696,28 +3981,46 @@ class ShotEncoder:
             logger.warning("reference_hwaccel: no /dev/dri render node in this "
                            "container; scoring reads stay on the CPU")
             return False
-        # two seconds in, so the seek path is the one that is exercised, but
-        # never past the end of a short source
-        seek = self._seek(min(int(round(2 * self.fps)), max(self.total_frames - n, 0)))
-        common = ["-hide_banner", "-loglevel", "error", "-nostats"]
-        tail = ["-i", str(self.source), "-map", "0:v:0", "-frames:v", str(n)]
-        sw = [self.ffmpeg, *common, "-threads", "2", "-ss", seek, *tail,
-              "-vf", f"format={self._native_format()}", "-f", "framemd5", "-"]
-        hw = [self.ffmpeg, *common, *self._hwdec_args(), "-ss", seek, *tail,
-              "-vf", self._download_vf(), "-f", "framemd5", "-"]
+        # info, not error: the line saying a window crossed an in-band
+        # parameter change is INFO (see graph_rebuilt). The checksums still
+        # stand apart from the log by their "0," stream prefix.
+        common = ["-hide_banner", "-loglevel", "info", "-nostats"]
 
         def sums(out: str) -> List[str]:
             return [line.rsplit(",", 1)[-1].strip()
                     for line in out.splitlines() if line.startswith("0,")]
 
-        try:
-            want = sums(self._run(sw, timeout=300))
-            got = sums(self._run(hw, timeout=300))
-        except (TranscodeError, OSError) as e:
-            logger.warning("reference_hwaccel: VA-API cannot decode {} ({}); "
-                           "scoring reads stay on the CPU for this job",
-                           self.source.name, e)
-            return False
+        starts = self._preflight_starts(n)
+        want: List[str] = []
+        got: List[str] = []
+        for k, start in enumerate(starts):
+            seek = self._seek(start)
+            tail = ["-i", str(self.source), "-map", "0:v:0", "-frames:v", str(n)]
+            sw = [self.ffmpeg, *common, "-threads", "2", "-ss", seek, *tail,
+                  "-vf", f"format={self._native_format()}", "-f", "framemd5", "-"]
+            hw = [self.ffmpeg, *common, *self._hwdec_args(), "-ss", seek, *tail,
+                  "-vf", self._download_vf(), "-f", "framemd5", "-"]
+            window = (start, start + n)
+            try:
+                want = sums(self._run_read(sw, 300, "preflight read", window, strict=True))
+                got = sums(self._run_read(hw, 300, "preflight read", window, strict=True))
+            except GraphRebuilt as e:
+                # never _note_rebuild here: _hwdec holds _hwdec_lock
+                if k + 1 < len(starts):
+                    logger.info("reference_hwaccel: the preflight window [{}, {}) crosses "
+                                "an in-band parameter change ({}); trying [{}, {})",
+                                start, start + n, e.reason, starts[k + 1], starts[k + 1] + n)
+                    continue
+                logger.warning("reference_hwaccel: every preflight window of {} crosses an "
+                               "in-band parameter change ({}); scoring reads stay on the "
+                               "CPU for this job", self.source.name, e.reason)
+                return False
+            except (TranscodeError, OSError) as e:
+                logger.warning("reference_hwaccel: VA-API cannot decode {} ({}); "
+                               "scoring reads stay on the CPU for this job",
+                               self.source.name, e)
+                return False
+            break
         if not want or not got:
             logger.warning("reference_hwaccel: {} decoded no frames of {}; "
                            "scoring reads stay on the CPU for this job",
@@ -3805,30 +4108,66 @@ class ShotEncoder:
         plus an upload without failing and says so only at INFO. And the
         score must equal the usual read's on the same pair, which a wrong
         de-tile or a missed P010 shift would not.
+
+        A window whose graph is rebuilt mid-read scores a part of itself on
+        one side (see graph_rebuilt), which is no verdict on zero-copy: the
+        next window is tried instead.
         """
         if not self._hwdec_preflight():
             logger.info("optimizer: vmaf_zero_copy stays off for this job (the "
                         "seeked VA-API read above did not match software)")
             return False
         n = self._ZC_PREFLIGHT_FRAMES * self._probing_rate()
-        w0 = min(int(round(2 * self.fps)), max(self.total_frames - n, 0))
-        w1 = min(w0 + n, max(self.total_frames, w0 + 1))
+        starts = self._preflight_starts(n)
+        for k, w0 in enumerate(starts):
+            w1 = min(w0 + n, max(self.total_frames, w0 + 1))
+            try:
+                return self._zc_preflight_window(sycl, w0, w1)
+            except GraphRebuilt as e:
+                # never _note_rebuild here: _zero_copy holds _zc_lock
+                if k + 1 < len(starts):
+                    nxt = starts[k + 1]
+                    logger.info("optimizer: the zero-copy preflight window [{}, {}) crosses "
+                                "an in-band parameter change ({}); trying [{}, {})",
+                                w0, w1, e.reason, nxt,
+                                min(nxt + n, max(self.total_frames, nxt + 1)))
+                    continue
+                logger.warning("optimizer: vmaf_zero_copy stays off for this job: every "
+                               "preflight window crosses an in-band parameter change ({})",
+                               e.reason)
+        return False
+
+    def _zc_preflight_window(self, sycl: int, w0: int, w1: int) -> bool:
+        """The zero-copy preflight on frames [w0, w1) (see _zc_preflight). A
+        graph rebuilt in any of its three reads leaves as GraphRebuilt."""
+        window = (w0, w1)
         ivf = self.probe_dir / "zc_preflight.ivf"
         out_json = self.probe_dir / "zc_preflight.json"
+        usual_json = self.probe_dir / "zc_preflight_usual.json"
         ref_args, ref_vf = self._probe_input(w0, w1)
-        exact_vf, exact_out = self._exact_frames()
-        encode = ([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *ref_args,
-                   "-vf", ",".join(ref_vf + exact_vf), *exact_out, "-map", "0:v:0",
+        # the probe encode's own read: no -t, bounded by its frame count
+        enc_args, _ = self._probe_input(w0, w1, encode=True)
+        exact_vf, exact_out = self._window_encode(w0, w1)
+        encode = ([self.ffmpeg, "-hide_banner", "-loglevel", "info", "-nostats", "-y",
+                   *enc_args, "-vf", ",".join(ref_vf + exact_vf), *exact_out, "-map", "0:v:0",
                    "-c:v", "libsvtav1", "-preset", "12", "-crf", "40",
                    "-pix_fmt", self._pix_fmt(), "-f", "ivf", str(ivf)])
+        # neither log may be one an earlier window left behind: libvmaf writes
+        # none for a run that scored nothing, and a stale one would parse
+        _unlink(out_json)
+        _unlink(usual_json)
         try:
-            self._run(encode, timeout=600)
-            want = self._score_vmaf_on(sycl, ["-i", str(ivf)], ref_args, ref_vf,
-                                       -1, 0, None, timeout=300)
-            out = self._run(self._vmaf_cmd(sycl, ["-i", str(ivf)], ref_args, ref_vf,
-                                           out_json, None, zero_copy=True,
-                                           loglevel="info"), timeout=300)
+            self._run_read(encode, 600, "zero-copy preflight encode", window, strict=True)
+            self._run_read(self._vmaf_cmd(sycl, ["-i", str(ivf)], ref_args, ref_vf,
+                                          usual_json, None),
+                           300, "zero-copy preflight score", window, strict=True)
+            want = parse_score(usual_json, self.metric)
+            out = self._run_read(self._vmaf_cmd(sycl, ["-i", str(ivf)], ref_args, ref_vf,
+                                                out_json, None, zero_copy=True),
+                                 300, "zero-copy preflight score", window, strict=True)
             got = parse_score(out_json, self.metric)
+        except GraphRebuilt:
+            raise
         except (TranscodeError, OSError, ValueError) as e:
             self._check_cancel()
             detail = "; ".join(
@@ -3839,6 +4178,7 @@ class ShotEncoder:
         finally:
             _unlink(ivf)
             _unlink(out_json)
+            _unlink(usual_json)
         if "readback path" in out or "de-tile" not in out:
             logger.warning(
                 "optimizer: vmaf_zero_copy stays off for this job: libvmaf {} "
@@ -3872,7 +4212,7 @@ class ShotEncoder:
             score = self._score_vmaf_on(sycl, ["-i", str(dist)], ref_args, ref_vf,
                                         idx, crf, None,
                                         timeout=self._sycl_timeout(frames),
-                                        zero_copy=True)
+                                        zero_copy=True, window=(w0, w1))
         finally:
             self._gpu_vram.calibrate()
             self._gpu_vram.release(booked, need)
@@ -3908,12 +4248,70 @@ class ShotEncoder:
                        if flip else "")
         return True
 
+    def _note_rebuild(self, w0: int, w1: int, err: GraphRebuilt) -> None:
+        """A card read of [w0, w1) had its filter graph rebuilt: every later
+        read of that window decodes in software, which does not rebuild for a
+        new frames context (see GraphRebuilt).
+
+        No failure streak moves and none resets - nothing was learnt about
+        the device either way. Takes _zc_lock and _hwdec_lock one after the
+        other, so it must never be called from the preflights, which run
+        under them.
+        """
+        key = (w0, w1)
+        with self._rebuild_lock:
+            self._rebuilt.setdefault(key, err.reason)
+            first = key not in self._rebuild_warned
+            self._rebuild_warned.add(key)
+        with self._zc_lock:
+            self._zc_bad.add(key)
+        with self._hwdec_lock:
+            self._hwdec_bad.add(key)
+        if not first:
+            self._log(f"graph rebuilt again on [{w0}, {w1}) in the {err.read}: {err.reason}")
+            return
+        # "hwaccel changed" alone is only the decoder's new frames context;
+        # anything else is the stream really changing, which software sees too
+        also = ("" if err.reason == "hwaccel changed" else
+                "; its parameters really change there, so the software read rebuilds "
+                "too and that window's scores may be off")
+        logger.warning("optimizer: ffmpeg rebuilt the filter graph of the {} of frames "
+                       "[{}, {}) ({}): the source changes stream parameters inside that "
+                       "window, so it is read with software decode for the rest of the "
+                       "job{}", err.read, w0, w1, err.reason, also)
+
+    def _note_software_rebuild(self, window: Optional[Tuple[int, int]], read: str,
+                               reason: str) -> None:
+        """A software read had its filter graph rebuilt: the stream really
+        changes there (size, format, colour, display matrix), and no other
+        read of the window avoids that - the software one is already the
+        fallback. So it is warned about once per window and the job carries
+        on with the read as it came. Failing the job over one window's score
+        would be the kind of strict refusal that once killed a whole queue.
+        """
+        with self._rebuild_lock:
+            first = window not in self._rebuild_warned
+            self._rebuild_warned.add(window)
+        where = f" of frames [{window[0]}, {window[1]})" if window else ""
+        if not first:
+            self._log(f"graph rebuilt again in the software {read}{where}: {reason}")
+            return
+        logger.warning("optimizer: ffmpeg rebuilt the filter graph of the software {}{} "
+                       "({}): the source changes stream parameters there and no other "
+                       "read avoids it, so that window's scores may be off; the job "
+                       "carries on", read, where, reason)
+
     def _zc_summary(self) -> str:
-        """The zero-copy share of the probe phase, for its summary line."""
-        if not (self._zc_scored or self._zc_fallbacks):
-            return ""
-        fell = f", {self._zc_fallbacks} fell back" if self._zc_fallbacks else ""
-        return f"; {self._zc_scored} score(s) zero-copy{fell}"
+        """The zero-copy share of the probe phase, for its summary line, and
+        how many windows a graph rebuild sent to software decode."""
+        parts = []
+        if self._zc_scored or self._zc_fallbacks:
+            fell = f", {self._zc_fallbacks} fell back" if self._zc_fallbacks else ""
+            parts.append(f"{self._zc_scored} score(s) zero-copy{fell}")
+        if self._rebuilt:
+            parts.append(f"{len(self._rebuilt)} window(s) read in software after a "
+                         "graph rebuild")
+        return "".join(f"; {p}" for p in parts)
 
     def _score_windows(self, w0: int, w1: int, idx: int, crf: int,
                        threads: int) -> float:
@@ -3921,17 +4319,25 @@ class ShotEncoder:
         source, reading both in place."""
         # the AV1 side stays on the CPU: dav1d beats a GPU decode plus
         # download there
+        window = (w0, w1)
         dist_args = self._window_input(w0, w1, self.output, threads)
         ref_args, ref_vf, hw = self._window_input(w0, w1, self.source, threads), [], False
-        if (w0, w1) not in self._hwdec_bad:
+        if window not in self._hwdec_bad:
             ref_args, ref_vf, hw = self._reference_read(ref_args, ref_vf)
         try:
-            score = self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, w1 - w0)
+            score = self._score_pair(dist_args, ref_args, ref_vf, idx, crf, threads, w1 - w0,
+                                     window)
+        except GraphRebuilt as e:
+            if not hw or (self.cancel_flag and self.cancel_flag()):
+                raise
+            self._note_rebuild(w0, w1, e)
+            return self._score_pair(dist_args, self._window_input(w0, w1, self.source, threads),
+                                    [], idx, crf, threads, w1 - w0, window)
         except TranscodeError as e:
             if not hw or not self._hwdec_fallback(w0, w1, e):
                 raise
             return self._score_pair(dist_args, self._window_input(w0, w1, self.source, threads),
-                                    [], idx, crf, threads, w1 - w0)
+                                    [], idx, crf, threads, w1 - w0, window)
         if hw:
             self._hwdec_read_ok()
         return score
@@ -4000,7 +4406,8 @@ class ShotEncoder:
     _VIDEO_ONLY_OUTPUT = ("-an", "-sn", "-dn")
 
     def _score_xpsnr(self, dist_args: List[str], ref_args: List[str],
-                     ref_vf: List[str], idx: int, crf: int) -> float:
+                     ref_vf: List[str], idx: int, crf: int,
+                     window: Optional[Tuple[int, int]] = None) -> float:
         """ffmpeg's xpsnr filter: a dB scale, not 0-100. Weighted luma is what
         the ITU work reports, so that is what is returned."""
         fmt = f"format={self._pix_fmt()}"
@@ -4010,10 +4417,12 @@ class ShotEncoder:
         ref_chain = ",".join(f for f in (*ref_vf, rebase, fmt) if f)
         lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
                  f"[dist][ref]xpsnr=shortest=1")
-        args = ([self.ffmpeg, "-hide_banner", "-y", "-loglevel", "info"]
+        args = ([self.ffmpeg, "-hide_banner", "-y", "-loglevel", "info", "-nostats"]
                 + dist_args + ref_args
                 + ["-lavfi", lavfi, *self._VIDEO_ONLY_OUTPUT, "-f", "null", "-"])
-        out = self._run(args, timeout=3600)
+        # the xpsnr filter restarts with a rebuilt graph like libvmaf does
+        out = self._run_read(args, 3600, "reference read" if "-hwaccel" in ref_args
+                             else "score read", window)
         m = re.findall(r"XPSNR\s+y:\s*([0-9.]+)", out)
         if not m:
             raise TranscodeError(f"could not parse XPSNR output: {out[-300:]}")
@@ -4152,7 +4561,8 @@ class ShotEncoder:
     def _score_vmaf(self, dist_args: List[str], ref_args: List[str],
                     ref_vf: List[str], idx: int, crf: int,
                     threads: Optional[int] = None,
-                    frames: Optional[int] = None) -> float:
+                    frames: Optional[int] = None,
+                    window: Optional[Tuple[int, int]] = None) -> float:
         """Score one distorted window against one reference window.
 
         Both sides arrive as ffmpeg INPUT ARGUMENTS rather than paths, because
@@ -4179,9 +4589,15 @@ class ShotEncoder:
             try:
                 score = self._score_vmaf_on(sycl, dist_args, ref_args, ref_vf,
                                             idx, crf, threads,
-                                            timeout=self._sycl_timeout(frames))
+                                            timeout=self._sycl_timeout(frames),
+                                            window=window)
                 self._sycl_scored_ok()
                 return score
+            except GraphRebuilt:
+                # not the device: a card reference read whose graph was
+                # rebuilt, which the CPU retry below would repeat with the
+                # same read. The caller reads the window in software instead.
+                raise
             except TranscodeError as e:
                 # Not just timeouts. E07 of Stranger Things died on
                 # "SYCL memcpy H2D: OUT_OF_DEVICE_MEMORY" followed by
@@ -4205,17 +4621,27 @@ class ShotEncoder:
                 # only when nothing at all is getting through, which is what a
                 # device that has really gone looks like.
                 text = str(e)
+                # A software read across a real parameter change (see
+                # _run_read), already warned about: the scorer restarted
+                # mid-read and then failed or stalled, which is the stream and
+                # not the device. The CPU still scores it below, but like a
+                # rebuilt card read it is no step towards retiring the device.
+                rebuilt = getattr(e, "rebuilt", None)
                 # Under the lock: probe workers fail concurrently, and the
                 # flip to the CPU should be announced exactly once.
                 with self._sycl_lock:
-                    self._sycl_timeouts += 1
+                    if rebuilt is None:
+                        self._sycl_timeouts += 1
                     n = self._sycl_timeouts
                     # consecutive, not cumulative: see _sycl_scored_ok
-                    flip = n >= self._SYCL_MAX_TIMEOUTS and self._sycl_ok
+                    flip = rebuilt is None and n >= self._SYCL_MAX_TIMEOUTS and self._sycl_ok
                     if flip:
                         self._sycl_ok = False
                         self._sycl_retired_at = time.time()
-                if stalled:
+                if rebuilt is not None:
+                    self._log(f"sycl scoring shot {idx:05d} crf {crf} ended after a graph "
+                              f"rebuild ({rebuilt}); scoring it on the CPU instead")
+                elif stalled:
                     logger.warning(
                         "optimizer: SYCL scoring of shot {} crf {} did not finish "
                         "within {}s (stall {} this job); scoring it on the CPU "
@@ -4235,7 +4661,7 @@ class ShotEncoder:
                 self._gpu_vram.calibrate()
                 self._gpu_vram.release(booked, need)
         return self._score_vmaf_on(-1, dist_args, ref_args, ref_vf, idx, crf,
-                                   threads, timeout=3600)
+                                   threads, timeout=3600, window=window)
 
     def _sycl_scored_ok(self) -> None:
         """A SYCL score came back: clear the stall streak.
@@ -4253,24 +4679,39 @@ class ShotEncoder:
     def _score_vmaf_on(self, sycl: int, dist_args: List[str], ref_args: List[str],
                        ref_vf: List[str], idx: int, crf: int,
                        threads: Optional[int], timeout: int,
-                       zero_copy: bool = False) -> float:
+                       zero_copy: bool = False,
+                       window: Optional[Tuple[int, int]] = None) -> float:
         """One libvmaf run on the given backend (`sycl` < 0 = CPU); with
-        `zero_copy` both inputs decode on the card instead (see _zero_copy)."""
+        `zero_copy` both inputs decode on the card instead (see _zero_copy).
+        `window` is the frames being scored, for a rebuilt graph's report."""
         out_json = self.probe_dir / f"score_{idx:05d}_{crf}.json"
         args = self._vmaf_cmd(sycl, dist_args, ref_args, ref_vf, out_json, threads,
                               zero_copy=zero_copy)
+        read = ("zero-copy score" if zero_copy else
+                "reference read" if "-hwaccel" in ref_args else "score read")
+        # The path depends only on the shot and CRF, which a SYCL run and its
+        # CPU retry, a zero-copy score and the usual read after it, and a card
+        # probe at q=18 and an SVT probe at CRF 18 all share. libvmaf writes
+        # no log for a run that scored nothing, so one left over would parse
+        # as this run's score.
+        _unlink(out_json)
         try:
-            self._run(args, timeout=timeout)
+            self._run_read(args, timeout, read, window)
+        except GraphRebuilt:
+            _unlink(out_json)       # one instance's log of part of the window
+            raise
         except CommandTimeout:
             raise
         except TranscodeError as e:
-            raise TranscodeError(
+            failed = TranscodeError(
                 f"{e}\n"
                 f"Hint: the quality probe could not run (model={self._model_cfg()}). "
                 "If target_metric=ssimulacra2, note stock libvmaf has no ssimulacra2 "
                 "built in - set transcode.optimizer.ssimulacra2_model to a compatible "
                 "model (e.g. path=/path/to/ssimulacra2.json) or use target_metric=vmaf."
-            ) from e
+            )
+            failed.rebuilt = getattr(e, "rebuilt", None)    # see _score_vmaf
+            raise failed from e
         score = parse_score(out_json, self.metric)
         self._log(f"shot {idx:05d} crf {crf} {self.metric}={score:.3f}")
         if not self.opt.keep_probes:
@@ -4282,8 +4723,13 @@ class ShotEncoder:
 
     def _vmaf_cmd(self, sycl: int, dist_args: List[str], ref_args: List[str],
                   ref_vf: List[str], out_json: Path, threads: Optional[int],
-                  zero_copy: bool = False, loglevel: str = "error") -> List[str]:
-        """The ffmpeg command behind one libvmaf run (see _score_vmaf_on)."""
+                  zero_copy: bool = False) -> List[str]:
+        """The ffmpeg command behind one libvmaf run (see _score_vmaf_on).
+
+        At -loglevel info: a graph rebuilt mid-run (see graph_rebuilt) and
+        libvmaf_sycl's report of how it imported the surfaces are both INFO
+        lines. -nostats keeps the progress lines out of what _run holds.
+        """
         # ts_sync_mode=nearest is NOT optional. The reference is read straight
         # from the source container while the distorted side is an ivf carrying
         # an exact frame-rate timebase, and matroska stores timestamps in whole
@@ -4371,7 +4817,7 @@ class ShotEncoder:
             ref_chain = ",".join(f for f in (*ref_vf, rebase, scale, fmt) if f)
         lavfi = (f"[0:v]{dist_chain}[dist];[1:v]{ref_chain}[ref];"
                  f"[dist][ref]{scorer}={':'.join(opts)}")
-        return ([self.ffmpeg, "-hide_banner", "-loglevel", loglevel, "-y", *hw]
+        return ([self.ffmpeg, "-hide_banner", "-loglevel", "info", "-nostats", "-y", *hw]
                 + dist_args + ref_args
                 + ["-lavfi", lavfi, *self._VIDEO_ONLY_OUTPUT, "-f", "null", "-"])
 
@@ -4727,7 +5173,7 @@ class ShotEncoder:
             crf = float(chosen.get(idx, self.video.crf))
             try:
                 score = self._score_delivered(idx, w0, w1, crf)
-            except (TranscodeError, OSError) as e:
+            except (TranscodeError, OSError, ValueError) as e:
                 logger.warning("optimizer: could not verify shot {} ({})", idx, e)
                 continue
             predicted = predict_score(list((samples.get(idx) or {}).items()), crf)
@@ -4805,6 +5251,71 @@ class ShotEncoder:
             args += [f"-c:s:{i}", "srt" if convert else "copy"]
         return args
 
+    # Every flag -disposition takes (libavformat/options.c), in ffmpeg's own
+    # order. ffprobe prints a stream's flags under these same names.
+    _DISPOSITIONS = ("default", "dub", "original", "comment", "lyrics",
+                     "karaoke", "forced", "hearing_impaired", "visual_impaired",
+                     "clean_effects", "attached_pic", "timed_thumbnails",
+                     "non_diegetic", "captions", "descriptions", "metadata",
+                     "dependent", "still_image", "multilayer")
+
+    def _disposition_args(self, source: str) -> List[str]:
+        """-disposition arguments that put `source`'s own flags on every stream
+        a "-map a? -map s?" remux of it writes, in output order.
+
+        Left to itself, fftools marks the first stream of a type default when
+        the output holds more than one of that type and none of them is
+        (set_dispositions in ffmpeg_mux_init.c). Two PGS tracks with neither
+        default came out with the first one default, mkvmerge kept it, and
+        Plex picked that empty track and burned it in: 17 Stranger Things S04
+        outputs. One explicit -disposition turns the inference off for the
+        whole file; naming every stream leaves nothing to it.
+        """
+        kinds = {"audio": "a", "subtitle": "s"}
+        try:
+            out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
+                             "-show_entries",
+                             "stream=index,codec_type:stream_disposition",
+                             "-of", "json", source], timeout=120)
+            # _run folds stderr in: start at the JSON, past any error lines
+            data, _ = json.JSONDecoder().raw_decode(out, out.index("{"))
+            values: Dict[str, List[str]] = {"a": [], "s": []}
+            for stream in data["streams"]:           # index order, as ffprobe lists
+                kind = kinds.get(stream.get("codec_type"))
+                if kind is None:
+                    continue
+                flags = stream["disposition"]
+                unknown = sorted(n for n, on in flags.items()
+                                 if on and n not in self._DISPOSITIONS)
+                if unknown:
+                    # naming a flag this ffmpeg lacks would fail the remux
+                    logger.warning("dropping disposition flag(s) {} that "
+                                   "ffmpeg does not take", ", ".join(unknown))
+                values[kind].append(
+                    "+".join(n for n in self._DISPOSITIONS if flags.get(n)) or "0")
+        except (TranscodeError, FileNotFoundError, ValueError, KeyError,
+                TypeError, AttributeError) as e:
+            # Not knowing the source's flags, clear the one that did the damage
+            # and leave the rest to ffmpeg's copy of the input. "-default" is
+            # prefixed, so it edits the copied flags instead of replacing them:
+            # the subtitles keep forced and the others, and the audio keeps
+            # exactly what it came with, a real default included. A genuine
+            # default subtitle lost costs a click in Plex; a false one costs a
+            # burn-in transcode. With a subtitle present, the audio's one change
+            # is that ffmpeg no longer invents a default among several tracks
+            # none of which is - the same guess, off for the whole file once a
+            # -disposition matches any stream. With no subtitle the option
+            # matches nothing and ffmpeg's old audio inference still applies.
+            logger.warning("could not probe the stream dispositions of {} ({}); "
+                           "clearing the default flag on its subtitles",
+                           Path(source).name, e)
+            return ["-disposition:s", "-default"]
+        args: List[str] = []
+        for kind in ("a", "s"):
+            for i, value in enumerate(values[kind]):
+                args += [f"-disposition:{kind}:{i}", value]
+        return args
+
     def concat_shots(self, ivf_paths: List[Path],
                      shots: Optional[List[Shot]] = None) -> None:
         if not ivf_paths:
@@ -4830,6 +5341,7 @@ class ShotEncoder:
         # intermediate, so muxing from it would drop audio).
         audio_src = str(self.info.path if self.info.path else self.source)
         audio_subs: Optional[Path] = self.tempdir / "audio_subs.mkv"
+        dispositions: List[str] = []
         if not self._has_audio_or_subs(audio_src):
             # Nothing to carry over, and asking anyway is actively dangerous:
             # "-map 0:a? -map 0:s?" against a video-only source maps NOTHING,
@@ -4838,36 +5350,89 @@ class ShotEncoder:
             # 8.20GB for the 24-second version - a flat allocation, unrelated
             # to the input size. Under a container memory limit that is an
             # OOM kill at the very last step, after the whole encode is done.
+            # Attachments alone do not need this pass: mkvmerge takes them from
+            # the source itself (see _source_attachments).
             logger.info("optimizer: source has no audio or subtitle streams; "
                         "muxing video only")
             audio_subs = None
         else:
             # NB: no -map_metadata -1 here: it strips per-stream LANGUAGE tags
             # from the subtitle/audio streams (Plex then shows every subtitle
-            # as English). The source's global "DV.HDR10.PLUS" title is
-            # harmless in this intermediate - mkvmerge does not copy it into
-            # the final file.
+            # as English). The source's global title rides along into this
+            # intermediate, and mkvmerge DOES carry it into the final file:
+            # measured with mkvmerge v82 (Ubuntu 24.04's, the image's), whose
+            # Matroska reader takes the segment title of every input
+            # (maybe_set_segment_title). A "DV.HDR10.PLUS" title can land on
+            # an HDR10 output.
+            # The source's own flags, stated for every stream so that fftools
+            # infers none (see _disposition_args). Probed once: the retry and
+            # the ffmpeg fallback mux below write the same streams in the same
+            # order.
+            dispositions = self._disposition_args(audio_src)
             base_args = [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
                          "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
-                         "-c:a", "copy"]
+                         "-c:a", "copy", *dispositions]
+            # The source's attachments too: the fonts its ASS subtitles are
+            # styled with, without which a player substitutes its own and CJK
+            # text can come out as boxes. mkvmerge normally takes them from the
+            # source instead; this copy serves the ffmpeg fallback mux and an
+            # mkvmerge that cannot read the source. "?" because most sources
+            # (every mp4) have none, and a bare "0:t" then fails the remux
+            # ("matches no streams", ffmpeg_opt.c). fftools only ever
+            # stream-copies an attachment (choose_encoder); "-c:t copy" says
+            # so. Mapped last, they shift no -disposition: an "a:N" or "s:N"
+            # counts streams of its own type only (stream_specifier_match).
+            attachments = ["-map", "0:t?", "-c:t", "copy"]
             try:
-                self._run(base_args + self._subtitle_codec_args(audio_src)
+                self._run(base_args + attachments
+                          + self._subtitle_codec_args(audio_src)
                           + [str(audio_subs)], timeout=1800)
             except TranscodeError:
                 logger.warning("subtitle remux failed, retrying with a plain copy")
-                self._run(base_args + ["-c:s", "copy", str(audio_subs)],
-                          timeout=1800)
+                try:
+                    self._run(base_args + attachments
+                              + ["-c:s", "copy", str(audio_subs)], timeout=1800)
+                except TranscodeError:
+                    # How an attachment fails the remux: matroskaenc refuses
+                    # one with no filename, or with no mimetype that it can
+                    # deduce from the codec (mkv_init; measured, exit 234). A
+                    # Matroska source never has such a stream - matroskadec
+                    # drops it as an "incomplete attachment" - but apetag's
+                    # binary items do.
+                    # Losing a font costs a styled subtitle; losing the remux
+                    # costs the whole finished encode.
+                    logger.warning("remux failed again; retrying without the "
+                                   "source's attachments")
+                    self._run(base_args + ["-c:s", "copy", str(audio_subs)],
+                              timeout=1800)
         # Final mux via mkvmerge: ffmpeg's -c copy remux of the concat leaves
         # the shot-boundary structure that Plex's 4K AV1 transcode hangs on
         # (runs for 10-20 min then stops producing HLS segments; verified on
         # 4K DV-P8 output while a single-continuous encode is fine). mkvmerge
         # rebuilds the container so the same bitstream plays and seeks fine.
-        # NB: mkvmerge does NOT copy the source's global metadata (which would
-        # carry a misleading "...DV.HDR10.PLUS..." title onto an HDR10 stream).
         mkvmerge = self.settings.tools.mkvmerge
-        if shutil.which(mkvmerge) and self._mkvmerge_mux(mkvmerge, video_only,
-                                                        audio_subs):
-            return
+        if shutil.which(mkvmerge):
+            # A Matroska source hands its attachments straight to mkvmerge,
+            # which copies every one exactly, UID included. The ffmpeg copy in
+            # audio_subs.mkv cannot: matroskadec turns an image/gif, jpeg, png
+            # or tiff attachment into an attached_pic video stream that no
+            # "-map 0:t" reaches, matroskaenc gives every attachment a new UID,
+            # and matroskadec's 256MB cap on a binary element (EBML_BIN) loses
+            # the attachment over it and every one after. Measured, mkvmerge
+            # reads only the header of such an input: 10MB of a 613MB file.
+            attachments_from = (audio_src if self._source_attachments(audio_src)
+                                else None)
+            if self._mkvmerge_mux(mkvmerge, video_only, audio_subs,
+                                  attachments_from):
+                return
+            if attachments_from is not None:
+                # e.g. a source mkvmerge cannot parse (exit 2). What
+                # audio_subs.mkv carries still gets through, and the container
+                # rebuild Plex needs is kept.
+                logger.warning("mkvmerge failed with {} as an attachment source; "
+                               "muxing again without it", Path(audio_src).name)
+                if self._mkvmerge_mux(mkvmerge, video_only, audio_subs):
+                    return
         logger.warning("mkvmerge unavailable or failed; falling back to ffmpeg mux")
         # fallback: global metadata comes from the first input (video_only,
         # which has no title), stream language tags ride along with the
@@ -4881,7 +5446,14 @@ class ShotEncoder:
             base += ["-i", str(audio_subs)]
         base += ["-map", "0:v:0"]
         if audio_subs is not None:
-            base += ["-map", "1:a?", "-map", "1:s?"]
+            # audio_subs holds the source's audio then its subtitles, in order,
+            # so the source's flags line up; without them this mux would infer
+            # a default of its own. The srt retry below inherits them. Then
+            # whatever attachments the remux copied - optional, as there are
+            # none from an mp4. Image attachments and the source's UIDs are
+            # what this path cannot keep (see the mkvmerge mux above).
+            base += ["-map", "1:a?", "-map", "1:s?", "-map", "1:t?",
+                     *dispositions]
         base += ["-c", "copy"]
         try:
             self._run(base + [str(self.output)], timeout=1800)
@@ -4897,7 +5469,12 @@ class ShotEncoder:
             raise TranscodeError("optimizer produced no output file")
 
     def _has_audio_or_subs(self, source: str) -> bool:
-        """Whether `source` carries anything the final mux needs to copy over.
+        """Whether `source` has audio or subtitles for the remux to copy over.
+
+        Attachments do not count. mkvmerge takes every one of them from the
+        source itself (see _source_attachments), images and UIDs included,
+        which the remux's copy could not; for attachments alone that copy
+        would serve only the ffmpeg fallback mux.
 
         Assumed present when ffprobe cannot say: running the remux for nothing
         wastes a pass, but skipping it wrongly silently drops the audio.
@@ -4917,6 +5494,38 @@ class ShotEncoder:
         kinds = {_csv_first(line) for line in out.splitlines()}
         return bool(kinds & {"audio", "subtitle"})
 
+    def _source_attachments(self, source: str) -> bool:
+        """Whether `source` is a Matroska file with attachments, for the final
+        mkvmerge mux to take straight from it.
+
+        ffprobe lists one as an "attachment" stream - except that matroskadec
+        makes an image/gif, jpeg, png or tiff attachment a video stream flagged
+        attached_pic. Both count. Only Matroska is taken this way: it is the
+        case measured, and elsewhere an attached_pic is cover art such as an
+        mp4's covr, not an attachment.
+
+        Taken as none when ffprobe cannot say: the remux's copy still carries
+        the fonts, where there is a remux.
+        """
+        try:
+            out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
+                             "-show_entries",
+                             "format=format_name:stream=codec_type"
+                             ":stream_disposition=attached_pic",
+                             "-of", "json", source], timeout=120)
+            # _run folds stderr in: start at the JSON, past any error lines
+            data, _ = json.JSONDecoder().raw_decode(out, out.index("{"))
+            if "matroska" not in data["format"]["format_name"].split(","):
+                return False
+            return any(stream["codec_type"] == "attachment"
+                       or stream["disposition"]["attached_pic"]
+                       for stream in data["streams"])
+        except (TranscodeError, FileNotFoundError, ValueError, KeyError,
+                TypeError, AttributeError) as e:
+            logger.warning("could not probe {} for attachments ({}); carrying "
+                           "only what the remux copies", Path(source).name, e)
+            return False
+
     def _mux_lead(self, audio_subs: Optional[Path]) -> float:
         """Seconds to delay the video track by in the final mux.
 
@@ -4934,19 +5543,43 @@ class ShotEncoder:
         return self._lead_of(self.info.path if self.info.path else self.source)
 
     def _mkvmerge_mux(self, mkvmerge: str, video_only: Path,
-                      audio_subs: Optional[Path]) -> bool:
-        """Final mux with mkvmerge. Returns True on a valid output file."""
+                      audio_subs: Optional[Path],
+                      attachments_from: Optional[str] = None) -> bool:
+        """Final mux with mkvmerge. Returns True on a valid output file.
+
+        `attachments_from` is a source to take every attachment from, and
+        nothing else: its tracks, chapters and tags are audio_subs.mkv's
+        already. audio_subs.mkv's own attachments are then left out. They are
+        ffmpeg's copies of the same files, and mkvmerge keeps the first of two
+        with the same name, description and size from different files
+        (add_attachment) - measured, the source's UIDs were lost without
+        --no-attachments. The source also offers mkvmerge its segment title,
+        which the first input to have one sets (maybe_set_segment_title). With
+        audio_subs.mkv that is the title it already carries. Without it, a
+        video-only source would add its title (e.g. "DV.HDR10.PLUS") to an
+        output that never had one. An explicit empty --title prevents that:
+        measured with v82, the output has no title and keeps the attachments
+        and their UIDs.
+        """
         try:
             if self.output.exists():
                 self.output.unlink()
             inputs: List[str] = []
+            if audio_subs is None and attachments_from is not None:
+                inputs += ["--title", ""]
             lead_ms = int(round(self._mux_lead(audio_subs) * 1000))
             if lead_ms > 0:
                 # --sync applies to the track of the input that FOLLOWS it
                 inputs += ["--sync", f"0:{lead_ms}"]
             inputs.append(str(video_only))
             if audio_subs is not None:
+                if attachments_from is not None:
+                    inputs.append("--no-attachments")
                 inputs.append(str(audio_subs))
+            if attachments_from is not None:
+                inputs += ["--no-video", "--no-audio", "--no-subtitles",
+                           "--no-buttons", "--no-track-tags", "--no-chapters",
+                           "--no-global-tags", attachments_from]
             proc = subprocess.run(
                 [mkvmerge, "-o", str(self.output), *inputs],
                 capture_output=True, text=True, timeout=1800,

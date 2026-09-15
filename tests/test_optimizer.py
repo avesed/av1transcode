@@ -1,5 +1,6 @@
 import json
 import math
+import random
 import shutil
 import sys
 import threading
@@ -207,7 +208,25 @@ def test_parse_score_aggregate_fallback(tmp_path):
 def test_parse_score_missing_raises(tmp_path):
     p = tmp_path / "s.json"
     p.write_text(json.dumps({"frames": []}))
-    with pytest.raises(Exception):
+    with pytest.raises(opt.TranscodeError):
+        opt.parse_score(p, "vmaf")
+
+
+@pytest.mark.parametrize("content", [
+    None, "", '{"pooled_metrics": {"vmaf": {"mea', "[]",
+    '{"pooled_metrics": {"vmaf": "x"}}', '{"pooled_metrics": {"vmaf": {"mean": "high"}}}',
+    '{"pooled_metrics": {"vmaf": {"mean": NaN}}}'])
+def test_parse_score_unusable_log_is_a_transcode_error(tmp_path, content):
+    """libvmaf writes its log at uninit and only when it scored a frame, so a
+    run can exit 0 with no log, and a killed or rebuilt one with half of one.
+    That is a failed scoring like any other: it has to reach the fallbacks
+    (SYCL to CPU, zero-copy to the usual read, verification skipping the
+    shot) as a TranscodeError, not escape as a JSONDecodeError and fail the
+    job."""
+    p = tmp_path / "s.json"
+    if content is not None:
+        p.write_text(content)
+    with pytest.raises(opt.TranscodeError):
         opt.parse_score(p, "vmaf")
 
 
@@ -564,7 +583,7 @@ def test_smooth_chosen_respects_min_crf(settings, info, plan, tmp_path):
 
 
 # ---- probe command construction ----
-def _capture_probe(enc, tmp_path):
+def _capture_probe(enc, tmp_path, shot=(0, 90)):
     """Run one probe with a fake ffmpeg, returning the two commands issued."""
     cmds = []
 
@@ -589,7 +608,7 @@ def _capture_probe(enc, tmp_path):
         return ""
 
     enc._run = fake_run.__get__(enc)
-    enc._probe_shot(0, 0, 90, [28], lp=4)
+    enc._probe_shot(0, *shot, [28], lp=4)
     return cmds
 
 
@@ -601,15 +620,19 @@ def test_probe_encode_matches_final_encode_config(settings, info, plan, tmp_path
     enc = make_encoder(settings, info, plan, tmp_path)
     encode_cmd = _capture_probe(enc, tmp_path)[0]
 
-    # no probe downscale: the only filters are the timestamp regeneration
-    assert encode_cmd[encode_cmd.index("-vf") + 1] == "settb=AVTB,setpts=PTS-STARTPTS"
+    # no probe downscale: the only filters are the timestamp rebase, which is
+    # 0 for shot 0 of a file with no lead (see test_encoder_reads_rebase_by_...)
+    assert encode_cmd[encode_cmd.index("-vf") + 1] == "settb=AVTB,setpts=PTS-0"
     assert encode_cmd[encode_cmd.index("-pix_fmt") + 1] == "yuv420p10le"
     svt = encode_cmd[encode_cmd.index("-svtav1-params") + 1]
     assert "tune=0" in svt and "lp=4" in svt
     assert encode_cmd[encode_cmd.index("-g") + 1] == "240"
     # exactly the probe window of the source, read once (no y4m intermediate)
     assert encode_cmd.count("-i") == 1
-    assert encode_cmd[encode_cmd.index("-i") - 1] == "3.000000"  # 90 frames @ 30fps
+    # bounded by its frame count on the output, not by a -t on the input
+    assert "-t" not in encode_cmd
+    assert encode_cmd[encode_cmd.index("-frames:v") + 1] == "90"
+    assert encode_cmd.index("-i") < encode_cmd.index("-frames:v") < encode_cmd.index("-c:v")
 
 
 def test_encoder_reads_emit_exactly_one_frame_per_decoded_frame(settings, info, plan, tmp_path):
@@ -623,9 +646,11 @@ def test_encoder_reads_emit_exactly_one_frame_per_decoded_frame(settings, info, 
     enc = make_encoder(settings, info, plan, tmp_path)               # 30fps
     probe_cmd = _capture_probe(enc, tmp_path)[0]
     final_cmd = _encode_cmd(make_encoder(settings, info, plan, tmp_path), 30.0)
-    for cmd in (probe_cmd, final_cmd):
+    # the probe rebases by a constant (0 for shot 0), the final encode - a
+    # software read nothing rebuilds - by its first frame
+    for cmd, rebase in ((probe_cmd, "setpts=PTS-0"), (final_cmd, "setpts=PTS-STARTPTS")):
         assert cmd[cmd.index("-fps_mode") + 1] == "passthrough"
-        assert cmd[cmd.index("-vf") + 1].endswith("settb=AVTB,setpts=PTS-STARTPTS")
+        assert cmd[cmd.index("-vf") + 1].endswith(f"settb=AVTB,{rebase}")
         # an output option: after the input, before the encoder
         assert cmd.index("-i") < cmd.index("-fps_mode") < cmd.index("-c:v")
 
@@ -637,7 +662,7 @@ def test_probe_regeneration_follows_the_subsampling(settings, info, plan, tmp_pa
     enc = make_encoder(settings, info, plan, tmp_path)
     vf = _capture_probe(enc, tmp_path)[0]
     vf = vf[vf.index("-vf") + 1]
-    assert vf.index("fps=15") < vf.index("setpts=PTS-STARTPTS")
+    assert vf.index("fps=15") < vf.index("setpts=PTS-0")
 
 
 def test_staged_window_is_frame_exact_too(settings, info, plan, tmp_path):
@@ -661,9 +686,9 @@ def test_staged_window_is_frame_exact_too(settings, info, plan, tmp_path):
 
 
 def _source_read(cmd, source):
-    """The `-ss X -t D -i <source>` slice of a probe command."""
+    """The `-ss X [-t D] -i <source>` slice of a probe command."""
     i = next(k for k, a in enumerate(cmd) if a == str(source))
-    return cmd[max(0, i - 5):i + 1]
+    return cmd[max(k for k in range(i) if cmd[k] == "-ss"):i + 1]
 
 
 def test_probe_read_caps_decoder_threads_at_the_admitted_lp(settings, info, plan, tmp_path):
@@ -717,9 +742,12 @@ def test_probe_encode_and_reference_read_the_same_frames(
     """
     enc = make_encoder(settings, info, plan, tmp_path)
     encode_cmd, vmaf_cmd = _capture_probe(enc, tmp_path)[:2]
-    assert _source_read(encode_cmd, enc.source) == _source_read(vmaf_cmd, enc.source)
-    # and it is a real read, not two empty slices comparing equal
-    assert "-ss" in _source_read(encode_cmd, enc.source)
+    # the same seek; where the window ends is all that differs - the encode
+    # counts frames on its output, the score's reference read keeps its -t
+    seek = ["-ss", enc._seek(0)]
+    assert _source_read(encode_cmd, enc.source) == [*seek, "-i", str(enc.source)]
+    assert _source_read(vmaf_cmd, enc.source) == [
+        *seek, "-t", f"{enc._span(0, 90):.6f}", "-i", str(enc.source)]
 
 
 def test_probe_scores_distorted_against_reference(settings, info, plan, tmp_path):
@@ -772,6 +800,193 @@ def test_probe_rebase_follows_the_probe_side_filters(settings, info, plan, tmp_p
     ref = vmaf_cmd[vmaf_cmd.index("-lavfi") + 1].split(";")[1]
     assert "fps=" in ref
     assert ref.index("fps=") < ref.index("setpts=PTS-STARTPTS")
+
+
+@pytest.mark.parametrize("lead", [0.0, 1.955])
+@pytest.mark.parametrize("rate", [1, 2])
+def test_encoder_reads_rebase_by_a_constant_and_count_their_frames(
+        settings, info, plan, tmp_path, monkeypatch, rate, lead):
+    """With -hwaccel vaapi an in-band parameter change rebuilds the filter
+    graph mid-read, and every filter in it starts over: STARTPTS rebased to 0
+    again and the input -t counted its duration again. Measured, a card probe
+    failed with AVERROR_BUG or wrote 77 frames for a 64-frame window. So an
+    encoder read subtracts a constant known before it starts, and stops on a
+    frame count the muxer keeps.
+
+    Mid-file, because at shot 0 of a file with no lead the constant is 0 and
+    a missing one would pass: half a frame at probing_rate 1 whatever the
+    lead, 0 after fps=, and all three encoder reads of the window agreeing.
+    The scores are not encoder reads and keep what they had: framesync
+    leaves the distorted frame 0 unpaired against a reference that starts a
+    microsecond after it."""
+    settings.transcode.optimizer.probing_rate = rate
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
+    enc = _zc_encoder(settings, info, plan, tmp_path)          # 30fps
+    enc._lead_of = lambda path: lead
+    enc._zc_ok = False                   # the SVT probe is scored the usual way
+    ran = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "-lavfi" not in args:
+            Path(args[-1]).write_bytes(b"ivf")
+            return ""
+        _write_score(args, 90.0)
+        return _ZC_LOG if "libvmaf_sycl=" in args[args.index("-lavfi") + 1] else ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    w0, w1 = 600, 721                    # odd: probing_rate 2 is 61 frames, not 121 // 2
+    enc._probe_encode_and_score(0, w0, w1, 28, 4, None)
+    enc._qsv_probe_encode(w0, w1, 22, tmp_path / "card.ivf")
+    assert enc._zc_preflight_window(0, w0, w1) is True
+    encodes = [c for c in ran if "-lavfi" not in c]
+    scores = [c for c in ran if "-lavfi" in c]
+    assert len(encodes) == 3 and len(scores) == 3
+
+    rebase = {"setpts=PTS-16666", "setpts=PTS-16667"} if rate == 1 else {"setpts=PTS-0"}
+    frames = {1: "121", 2: "61"}[rate]
+    for cmd in encodes:
+        vf = cmd[cmd.index("-vf") + 1].split(",")
+        assert vf[-2] == "settb=AVTB" and vf[-1] in rebase, vf
+        assert [f for f in vf if f.startswith("fps=")] == (["fps=15"] if rate > 1 else [])
+        assert cmd[cmd.index("-frames:v") + 1] == frames
+        assert cmd.index("-i") < cmd.index("-frames:v") < cmd.index("-c:v")
+        assert _source_read(cmd, enc.source) == ["-ss", enc._seek(w0), "-i", str(enc.source)]
+        assert not any("STARTPTS" in a for a in cmd)
+    assert len({c[c.index("-vf") + 1].split(",")[-1] for c in encodes}) == 1
+    # a shard is read without -ss and starts at 0 at every rate: half a frame
+    # subtracted there would put each frame exactly between two slots
+    vf, out = enc._window_encode(w0, w1, tmp_path / "shard.mkv")
+    assert vf == ["settb=AVTB", "setpts=PTS-0"] and out[-2:] == ["-frames:v", frames]
+    for cmd in scores:
+        dist, ref = cmd[cmd.index("-lavfi") + 1].split(";")[:2]
+        assert "setpts=PTS-STARTPTS" in dist and "setpts=PTS-STARTPTS" in ref
+        assert ("fps=15" in ref) == (rate > 1)
+        assert _source_read(cmd, enc.source) == [
+            "-ss", enc._seek(w0), "-t", f"{enc._span(w0, w1):.6f}", "-i", str(enc.source)]
+        assert "-frames:v" not in cmd
+
+
+def test_first_pts_is_where_the_seek_leaves_the_frame(settings, info, plan, tmp_path):
+    """What an encoder read subtracts instead of STARTPTS. After _seek's half
+    frame of lead it is half a frame - 16666.67us at 30fps, the seek string's
+    six decimals putting it either side - whatever the file's own lead and
+    wherever a hole moved the slot. Where the seek clamps at 0, the lead."""
+    enc = make_encoder(settings, info, plan, tmp_path)          # 30fps
+    for lead in (0.0, 1.955):
+        enc._lead_of = lambda path, lead=lead: lead
+        assert enc._first_pts_us(600) in (16666, 16667)
+    assert enc._first_pts_us(0) in (16666, 16667)              # 1.955 is past half a frame
+    enc._lead_of = lambda path: 0.010
+    assert enc._first_pts_us(0) == 10000
+    assert enc._first_pts_us(1) in (16666, 16667)
+    enc._lead_of = lambda path: 0.0
+    assert enc._first_pts_us(0) == 0
+    pts = [i / 30.0 for i in range(300)]
+    del pts[50]
+    enc._slots = enc._slots_from_pts(pts)
+    assert enc._slot(120) == 121 and enc._first_pts_us(120) in (16666, 16667)
+
+
+def test_read_frames_counts_what_the_subsampling_emits(settings, info, plan, tmp_path):
+    """fps= at probing_rate 2 emits one frame per period of its grid, and a
+    period holds the last frame that rounds onto it. So the count is not
+    (w1 - w0) // 2: on an odd window the last frame inside it still gets a
+    period of its own - the 127-frame card window of the measurement is 64
+    frames - and a hole is a period too."""
+    info.fps = 23.976024
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    assert enc._read_frames(236, 363, 2) == 64 and (363 - 236) // 2 == 63
+    assert enc._read_frames(600, 720, 2) == 60
+    assert enc._read_frames(600, 720, 1) == 120
+    # where the seek clamps at 0 frame 0 sits on the grid, and an odd window
+    # gives up its last period rather than share it with the next shot
+    assert enc._read_frames(0, 91, 2) == 45
+    enc._lead_of = lambda path: 0.010                          # a quarter frame in
+    assert enc._read_frames(0, 91, 2) == 46
+    # never nothing, however short the window
+    assert enc._read_frames(300, 301, 2) == 1 and enc._read_frames(0, 1, 3) == 1
+    pts = [i / 23.976024 for i in range(1000)]
+    del pts[650]
+    enc._slots = enc._slots_from_pts(pts)
+    assert enc._read_frames(600, 720, 2) == 61                 # 121 periods
+    assert enc._read_frames(600, 720, 1) == 120                # the encoder keeps the hole
+
+
+def _fps_periods(pts, period, n):
+    """The frame (index into pts) each of fps='s first n periods holds: the
+    last one whose timestamp rounds onto it."""
+    rounded = [math.floor(p / period + 0.5) for p in pts]
+    held, k = [], 0
+    for j in range(n):
+        while k + 1 < len(rounded) and rounded[k + 1] <= j:
+            k += 1
+        held.append(k)
+    return held
+
+
+def test_read_frames_never_reaches_the_next_shot(settings, info, plan, tmp_path):
+    """_read_frames against a model of the read: Matroska's whole
+    milliseconds, the demuxer subtracting the seek, trim dropping what lands
+    before 0, and fps= rounding each frame to its nearest period. Across
+    rates, leads, holes and windows, the last period counted never holds
+    frame w1 or later - but for the floor of one frame on the shortest
+    windows - and one inside the window is left out only where frame w1 lands
+    on a rounding tie, which the margin keeps clear of."""
+    rng = random.Random(7)
+    for fps in (23.976024, 25.0, 29.97003, 59.94006, 119.88012):
+        info.fps = fps
+        enc = make_encoder(settings, info, plan, tmp_path)
+        for holes in (0, 12):
+            pts = [i / fps for i in range(6000)]
+            for h in sorted(rng.sample(range(1, 5999), holes), reverse=True):
+                del pts[h]
+            enc._slots = enc._slots_from_pts(pts) if holes else []
+            for lead in (0.0, 0.004, 0.010, 0.066, 1.955):
+                enc._lead_of = lambda path, lead=lead: lead
+                for _ in range(30):
+                    rate = rng.choice((2, 3))
+                    w0 = rng.choice((0, rng.randrange(1, 5000)))
+                    w1 = w0 + rng.randrange(1, 300)
+                    ss_ms = round(float(enc._seek(w0)) * 1000)
+                    read = [round(1000 * (lead + enc._slot(i) / fps)) - ss_ms
+                            for i in range(max(0, w0 - 1), w1 + 2 * rate + 2)]
+                    if w0:
+                        assert read.pop(0) < 0             # the frame before w0 is dropped
+                    assert read[0] >= 0
+                    n = enc._read_frames(w0, w1, rate)
+                    held = _fps_periods(read, 1000 * rate / fps, n + 3)
+                    inside = next(j for j, k in enumerate(held) if k >= w1 - w0)
+                    x = (enc._slot(w1) - enc._slot(w0)
+                         + enc._first_pts_us(w0) * 1e-6 * fps) / rate
+                    case = (fps, holes, lead, rate, w0, w1, n, inside)
+                    if x - 0.55 <= 0:
+                        assert n == 1, case                # the floor
+                        continue
+                    assert held[n - 1] < w1 - w0, case
+                    assert n == inside or (n == inside - 1 and abs(x % 1 - 0.5) < 0.1), case
+
+
+def test_probe_side_fps_is_spelled_once(settings, info, plan, tmp_path, monkeypatch):
+    """The card probe wrote fps= to six decimals where its score's reference
+    read wrote %g - 11.988012 against 11.988 at 23.976fps - and at the
+    rounding ties near the start of a file those two rates put a frame on
+    different periods: modelled offline, 20 of 3960 windows encoded other
+    frames than they were scored against."""
+    settings.transcode.optimizer.probing_rate = 2
+    info.fps = 23.976024
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    ran = []
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: (ran.append(args), "")[1])
+    enc._qsv_probe_encode(0, 91, 22, tmp_path / "p.ivf")
+    card = ran[0][ran[0].index("-vf") + 1].split(",")
+    _, ref_vf = enc._probe_input(0, 91)
+    assert ([f for f in card if f.startswith("fps=")]
+            == [f for f in ref_vf if f.startswith("fps=")] == ["fps=11.988"])
 
 
 def test_metric_runs_output_nothing_but_the_scored_video(settings, info, plan, tmp_path):
@@ -1189,6 +1404,45 @@ def test_p5_shard_holds_the_window_not_twice_it(settings, info, plan, tmp_path):
     assert chain[0] == f"trim=end_frame={w1 - w0}"
     fps = next(i for i, f in enumerate(chain) if f.startswith("fps="))
     assert 0 < fps
+    # the probe encode reading the shard stops where the live read would
+    encode = [c for c in cmds if "libsvtav1" in c][0]
+    assert encode[encode.index("-frames:v") + 1] == str(enc._read_frames(w0, w1, 2)) == "45"
+    assert encode[encode.index("-vf") + 1] == "settb=AVTB,setpts=PTS-0"
+
+
+def test_a_shard_probe_encode_subtracts_nothing_mid_file(settings, info, plan, tmp_path):
+    """A shard is read without -ss, so its frames sit exactly on k/fps from 0
+    and the probe encode reading it subtracts nothing - at probing_rate 1 as
+    well, where a live read of the same window subtracts half a frame. Half a
+    frame taken off a shard puts every frame exactly between two slots, and
+    passthrough's rounding then lands neighbours on one. Mid-file and through
+    the call site: at shot 0 both constants are 0 and a lost shard passes."""
+    settings.transcode.optimizer.probing_rate = 1
+    cache = tmp_path / "shm"
+    cache.mkdir()
+    enc = _p5_encoder(settings, info, plan, tmp_path, cache)
+    enc._lead_of = lambda path: 0.0
+    cmds = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        if "ffv1" in args:
+            Path(args[-1]).write_bytes(b"shard")
+        elif any("libvmaf=" in a for a in args):
+            _write_score(args, 92.0)
+        elif "-f" in args and args[args.index("-f") + 1] == "ivf":
+            Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc._probe_shot(0, 600, 720, [32], lp=4)
+    w0, w1 = enc._probe_window(600, 720)
+    assert w0 > 0 and enc._first_pts_us(w0) != 0         # what a live read subtracts
+    encode = [c for c in cmds if "libsvtav1" in c][0]
+    assert str(enc.source) not in encode
+    assert encode[encode.index("-vf") + 1] == "settb=AVTB,setpts=PTS-0"
+    assert encode[encode.index("-frames:v") + 1] == str(w1 - w0) == "120"
 
 
 def test_p5_shard_falls_back_to_workdir_when_cache_is_small(settings, info, plan, tmp_path,
@@ -2174,6 +2428,29 @@ def test_verify_never_fails_the_job(settings, info, plan, tmp_path, monkeypatch)
     assert "no shot could be verified" in "\n".join(logs)
 
 
+def test_verification_survives_an_unparseable_log(settings, info, plan, tmp_path, monkeypatch):
+    """A libvmaf log cut short used to leave verify_delivered as a
+    JSONDecodeError and fail a job whose encode and mux had already finished.
+    SYCL is off, so no CPU retry absorbs the bad log before it gets there."""
+    settings.transcode.optimizer.verify_shots = 2
+    settings.transcode.optimizer.vmaf_sycl_device = -1
+    settings.transcode.optimizer.reference_hwaccel = "off"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    logs = _capture_logs(monkeypatch)
+
+    def truncated(self, args, timeout=None):
+        args = [str(a) for a in args]
+        lavfi = args[args.index("-lavfi") + 1]
+        Path(lavfi.split("log_path=")[1].split(":")[0]).write_text('{"pooled')
+        return ""
+
+    enc._run = truncated.__get__(enc)
+    enc.verify_delivered([(0, 90), (90, 180)], {0: 30.0, 1: 30.0}, {})
+    text = "\n".join(logs)
+    assert "could not verify shot" in text and "no shot could be verified" in text
+
+
 def test_verify_is_off_when_disabled(settings, info, plan, tmp_path):
     settings.transcode.optimizer.verify_shots = 0
     enc = make_encoder(settings, info, plan, tmp_path)
@@ -2649,6 +2926,158 @@ def test_subtitle_codecs_survive_trailing_csv_fields_too(settings, info, plan, t
     assert enc._subtitle_codec_args("x.mp4") == ["-c:s:0", "srt", "-c:s:1", "copy"]
 
 
+# ---- stream dispositions through the audio/subtitle remux and the final mux ----
+def _probe_json(*streams):
+    """ffprobe -of json for (codec_type, set flags) streams, every known flag
+    printed as 0 or 1 the way ffprobe prints them."""
+    return json.dumps({"streams": [
+        {"index": i, "codec_type": kind,
+         "disposition": {n: int(n in flags) for n in opt.ShotEncoder._DISPOSITIONS}}
+        for i, (kind, flags) in enumerate(streams)]}, indent=4)
+
+
+def _mux_with(enc, monkeypatch, probe, fail=lambda args: False):
+    """concat_shots down the ffmpeg fallback mux, with `probe` as what the
+    disposition probe prints (raised instead when it is an exception) and
+    `fail` picking the commands that fail. Returns every command run."""
+    monkeypatch.setattr(opt.shutil, "which",
+                        lambda n, *a, **k: None if "mkvmerge" in n else f"/usr/bin/{n}")
+    enc._lead_of = lambda path: 0.0
+    ran = []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "ffprobe" in args[0]:
+            if "stream=codec_type" in args:
+                return "video\naudio\nsubtitle\n"
+            if "stream=index,codec_type:stream_disposition" in args:
+                if isinstance(probe, Exception):
+                    raise probe
+                return probe
+            return "hdmv_pgs_subtitle\nhdmv_pgs_subtitle\n"      # subtitle codecs
+        if fail(args):
+            raise opt.TranscodeError("mux failed")
+        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        return ""
+
+    enc._run = fake_run.__get__(enc)
+    enc.concat_shots([enc.tempdir / "enc_00000.ivf"])
+    return ran
+
+
+def _dispositions(cmd):
+    """The -disposition pairs of `cmd`, each checked to sit where ffmpeg takes
+    it as an output option: after the last input, before the output path.
+    Ahead of an -i, ffmpeg rejects it as an input option and the mux fails."""
+    last_url = max(i for i, a in enumerate(cmd) if a == "-i") + 1
+    pairs = []
+    for i, a in enumerate(cmd):
+        if a.startswith("-disposition"):
+            assert last_url < i and i + 1 < len(cmd) - 1, (a, cmd)
+            pairs.append((a, cmd[i + 1]))
+    return pairs
+
+
+def _remuxes(ran):
+    return [a for a in ran if a[-1].endswith("audio_subs.mkv")]
+
+
+def test_remux_states_every_disposition_so_no_subtitle_is_made_default(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Stranger Things S04E07: two PGS tracks, neither default. Left to infer,
+    fftools marked the first one default in audio_subs.mkv, mkvmerge kept it,
+    and Plex auto-selected the empty track - a burn-in transcode. 17 outputs."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", {"default"}), ("audio", {"default"}),
+        ("subtitle", set()), ("subtitle", set())))
+    remux, = _remuxes(ran)
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "0")]
+
+
+def test_remux_carries_each_streams_flags_exactly(settings, info, plan, tmp_path,
+                                                  monkeypatch):
+    """Output order is every audio stream and then every subtitle, each
+    counted within its own type, however the source interleaves them."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", {"default"}),
+        ("audio", {"default", "original"}),
+        ("subtitle", set()),
+        ("audio", {"comment", "visual_impaired"}),
+        ("subtitle", {"default", "forced"}),
+        ("subtitle", {"hearing_impaired"})))
+    remux, = _remuxes(ran)
+    assert _dispositions(remux) == [("-disposition:a:0", "default+original"),
+                                    ("-disposition:a:1", "comment+visual_impaired"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "default+forced"),
+                                    ("-disposition:s:2", "hearing_impaired")]
+
+
+def test_retries_and_the_ffmpeg_fallback_mux_carry_the_same_dispositions(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+
+    def fail(args):
+        if args[-1].endswith("audio_subs.mkv") and "-c:s:0" in args:
+            return True                  # per-stream codec remux: plain-copy retry
+        return args[-1] == str(enc.output) and "srt" not in args   # srt retry
+
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", {"default"}), ("audio", {"default"}),
+        ("subtitle", set()), ("subtitle", {"default", "forced"})), fail)
+    remux, retry = _remuxes(ran)
+    final, final_srt = [a for a in ran if a[-1] == str(enc.output)]
+    assert "-c:s:0" in remux and "-c:s:0" not in retry
+    assert "srt" in final_srt and "1:s?" in final
+    expected = [("-disposition:a:0", "default"), ("-disposition:s:0", "0"),
+                ("-disposition:s:1", "default+forced")]
+    for cmd in (remux, retry, final, final_srt):
+        assert _dispositions(cmd) == expected
+    # the one probe of the source serves all four
+    assert sum("stream=index,codec_type:stream_disposition" in a for a in ran) == 1
+    assert enc.output.exists()
+
+
+@pytest.mark.parametrize("probe", [
+    opt.TranscodeError("ffprobe exploded"),
+    "Invalid data found when processing input\n",
+    json.dumps({"streams": [{"index": 0, "codec_type": "subtitle"}]}),
+], ids=["ffprobe-failed", "no-json", "no-disposition-section"])
+def test_a_failed_disposition_probe_clears_subtitle_defaults_and_goes_on(
+        settings, info, plan, tmp_path, monkeypatch, probe):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+    ran = _mux_with(enc, monkeypatch, probe)
+    remux, = _remuxes(ran)
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    for cmd in (remux, final):
+        # only the default flag, and only on subtitles: the audio keeps what
+        # ffmpeg copies from the source
+        assert _dispositions(cmd) == [("-disposition:s", "-default")]
+    assert enc.output.exists()
+    assert any("stream dispositions" in str(w[0]) for w in warnings)
+
+
+def test_disposition_probe_reads_past_error_lines_and_drops_unknown_flags(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+    body = json.loads(_probe_json(("audio", {"default"}), ("subtitle", {"forced"})))
+    body["streams"][1]["disposition"]["from_a_newer_ffprobe"] = 1
+    out = "[matroska,webm @ 0x55d0c0] Read error\n" + json.dumps(body, indent=4)
+    enc._run = (lambda self, args, timeout=None: out).__get__(enc)
+    assert enc._disposition_args("/x/src.mkv") == ["-disposition:a:0", "default",
+                                                    "-disposition:s:0", "forced"]
+    assert any("from_a_newer_ffprobe" in str(w) for w in warnings)
+
+
 def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,
                                             monkeypatch):
     enc = make_encoder(settings, info, plan, tmp_path)
@@ -2694,6 +3123,356 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
             "-i", "sine=frequency=440:duration=1", "-c:v", "libx264",
             "-c:a", "aac", str(noisy)], check=True)
     assert enc._has_audio_or_subs(str(noisy)) is True
+
+
+# ---- attachments (the fonts styled subtitles name) through the final mux ----
+_MKV, _MP4 = "matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2"
+_ATTACHMENT_PROBE = "format=format_name:stream=codec_type:stream_disposition=attached_pic"
+_SOURCE_ONLY = ["--no-video", "--no-audio", "--no-subtitles", "--no-buttons",
+                "--no-track-tags", "--no-chapters", "--no-global-tags"]
+
+
+def _maps(cmd):
+    return [cmd[i + 1] for i, a in enumerate(cmd) if a == "-map"]
+
+
+def _attachment_probe(format_name, *streams):
+    """ffprobe -of json for the attachment probe: (codec_type, attached_pic)
+    per stream, the way ffprobe prints them."""
+    return json.dumps({"programs": [], "streams": [
+        {"codec_type": kind, "disposition": {"attached_pic": pic}}
+        for kind, pic in streams], "format": {"format_name": format_name}}, indent=4)
+
+
+def _concat_via_mkvmerge(enc, monkeypatch, kinds, probe, rc=lambda cmd: 0):
+    """concat_shots down the mkvmerge mux, with `kinds` as what the stream
+    type probe prints and `probe` as what the attachment probe prints (raised
+    when an exception). `rc` gives each mkvmerge run its exit code. Returns
+    (the commands _run ran, the mkvmerge commands)."""
+    monkeypatch.setattr(opt.shutil, "which", lambda n, *a, **k: f"/usr/bin/{n}")
+    enc._lead_of = lambda path: 0.0
+    ran, merges = [], []
+
+    def fake_run(self, args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "ffprobe" in args[0]:
+            if "stream=codec_type" in args:
+                return kinds
+            if _ATTACHMENT_PROBE in args:
+                # the original file, as for the audio: a Dolby Vision job's
+                # enc.source is a stripped intermediate with no attachments
+                assert args[-1] == str(enc.info.path), args
+                if isinstance(probe, Exception):
+                    raise probe
+                return probe
+            return ""
+        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        return ""
+
+    def fake_mkvmerge(cmd, capture_output=False, text=False, timeout=None):
+        merges.append(cmd)
+        code = rc(cmd)
+        if code == 0:
+            enc.output.write_bytes(b"\x1aE\xdf\xa3")
+        return types.SimpleNamespace(returncode=code, stderr="Error: boom")
+
+    enc._run = fake_run.__get__(enc)
+    monkeypatch.setattr(opt.subprocess, "run", fake_mkvmerge)
+    enc.concat_shots([enc.tempdir / "enc_00000.ivf"])
+    return ran, merges
+
+
+def test_remux_and_the_ffmpeg_fallback_mux_carry_the_attachments(
+        settings, info, plan, tmp_path, monkeypatch):
+    """An ASS track names its fonts, and the source carries them as attachments;
+    dropped, a player substitutes its own and CJK can come out as boxes. Both
+    maps end in "?": most sources (every mp4) have none, and ffmpeg fails a
+    map that matches no stream ("To ignore this, add a trailing '?'")."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", {"default"}), ("audio", {"default"}),
+        ("subtitle", set()), ("subtitle", {"default", "forced"})))
+    remux, = _remuxes(ran)
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _maps(remux) == ["0:a?", "0:s?", "0:t?"]
+    assert remux[remux.index("-c:t") + 1] == "copy"
+    assert _maps(final) == ["0:v:0", "1:a?", "1:s?", "1:t?"]
+    # mapped last and counted as a type of their own, they move no flag
+    expected = [("-disposition:a:0", "default"), ("-disposition:s:0", "0"),
+                ("-disposition:s:1", "default+forced")]
+    assert _dispositions(remux) == expected
+    assert _dispositions(final) == expected
+
+
+def test_a_remux_that_fails_with_the_attachments_is_retried_without_them(
+        settings, info, plan, tmp_path, monkeypatch):
+    """matroskaenc refuses an attachment with no filename, or with no mimetype
+    it can deduce (measured: exit 234, "Attachment stream 1 has no mimetype
+    tag"). A font lost costs a styled subtitle; a remux lost, the encode."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", {"default"}), ("audio", {"default"}), ("subtitle", set())),
+        fail=lambda args: args[-1].endswith("audio_subs.mkv") and "0:t?" in args)
+    first, retry, bare = _remuxes(ran)
+    assert "0:t?" in first and "0:t?" in retry
+    assert _maps(bare) == ["0:a?", "0:s?"] and "-c:t" not in bare
+    assert _dispositions(bare) == [("-disposition:a:0", "default"),
+                                   ("-disposition:s:0", "0")]
+    assert enc.output.exists()
+    assert any("without the source's attachments" in str(w[0]) for w in warnings)
+
+
+def test_mkvmerge_takes_only_the_attachments_from_the_source(settings, info, plan,
+                                                             tmp_path, monkeypatch):
+    """The source's tracks, chapters and tags are audio_subs.mkv's already.
+    audio_subs.mkv's attachments must be left out: they are ffmpeg's copies,
+    with new UIDs and no images, and mkvmerge keeps a first copy over a second
+    of the same name, description and size - measured, the source's UIDs were
+    lost without --no-attachments."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.5
+    video_only = tmp_path / "video_only.mkv"
+    audio_subs = tmp_path / "audio_subs.mkv"
+    video_only.touch(); audio_subs.touch()
+    seen = []
+
+    def fake_run(cmd, capture_output=False, text=False, timeout=None):
+        seen.append(cmd)
+        enc.output.write_bytes(b"\x1aE\xdf\xa3")
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(opt.subprocess, "run", fake_run)
+    assert enc._mkvmerge_mux("mkvmerge", video_only, audio_subs, "/m/movie.mkv") is True
+    assert seen[-1] == ["mkvmerge", "-o", str(enc.output), "--sync", "0:500",
+                        str(video_only), "--no-attachments", str(audio_subs),
+                        *_SOURCE_ONLY, "/m/movie.mkv"]
+    # With no audio_subs.mkv, the source would be the first input with a segment
+    # title, and mkvmerge would put it on an output that never had one. An
+    # explicit empty title wins (measured, v82). With audio_subs.mkv the title is
+    # the one it already carries, and the command above leaves it alone.
+    assert enc._mkvmerge_mux("mkvmerge", video_only, None, "/m/movie.mkv") is True
+    assert seen[-1] == ["mkvmerge", "-o", str(enc.output), "--title", "",
+                        str(video_only), *_SOURCE_ONLY, "/m/movie.mkv"]
+    assert enc._mkvmerge_mux("mkvmerge", video_only, None) is True
+    assert seen[-1] == ["mkvmerge", "-o", str(enc.output), str(video_only)]
+
+
+@pytest.mark.parametrize("probe, takes", [
+    (_attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0),
+                       ("attachment", 0), ("attachment", 0)), True),
+    # matroskadec makes an image/jpeg attachment a video stream, attached_pic
+    (_attachment_probe(_MKV, ("video", 0), ("audio", 0), ("video", 1)), True),
+    (_attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)), False),
+    # an mp4's cover art is attached_pic too, and no attachment
+    (_attachment_probe(_MP4, ("video", 0), ("audio", 0), ("video", 1)), False),
+    ("[matroska,webm @ 0x55d0c0] Read error\n"
+     + _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("attachment", 0)), True),
+    ("Invalid data found when processing input\n", False),
+    (opt.TranscodeError("ffprobe exploded"), False),
+], ids=["fonts", "image", "none", "mp4-cover", "past-error-lines", "no-json",
+        "ffprobe-failed"])
+def test_mkvmerge_reads_the_original_source_only_for_its_attachments(
+        settings, info, plan, tmp_path, monkeypatch, probe, takes):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran, merges = _concat_via_mkvmerge(enc, monkeypatch, "video\naudio\nsubtitle\n", probe)
+    merge, = merges
+    audio_subs = str(enc.tempdir / "audio_subs.mkv")
+    # Dolby Vision encodes a stripped intermediate: attachments, like the
+    # audio, come from the original file
+    assert str(enc.source) != str(enc.info.path)
+    assert [a[-1] for a in ran if _ATTACHMENT_PROBE in a] == [str(enc.info.path)]
+    assert any(a[-1] == audio_subs and "0:t?" in a for a in ran)
+    if takes:
+        assert merge[1:] == ["-o", str(enc.output), str(enc.tempdir / "video_only.mkv"),
+                             "--no-attachments", audio_subs, *_SOURCE_ONLY,
+                             str(enc.info.path)]
+    else:
+        assert merge[1:] == ["-o", str(enc.output),
+                             str(enc.tempdir / "video_only.mkv"), audio_subs]
+
+
+def test_an_mkvmerge_that_cannot_read_the_source_muxes_again_without_it(
+        settings, info, plan, tmp_path, monkeypatch):
+    """mkvmerge exits 2 on a file it cannot parse ("The type of file could not
+    be recognized"). That must not cost the container rebuild Plex needs: the
+    fonts audio_subs.mkv carries still get through a second mkvmerge."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+    ran, merges = _concat_via_mkvmerge(
+        enc, monkeypatch, "video\naudio\n",
+        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("attachment", 0)),
+        rc=lambda cmd: 2 if str(enc.info.path) in cmd else 0)
+    first, second = merges
+    assert first[-1] == str(enc.info.path)
+    assert second[1:] == ["-o", str(enc.output), str(enc.tempdir / "video_only.mkv"),
+                          str(enc.tempdir / "audio_subs.mkv")]
+    assert not any(a[-1] == str(enc.output) for a in ran)     # no ffmpeg mux
+    assert any("attachment source" in str(w[0]) for w in warnings)
+
+
+def test_a_video_only_source_keeps_its_attachments_without_a_remux(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Attachments alone start no ffmpeg pass. mkvmerge takes every one from
+    the source itself, images and UIDs included, which the remux's copy could
+    not; that copy would serve only the ffmpeg fallback. So _has_audio_or_subs
+    stays about audio and subtitles - the guard against a remux with nothing
+    to write."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran, merges = _concat_via_mkvmerge(
+        enc, monkeypatch, "video\nattachment\nvideo\n",
+        _attachment_probe(_MKV, ("video", 0), ("attachment", 0), ("video", 1)))
+    assert not any("audio_subs.mkv" in " ".join(a) for a in ran)
+    merge, = merges
+    assert merge[1:] == ["-o", str(enc.output), "--title", "",
+                         str(enc.tempdir / "video_only.mkv"), *_SOURCE_ONLY,
+                         str(enc.info.path)]
+    enc._run = (lambda self, args, timeout=None: "video\nattachment\n").__get__(enc)
+    assert enc._has_audio_or_subs("x.mkv") is False
+
+
+_REAL_WHICH = shutil.which        # the settings fixture fakes it per test
+
+
+@pytest.mark.skipif(any(_REAL_WHICH(t) is None for t in ("ffmpeg", "ffprobe", "mkvmerge")),
+                    reason="needs a real ffmpeg, ffprobe and mkvmerge")
+@pytest.mark.parametrize("container", ["mkv", "mp4"])
+@pytest.mark.parametrize("muxer", ["mkvmerge", "ffmpeg"])
+def test_attachments_reach_the_final_file_against_real_tools(
+        settings, plan, tmp_path, monkeypatch, muxer, container):
+    """The whole final mux for real, not against a stubbed _run. No stub can
+    tell that a bare "0:t" fails an mp4's remux, that ffmpeg turns an image
+    attachment into a video stream, or which copy of a font mkvmerge keeps."""
+    import subprocess as sp
+    real = _REAL_WHICH
+    monkeypatch.setattr(shutil, "which", real if muxer == "mkvmerge" else
+                        (lambda n, *a, **k: None if "mkvmerge" in n else real(n, *a, **k)))
+    ffmpeg, mkvmerge = real("ffmpeg"), real("mkvmerge")
+
+    def ff(*args):
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, args)],
+               check=True, cwd=tmp_path)
+
+    def ident(path):
+        return json.loads(sp.run([mkvmerge, "-J", str(path)], check=True,
+                                 capture_output=True, text=True).stdout)
+
+    shot = tmp_path / "enc_00000.ivf"
+    try:
+        ff("-f", "lavfi", "-i", "testsrc=size=160x120:rate=5:duration=2",
+           "-c:v", "libsvtav1", "-preset", "12", shot)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with libsvtav1 to build the shot")
+    ff("-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac", "sound.mka")
+    if container == "mkv":
+        ass = ("[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n"
+               "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+               "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+               "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+               "MarginL, MarginR, MarginV, Encoding\n"
+               "Style: Default,Test Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+               "0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n[Events]\n"
+               "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+               "Effect, Text\nDialogue: 0,0:00:00.20,0:00:01.50,Default,,0,0,0,,hello\n")
+        (tmp_path / "a.ass").write_text(ass)
+        (tmp_path / "b.ass").write_text(ass)
+        (tmp_path / "font.ttf").write_bytes(bytes(range(256)) * 40)
+        ff("-f", "lavfi", "-i", "testsrc=size=64x64", "-frames:v", "1", "cover.jpg")
+        source = tmp_path / "movie.mkv"
+        sp.run([mkvmerge, "-q", "-o", str(source), str(shot), "sound.mka",
+                "--default-track-flag", "0:no", "a.ass",
+                "--default-track-flag", "0:no", "--forced-display-flag", "0:yes", "b.ass",
+                "--attachment-description", "Main font",
+                "--attachment-mime-type", "application/x-truetype-font",
+                "--attach-file", "font.ttf",
+                "--attachment-mime-type", "image/jpeg", "--attach-file", "cover.jpg"],
+               check=True, cwd=tmp_path)
+    else:
+        (tmp_path / "s.srt").write_text("1\n00:00:00,200 --> 00:00:01,500\nhello\n")
+        source = tmp_path / "movie.mp4"
+        ff("-i", shot, "-i", "sound.mka", "-i", "s.srt", "-map", "0", "-map", "1",
+           "-map", "2", "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text", source)
+    info = MediaInfo(path=source)
+    info.fps = 5.0
+    info.duration = 2.0
+    # encodes tmp_path/src.mkv, as a Dolby Vision job encodes its intermediate
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+    enc.concat_shots([shot])
+
+    def attachments(j, uid=True):
+        return [(a["file_name"], a["content_type"], a.get("description", ""), a["size"])
+                + ((a["properties"]["uid"],) if uid else ())
+                for a in j.get("attachments", [])]
+
+    def subtitles(j):
+        return [(t["properties"]["default_track"], t["properties"]["forced_track"])
+                for t in j["tracks"] if t["type"] == "subtitles"]
+
+    src, out = ident(source), ident(enc.output)
+    assert [t["type"] for t in out["tracks"]] == [t["type"] for t in src["tracks"]]
+    if container == "mp4":
+        assert attachments(out) == []
+    else:
+        assert subtitles(out) == [(False, False), (False, True)] == subtitles(src)
+        assert len(attachments(src)) == 2
+        if muxer == "mkvmerge":
+            # every one, the image and the UIDs included
+            assert attachments(out) == attachments(src)
+        else:
+            # ffmpeg's copy: the font keeps its name, type and description
+            assert attachments(out, uid=False) == attachments(src, uid=False)[:1]
+    assert not any("attachment" in str(w[0]) for w in warnings)
+
+
+@pytest.mark.skipif(any(_REAL_WHICH(t) is None for t in ("ffmpeg", "ffprobe", "mkvmerge")),
+                    reason="needs a real ffmpeg, ffprobe and mkvmerge")
+def test_a_video_only_source_lends_mkvmerge_its_attachments_not_its_title(
+        settings, plan, tmp_path, monkeypatch):
+    """With no audio_subs.mkv, the source is the only input with a segment title,
+    and mkvmerge takes the title from the first input that has one. Before
+    attachments were carried such an output had no title, and it must still
+    have none: a "DV.HDR10.PLUS" label is wrong on an AV1 file that may be
+    HDR10 only."""
+    import subprocess as sp
+    monkeypatch.setattr(shutil, "which", _REAL_WHICH)
+    ffmpeg, mkvmerge = _REAL_WHICH("ffmpeg"), _REAL_WHICH("mkvmerge")
+    shot = tmp_path / "enc_00000.ivf"
+    try:
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc=size=160x120:rate=5:duration=2", "-c:v", "libsvtav1",
+                "-preset", "12", str(shot)], check=True)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with libsvtav1 to build the shot")
+    font = tmp_path / "font.ttf"
+    font.write_bytes(bytes(range(256)) * 40)
+    source = tmp_path / "movie.mkv"
+    sp.run([mkvmerge, "-q", "-o", str(source), "--title", "Show.S01E01.DV.HDR10.PLUS",
+            str(shot), "--attachment-mime-type", "application/x-truetype-font",
+            "--attach-file", str(font)], check=True)
+    info = MediaInfo(path=source)
+    info.fps = 5.0
+    info.duration = 2.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc.concat_shots([shot])
+
+    def ident(path):
+        return json.loads(sp.run([mkvmerge, "-J", str(path)], check=True,
+                                 capture_output=True, text=True).stdout)
+
+    def attachments(j):
+        return [(a["file_name"], a["content_type"], a["properties"]["uid"])
+                for a in j.get("attachments", [])]
+
+    src, out = ident(source), ident(enc.output)
+    assert src["container"]["properties"].get("title") == "Show.S01E01.DV.HDR10.PLUS"
+    assert out["container"]["properties"].get("title") is None
+    assert [t["type"] for t in out["tracks"]] == ["video"]
+    assert attachments(out) == attachments(src) != []
 
 
 def test_scaled_size_derives_the_hw_scale_target(settings, info, plan, tmp_path):
@@ -3071,7 +3850,7 @@ def _one_render_node(monkeypatch, settings):
 def _capture_scores(enc, monkeypatch):
     calls = []
 
-    def fake(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None):
+    def fake(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None, window=None):
         calls.append((list(dist_args), list(ref_args), list(ref_vf)))
         return 90.0
 
@@ -3139,7 +3918,7 @@ def test_reference_read_falls_back_per_window_when_the_gpu_read_fails(
 
     calls_by_ss = []
 
-    def flaky(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None):
+    def flaky(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None, window=None):
         hw = "-hwaccel" in ref_args
         if hw and mode["fail"] == "sync":
             raise opt.TranscodeError("ffmpeg failed (rc=251):\n[hwdownload] Failed to download frame: -5.")
@@ -3150,7 +3929,8 @@ def test_reference_read_falls_back_per_window_when_the_gpu_read_fails(
             calls_by_ss.append(1)
             if len(calls_by_ss) % 2 == 1:
                 raise opt.TranscodeError("ffmpeg failed (rc=251):\n[hwdownload] Failed to download frame: -5.")
-        return real(dist_args, ref_args, ref_vf, idx, crf, threads=threads, frames=frames)
+        return real(dist_args, ref_args, ref_vf, idx, crf, threads=threads, frames=frames,
+                    window=window)
 
     monkeypatch.setattr(enc, "_score_vmaf", flaky)
     assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 90.0
@@ -3285,7 +4065,7 @@ def test_sycl_device_error_scores_on_the_cpu_instead_of_killing_the_job(
     monkeypatch.setattr(opt.logger, "warning", lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
     backends = []
 
-    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout):
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout, window=None):
         backends.append(sycl)
         if sycl >= 0:
             raise opt.TranscodeError(
@@ -3430,7 +4210,8 @@ def test_zero_copy_failure_rescores_the_window_the_usual_way(
     attempts = []
     mode = {"fail": True}
 
-    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout, zero_copy=False):
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout, zero_copy=False,
+           window=None):
         attempts.append(zero_copy)
         if zero_copy and mode["fail"]:
             raise opt.TranscodeError("ffmpeg failed (rc=-11):\nSegmentation fault")
@@ -3510,6 +4291,501 @@ def test_zero_copy_preflight_decides_once_per_job(
     assert not list(enc.probe_dir.glob("zc_preflight*"))
 
 
+# ---------------------------------------------------------------- graph rebuilds
+# With -hwaccel vaapi an in-band SPS/PPS change gives the decoder a new frames
+# context, and fftools rebuilds the whole filter graph for that alone. Every
+# stateful filter restarts: measured, a card probe wrote 77 frames for a
+# 64-frame window, and a zero-copy score kept 59 of 84.
+
+_REBUILT_LINE = "[vf#0:0 @ 0x55d0c0a1b2c0] Reconfiguring filter graph because hwaccel changed\n"
+
+
+def _ended(ending, output):
+    """What _run does with `output` when ffmpeg exits 0, fails or stalls."""
+    if ending == "exit 0":
+        return output
+    err = (opt.TranscodeError("ffmpeg failed (rc=234):\n" + output[-2000:])
+           if ending == "failed" else opt.CommandTimeout("command timed out after 180s: ffmpeg"))
+    err.output = output
+    raise err
+
+
+@pytest.mark.parametrize("text, reason", [
+    (_REBUILT_LINE, "hwaccel changed"),
+    ("[fc#0 @ 0x55d0c0a1b2c0] [info] Reconfiguring filter graph because hwaccel changed\n",
+     "hwaccel changed"),
+    ("frame=   12 fps=0.0 q=-0.0 size=N/A time=00:00:00.50 bitrate=N/A speed=1x    \r"
+     + _REBUILT_LINE, "hwaccel changed"),
+    # log.c keeps one print_prefix for the whole process: after another
+    # thread's unterminated message the line comes out bare, or glued on
+    ("Reconfiguring filter graph because hwaccel changed\n", "hwaccel changed"),
+    ("[hevc @ 0x1] Invalid value 7 for log2_min_cb_sizeReconfiguring filter graph "
+     "because hwaccel changed\n", "hwaccel changed"),
+    ("[vf#0:0 @ 0x5] Reconfiguring filter graph because video parameters changed to "
+     "vaapi(tv, bt2020nc), 1920x1080, straight alpha, hwaccel changed\n",
+     "video parameters changed to vaapi(tv, bt2020nc), 1920x1080, straight alpha, "
+     "hwaccel changed"),
+    ("[vf#0:0 @ 0xabc] Reconfiguring filter graph\n", "unspecified"),
+    # a stream title in the input dump is the file talking, not ffmpeg
+    ("Input #0, matroska,webm, from 'x.mkv':\n  Metadata:\n"
+     "    title           : Reconfiguring filter graph because hwaccel changed\n", None),
+    ("    title           : Reconfiguring filter graph\n" + _REBUILT_LINE, "hwaccel changed"),
+    ("[out#0/null @ 0x1] video:0KiB audio:0KiB subtitle:0KiB\n", None),
+    ("", None),
+    (None, None),
+])
+def test_graph_rebuilt_reads_ffmpegs_own_line(text, reason):
+    assert opt.graph_rebuilt(text) == reason
+
+
+def test_run_keeps_the_whole_output_when_a_command_fails(settings, info, plan, tmp_path):
+    """The failure message carries the last 2000 characters, and a rebuild
+    logged before a long error tail falls outside them. A real subprocess."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    line = _REBUILT_LINE.strip()
+    with pytest.raises(opt.TranscodeError) as e:
+        enc._run([sys.executable, "-c",
+                  f"import sys; print({line!r}); print('x' * 5000); sys.exit(1)"])
+    assert line not in str(e.value) and line in e.value.output
+
+
+def test_run_keeps_what_a_timed_out_command_printed(settings, info, plan, tmp_path):
+    """A rebuild that stalls a score has to read as a rebuild, not as the
+    card failing to finish in time."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    line = _REBUILT_LINE.strip()
+    with pytest.raises(opt.CommandTimeout) as e:
+        enc._run([sys.executable, "-c",
+                  f"import time; print({line!r}, flush=True); time.sleep(30)"], timeout=1)
+    assert line in e.value.output
+
+
+@pytest.mark.parametrize("ending", ["exit 0", "failed", "timed out"])
+def test_zero_copy_rebuild_rereads_the_window_without_touching_any_streak(
+        settings, info, plan, tmp_path, monkeypatch, ending):
+    """A zero-copy score across a parameter change is the source, not the
+    card: the window is scored again the usual way and remembered, and no
+    failure streak moves - zero-copy's, the SYCL device's or the hardware
+    read's - whether ffmpeg exited 0, crashed on the restart or stalled."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    enc._zc_ok = True
+    enc._zc_streak, enc._sycl_timeouts, enc._hwdec_streak = 3, 2, 5
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    cmds, at_reread = [], []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        if "libvmaf_sycl=" in args[args.index("-lavfi") + 1]:
+            _write_score(args, 100.0)               # the restarted instance's segment
+            return _ended(ending, _ZC_LOG + _REBUILT_LINE + "x" * 3000)
+        # the moment the usual read starts, nothing has been counted
+        at_reread.append((enc._zc_streak, enc._zc_fallbacks, enc._sycl_timeouts,
+                          enc._hwdec_streak))
+        _write_score(args, 88.0)
+        return ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 88.0
+    assert at_reread == [(3, 0, 2, 5)]
+    # afterwards only the usual read's own success has spoken, and it clears
+    # the SYCL stall streak as any good score does
+    assert (enc._zc_streak, enc._zc_fallbacks, enc._sycl_timeouts, enc._hwdec_streak) == (3, 0, 0, 5)
+    assert enc._zc_ok is True and enc._sycl_ok is True and enc._zc_scored == 0
+    assert (600, 720) in enc._zc_bad and (600, 720) in enc._hwdec_bad
+    assert len(warnings) == 1 and "[600, 720)" in warnings[0] and "hwaccel changed" in warnings[0]
+    zc, usual = cmds
+    assert zc[zc.index("-loglevel") + 1] == "info" and "-nostats" in zc
+    assert "-hwaccel" not in usual
+    # the window's other probes go straight to the usual read, quietly
+    cmds.clear()
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 34) == 88.0
+    assert len(cmds) == 1 and "libvmaf_sycl=" not in cmds[0][cmds[0].index("-lavfi") + 1]
+    assert len(warnings) == 1
+    assert "1 window(s) read in software after a graph rebuild" in enc._zc_summary()
+
+
+def test_a_cancelled_job_is_not_rescored_after_a_rebuild(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    enc._zc_ok = True
+    enc.cancel_flag = lambda: True
+    attempts = []
+
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout, zero_copy=False,
+           window=None):
+        attempts.append(zero_copy)
+        raise opt.GraphRebuilt("hwaccel changed", window, "zero-copy score")
+
+    monkeypatch.setattr(enc, "_score_vmaf_on", on)
+    with pytest.raises(opt.TranscodeError):
+        enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30)
+    assert attempts == [True] and not enc._rebuilt
+    # a command the cancel killed is the cancel, whatever it logged first
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: _ended(
+        "failed", _REBUILT_LINE + "[out#0/null @ 0x1] Terminating thread\n"))
+    with pytest.raises(opt.TranscodeError) as e:
+        enc._run_read(["ffmpeg", *_VAAPI, "-i", "src.mkv"], 60, "reference read", (600, 720))
+    assert not isinstance(e.value, opt.GraphRebuilt)
+
+
+def test_reference_read_rebuild_goes_to_software_without_counting(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A VA-API reference read across a parameter change is not a decode
+    failure: no step towards giving up the GPU and no 'failed' warning, and
+    the window reads in software from then on - in verification too."""
+    info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    monkeypatch.setattr(enc, "_run", lambda args, timeout=None: _FRAMEMD5)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    calls = _capture_scores(enc, monkeypatch)
+    real = enc._score_vmaf
+
+    def rebuilt(dist_args, ref_args, ref_vf, idx, crf, threads=None, frames=None, window=None):
+        if "-hwaccel" in ref_args:
+            raise opt.GraphRebuilt("hwaccel changed", window, "reference read")
+        return real(dist_args, ref_args, ref_vf, idx, crf, threads=threads, frames=frames,
+                    window=window)
+
+    monkeypatch.setattr(enc, "_score_vmaf", rebuilt)
+    enc._hwdec_streak = 3
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 90.0
+    assert ["-hwaccel" in ref for _, ref, _ in calls] == [False]
+    assert enc._hwdec_streak == 3 and enc._hwdec_ok is True and (600, 720) in enc._hwdec_bad
+    assert len(warnings) == 1 and "failed" not in warnings[0] and "[600, 720)" in warnings[0]
+    # verification of that window goes straight to software
+    assert enc._score_windows(600, 720, 0, 30, 4) == 90.0
+    assert len(calls) == 2 and "-hwaccel" not in calls[-1][1]
+    # and a window whose verification read rebuilds is read again in software
+    assert enc._score_windows(840, 960, 1, 30, 4) == 90.0
+    assert len(calls) == 3 and "-hwaccel" not in calls[-1][1] and calls[-1][2] == []
+    assert (840, 960) in enc._hwdec_bad and enc._hwdec_streak == 3 and len(warnings) == 2
+
+
+def test_an_xpsnr_reference_read_that_rebuilds_goes_to_software_too(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The xpsnr filter restarts with a rebuilt graph as libvmaf does, so its
+    card reference read is watched the same way: read again in software, the
+    window remembered, no step towards giving up the GPU."""
+    info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
+    enc = _metric_encoder(settings, info, plan, tmp_path, "xpsnr")
+    enc._lead_of = lambda path: 0.0
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: None)
+    xpsnr = "[Parsed_xpsnr_2 @ 0x1] XPSNR  y: 40.0000  u: 49.5918  v: 51.1706  (minimum: 40.0000)\n"
+    scores = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        if "-lavfi" not in args:
+            return _FRAMEMD5                     # the reference_hwaccel preflight
+        scores.append(args)
+        return (_REBUILT_LINE if "-hwaccel" in args else "") + xpsnr
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    enc._hwdec_streak = 3
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 40.0
+    assert ["-hwaccel" in c for c in scores] == [True, False]
+    assert (600, 720) in enc._hwdec_bad and enc._hwdec_streak == 3 and enc._hwdec_ok is True
+
+
+def test_score_vmaf_lets_a_rebuild_through_without_retrying_the_same_read(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Retrying a rebuilt card reference read on the CPU would read the card
+    again and rebuild again; and it says nothing about the SYCL device."""
+    settings.transcode.optimizer.vmaf_sycl_device = 0
+    settings.transcode.optimizer.vmaf_sycl_min_width = 0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._sycl_ok = True
+    backends = []
+
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout, window=None):
+        backends.append(sycl)
+        raise opt.GraphRebuilt("hwaccel changed", window, "reference read")
+
+    monkeypatch.setattr(enc, "_score_vmaf_on", on)
+    with pytest.raises(opt.GraphRebuilt):
+        enc._score_vmaf(["-i", "d"], [*_VAAPI, "-i", "r"], [], 0, 30, frames=120,
+                        window=(600, 720))
+    assert backends == [0] and enc._sycl_timeouts == 0 and enc._sycl_ok is True
+
+
+def test_score_vmaf_on_watches_every_read_and_never_parses_a_stale_log(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A card read that rebuilds leaves as GraphRebuilt with no log behind it.
+    A software read that rebuilds has nowhere better to go - the stream
+    really changes there - so it is one warning per window and the score
+    stands. And the per-(shot, CRF) log path is shared by retries and
+    fallbacks, so a run that scores nothing must not return an old log."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    changed = ("[fc#0 @ 0x2] Reconfiguring filter graph because video parameters changed "
+               "to yuv420p10le(tv, bt2020nc), 1920x800, straight alpha\n")
+    mode = {"write": True, "say": changed}
+    ran = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if mode["write"]:
+            _write_score(args, 91.0)
+        return mode["say"]
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    sw = ["-i", "r.mkv"]
+    assert enc._score_vmaf_on(-1, ["-i", "d"], sw, [], 0, 30, 4, 3600, window=(600, 720)) == 91.0
+    assert ran[-1][ran[-1].index("-loglevel") + 1] == "info" and "-nostats" in ran[-1]
+    assert len(warnings) == 1 and "software" in warnings[0] and "[600, 720)" in warnings[0]
+    assert "video parameters changed" in warnings[0]
+    assert enc._score_vmaf_on(-1, ["-i", "d"], sw, [], 0, 34, 4, 3600, window=(600, 720)) == 91.0
+    assert len(warnings) == 1
+    mode["say"] = _REBUILT_LINE
+    with pytest.raises(opt.GraphRebuilt) as e:
+        enc._score_vmaf_on(-1, ["-i", "d"], [*_VAAPI, *sw], [], 0, 30, 4, 3600,
+                           window=(840, 960))
+    assert (e.value.window, e.value.read) == ((840, 960), "reference read")
+    log = enc.probe_dir / "score_00000_30.json"
+    assert not log.exists()
+    mode["say"], mode["write"] = "", False
+    log.write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 50.0}}}))
+    with pytest.raises(opt.TranscodeError):
+        enc._score_vmaf_on(-1, ["-i", "d"], sw, [], 0, 30, 4, 3600, window=(600, 720))
+
+
+def test_a_missing_sycl_log_scores_on_the_cpu(settings, info, plan, tmp_path, monkeypatch):
+    """ffmpeg can exit 0 and leave no log. On the SYCL device that used to
+    escape as FileNotFoundError and fail the job; it is a failed scoring like
+    a crash, retried on the CPU. On the zero-copy read it falls back to the
+    usual one."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: None)
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        if "sycl_device=" not in args[args.index("-lavfi") + 1]:
+            _write_score(args, 91.0)
+        return ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120) == 91.0
+    assert enc._sycl_timeouts == 1
+    enc._zc_ok = True
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 91.0
+    assert enc._zc_fallbacks == 1 and enc._sycl_timeouts == 2
+
+
+@pytest.mark.parametrize("ending", ["failed", "timed out"])
+def test_a_sycl_score_across_a_real_parameter_change_is_not_held_against_the_device(
+        settings, info, plan, tmp_path, monkeypatch, ending):
+    """A software read of a window whose stream really changes rebuilds its
+    graph, SYCL scorer and all. That instance failing or stalling is the
+    source, not the card: the CPU still scores the window, but no stall is
+    counted - one more would retire the device for the job here - and the one
+    warning is the rebuild's."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    enc._sycl_timeouts = enc._SYCL_MAX_TIMEOUTS - 1
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    changed = ("[vf#1:0 @ 0x4] Reconfiguring filter graph because video parameters changed "
+               "to yuv420p10le(tv, bt709), 3840x2160, straight alpha\n")
+    mode = {"say": changed}
+    backends = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        sycl = "sycl_device=" in args[args.index("-lavfi") + 1]
+        backends.append(sycl)
+        if sycl:
+            return _ended(ending, _ZC_LOG + mode["say"] + "x" * 3000)
+        _write_score(args, 91.0)
+        return mode["say"]
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120,
+                           window=(600, 720)) == 91.0
+    assert backends == [True, False]
+    assert enc._sycl_timeouts == enc._SYCL_MAX_TIMEOUTS - 1 and enc._sycl_ok is True
+    assert len(warnings) == 1 and "software score read of frames [600, 720)" in warnings[0]
+    # the same failure with no rebuild behind it is the device's, and retires it
+    mode["say"] = ""
+    assert enc._score_vmaf(["-i", "d"], ["-i", "r"], [], 0, 30, frames=120,
+                           window=(840, 960)) == 91.0
+    assert enc._sycl_timeouts == enc._SYCL_MAX_TIMEOUTS and enc._sycl_ok is False
+
+
+def test_a_rebuild_on_a_software_read_warns_once_and_carries_on(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Where the stream really changes size, format or colour, the software
+    read rebuilds its graph too and no other read avoids it. Refusing over
+    one window is the kind of refusal that once killed a whole queue, so it
+    is one warning per window, across probes and verification, and the job
+    goes on."""
+    settings.transcode.optimizer.reference_hwaccel = "off"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    changed = ("[vf#0:0 @ 0x3] Reconfiguring filter graph because video parameters changed "
+               "to yuv420p10le(tv, bt709), 1920x800, straight alpha\n")
+    ran = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "-lavfi" in args:
+            _write_score(args, 90.0)
+        else:
+            Path(args[-1]).write_bytes(b"ivf")
+        return changed
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    scores = enc._probe_shot(0, 0, 90, [20, 26, 32], lp=4)
+    assert len(scores) == 3 and set(scores.values()) == {90.0}
+    assert enc._score_windows(0, 90, 0, 30, 4) == 90.0
+    assert len(warnings) == 1 and "software probe encode" in warnings[0]
+    assert "[0, 90)" in warnings[0] and "video parameters changed" in warnings[0]
+    encodes = [c for c in ran if "libsvtav1" in c]
+    assert len(encodes) == 3
+    assert all(c[c.index("-loglevel") + 1] == "info" and "-nostats" in c for c in encodes)
+    assert not enc._rebuilt and not enc._zc_bad
+
+
+@pytest.mark.parametrize("ending", ["failed", "timed out"])
+def test_a_software_read_that_rebuilds_and_then_fails_is_still_warned_about(
+        settings, info, plan, tmp_path, monkeypatch, ending):
+    """A crash or stall after a real parameter change fails as it always did,
+    but not silently: the window's one warning names the change, and the
+    error carries it so a SYCL score does not blame the device (see
+    _score_vmaf)."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    changed = ("[vf#0:0 @ 0x3] Reconfiguring filter graph because video parameters changed "
+               "to yuv420p10le(tv, bt709), 1920x800, straight alpha\n")
+    monkeypatch.setattr(enc, "_run",
+                        lambda args, timeout=None: _ended(ending, changed + "x" * 3000))
+    with pytest.raises(opt.TranscodeError) as e:
+        enc._run_read(["ffmpeg", "-i", "src.mkv"], 60, "score read", (600, 720))
+    assert not isinstance(e.value, opt.GraphRebuilt)
+    assert isinstance(e.value, opt.CommandTimeout) == (ending == "timed out")
+    assert e.value.rebuilt.startswith("video parameters changed")
+    assert len(warnings) == 1 and "software score read of frames [600, 720)" in warnings[0]
+
+
+def test_a_rebuild_while_staging_a_shard_is_warned_about_once(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A DV P5 or SSIMULACRA2 probe reads the source once, into its shard, and
+    every probe encode and score of the shot reads the shard. A parameter
+    change inside the window shows only in that staging read, so that is where
+    it is watched: one warning, and the shard stands like any software read."""
+    cache = tmp_path / "shm"
+    cache.mkdir()
+    enc = _p5_encoder(settings, info, plan, tmp_path, cache)
+    enc._lead_of = lambda path: 0.0
+    settings.transcode.optimizer.probe_bracket_width = 0     # sweep the grid
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    changed = ("[vf#0:0 @ 0x3] Reconfiguring filter graph because video parameters changed "
+               "to yuv420p10le(tv, bt709), 3840x1920, straight alpha\n")
+    staged = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        if "ffv1" in args:
+            staged.append(args)
+            Path(args[-1]).write_bytes(b"shard")
+            return changed
+        if "-lavfi" in args:
+            _write_score(args, 92.0)
+        elif "-f" in args and args[args.index("-f") + 1] == "ivf":
+            Path(args[-1]).write_bytes(b"ivf")
+        return ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    assert set(enc._probe_shot(0, 0, 90, [20, 32], lp=4).values()) == {92.0}
+    assert len(staged) == 1
+    assert staged[0][staged[0].index("-loglevel") + 1] == "info" and "-nostats" in staged[0]
+    assert len(warnings) == 1 and "software staging read of frames [0, 90)" in warnings[0]
+    assert "video parameters changed" in warnings[0] and not enc._rebuilt
+
+
+def test_reference_read_preflight_steps_off_a_parameter_change(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Eight frames that cross a parameter change prove nothing about the
+    decoder, so another window is read before anything is decided."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._lead_of = lambda path: 0.0
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    ran = []
+
+    def fake_run(args, timeout=None):
+        ran.append(args)
+        return _FRAMEMD5 + (_REBUILT_LINE if "-hwaccel" in args and len(ran) == 2 else "")
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    assert enc._hwdec() is True
+    assert len(ran) == 4 and not warnings
+    assert ran[0][ran[0].index("-ss") + 1] != ran[2][ran[2].index("-ss") + 1]
+    assert all(c[c.index("-loglevel") + 1] == "info" and "-nostats" in c for c in ran)
+
+
+@pytest.mark.parametrize("outcome", ["the next window agrees", "every window rebuilds"])
+def test_zero_copy_preflight_steps_off_a_parameter_change(
+        settings, info, plan, tmp_path, monkeypatch, outcome):
+    """A preflight window across a parameter change scores part of itself on
+    the card and all of it the usual way. That disagreement is the source,
+    not zero-copy, and switching zero-copy off for the whole job over it -
+    blaming the scores - is what this used to do."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(enc, "_hwdec_preflight", lambda: True)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    ran = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "libsvtav1" in args:
+            Path(args[-1]).write_bytes(b"ivf")
+            return ""
+        if "libvmaf_sycl=" in args[args.index("-lavfi") + 1]:
+            if outcome == "every window rebuilds" or sum(
+                    "libvmaf_sycl=" in " ".join(c) for c in ran) == 1:
+                _write_score(args, 97.0)          # the segment after the change
+                return _ZC_LOG + _REBUILT_LINE
+            _write_score(args, 90.0)
+            return _ZC_LOG
+        _write_score(args, 90.0)
+        return ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    agrees = outcome == "the next window agrees"
+    windows = len(enc._preflight_starts(enc._ZC_PREFLIGHT_FRAMES))
+    for _ in range(3):
+        assert enc._zero_copy() is agrees
+    assert windows >= 2 and len(ran) == (6 if agrees else 3 * windows)
+    encodes = [c[c.index("-ss") + 1] for c in ran if "libsvtav1" in c]
+    assert len(set(encodes)) == len(encodes)          # a different window each time
+    if agrees:
+        assert not warnings
+    else:
+        assert len(warnings) == 1 and "parameter change" in warnings[0]
+    assert not list(enc.probe_dir.glob("zc_preflight*"))
+
+
 # ---------------------------------------------------------------- gpu probe path
 
 def _curve(idxs, crossing, target, slope=1.0):
@@ -3563,7 +4839,11 @@ def test_gpu_probe_encode_runs_wholly_on_the_card(settings, info, plan, tmp_path
     assert cmd.index("-hwaccel") < cmd.index("-ss") < cmd.index("-i")
     vf = cmd[cmd.index("-vf") + 1] if "-vf" in cmd else ""
     assert "hwdownload" not in vf                        # the whole point
-    assert "setpts=PTS-STARTPTS" in vf                   # same framing as every other read
+    # rebased by the half frame the seek leaves (16666.67us at 30fps) and
+    # bounded by a frame count: neither restarts when the graph is rebuilt
+    assert vf.endswith(("settb=AVTB,setpts=PTS-16666", "settb=AVTB,setpts=PTS-16667"))
+    assert "-t" not in cmd and cmd[cmd.index("-frames:v") + 1] == "120"
+    assert cmd.index("-map") < cmd.index("-frames:v") < cmd.index("-c:v")
     # and it books room against the same budget the scores do: one card, one
     # pool of memory, and exhausting it once already cost a reboot
     enc._gpu_vram = opt.VramBudget(1000, max_ops=8, measure=lambda: 0.0)
@@ -3571,6 +4851,65 @@ def test_gpu_probe_encode_runs_wholly_on_the_card(settings, info, plan, tmp_path
     assert enc._gpu_vram.reserve(1000, 0.0) is True      # the card is now full
     with pytest.raises(opt.TranscodeError, match="no room on the GPU"):
         enc._qsv_probe_encode(600, 720, 22, tmp_path / "p.ivf")
+
+
+@pytest.mark.parametrize("ending", ["exit 0", "failed", "timed out", "failed without it"])
+def test_a_card_probe_across_a_parameter_change_raises_graph_rebuilt(
+        settings, info, plan, tmp_path, monkeypatch, ending):
+    """Measured across an in-band SPS change: 77 frames written for a 64-frame
+    window, or AVERROR_BUG. The line that says why is INFO, so the card read
+    runs at info; and it counts whether ffmpeg exited 0, failed or stalled.
+    A failure that does not say so stays an ordinary failure."""
+    info.color.bit_depth, info.color.pix_fmt = 10, "yuv420p10le"
+    enc, _ = _gpu_encoder(settings, info, plan, tmp_path)
+    ran = []
+
+    def fake_run(args, timeout=None):
+        ran.append(args)
+        Path(args[-1]).write_bytes(b"partial")
+        if ending == "failed without it":
+            return _ended("failed", "[av1_vaapi @ 0x1] Failed to end picture encode\n")
+        return _ended(ending, _REBUILT_LINE + "x" * 3000)
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    with pytest.raises(opt.TranscodeError) as e:
+        enc._qsv_score(3, 600, 720, 22)
+    cmd = ran[0]
+    assert cmd[cmd.index("-loglevel") + 1] == "info" and "-nostats" in cmd
+    assert not (enc.probe_dir / "gpuprobe_00003_22.ivf").exists()   # no partial file left
+    if ending == "failed without it":
+        assert not isinstance(e.value, opt.GraphRebuilt)
+        return
+    assert isinstance(e.value, opt.GraphRebuilt)
+    assert (e.value.window, e.value.read, e.value.reason) == \
+        ((600, 720), "card probe encode", "hwaccel changed")
+
+
+def test_gpu_probe_rebuild_probes_that_shot_with_svt(settings, info, plan, tmp_path, monkeypatch):
+    """probe_encoder=qsv: a card probe across a parameter change used to fail
+    the whole job. An anchor just adds no pair; a bulk shot is probed with SVT."""
+    enc, shots = _gpu_encoder(settings, info, plan, tmp_path)
+    grid = [20, 26, 32, 38, 44]
+    qgrid = enc._qsv_grid()
+    crf_of = lambda i: 22.0 + (i % 5)
+    q_of = lambda i: (crf_of(i) + 14.0) / 2.0
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: None)
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: _curve(grid, crf_of(idx), enc.target))
+    anchors = enc._gpu_anchor_indices(shots)
+    bulk = next(i for i in range(len(shots)) if i not in anchors)
+
+    def qsv(idx, s0, s1, qg):
+        if idx in (anchors[0], bulk):
+            raise opt.GraphRebuilt("hwaccel changed", (s0, s1), "card probe encode")
+        return _curve(qgrid, q_of(idx), enc.target), {max(qgrid): 100.0 + q_of(idx)}
+
+    monkeypatch.setattr(enc, "_probe_shot_qsv", qsv)
+    samples, chosen = enc.probe_all_gpu(shots, grid)
+    assert len(chosen) == len(shots)
+    assert bulk in samples and chosen[bulk] == pytest.approx(crf_of(bulk), abs=0.01)
+    assert enc._probe_window(*shots[bulk]) in enc._zc_bad
+    assert enc._probe_window(*shots[anchors[0]]) in enc._zc_bad
 
 
 def test_gpu_probe_maps_the_bulk_and_keeps_anchor_samples(settings, info, plan, tmp_path, monkeypatch):
@@ -3666,7 +5005,7 @@ def test_sycl_stalls_must_be_consecutive_to_retire_the_device(
     monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: None)
     seq = []
 
-    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout):
+    def on(sycl, dist_args, ref_args, ref_vf, idx, crf, threads, timeout, window=None):
         if sycl >= 0 and seq and seq.pop(0) == "stall":
             raise opt.CommandTimeout("libvmaf timed out")
         return 90.0
@@ -4035,6 +5374,77 @@ def test_a_failed_qsv_prediction_still_probes_the_shot(
     assert len(samples) == len(shots)
     chosen = enc.pick_all_crfs(samples, grid)
     assert all(c == pytest.approx(26.0) for c in chosen.values())
+
+
+def test_card_probe_rebuild_probes_the_shot_from_the_grid(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A card probe across a parameter change is not a busy or wedged card:
+    the shot is probed from the grid, the window is remembered for both
+    hardware reads, and nothing is counted against the device."""
+    enc, shots = _verified_encoder(settings, info, plan, tmp_path, shots=10)
+    grid = list(range(18, 51, 2))
+    qgrid = enc._qsv_grid()
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+
+    def qsv(idx, s0, s1, qg):
+        if idx == 3:
+            raise opt.GraphRebuilt("hwaccel changed", enc._probe_window(s0, s1),
+                                   "card probe encode")
+        return _curve(qgrid, 20.0, enc.target), {max(qgrid): 100.0}
+
+    monkeypatch.setattr(enc, "_probe_shot_qsv", qsv)
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: _curve(grid, 26.0, enc.target))
+    samples = enc.probe_all_verified(shots, grid)
+    assert len(samples) == len(shots)
+    w = enc._probe_window(*shots[3])
+    assert w in enc._zc_bad and w in enc._hwdec_bad and list(enc._rebuilt) == [w]
+    rebuilt = [m for m in warnings if "rebuilt" in m]
+    assert len(rebuilt) == 1 and "card probe encode" in rebuilt[0]
+    assert enc._zc_streak == 0 and enc._sycl_timeouts == 0 and enc._hwdec_streak == 0
+
+
+def test_after_a_card_probe_rebuild_the_shots_svt_scores_skip_zero_copy(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The window is remembered for the probes that follow on it, not just
+    for the card: shot 0's card read rebuilds, so its SVT probes are scored
+    the usual way, while shot 1 beside it keeps zero-copy. Nothing faked
+    between the probe phase and the ffmpeg commands."""
+    o = settings.transcode.optimizer
+    o.probe_encoder, o.gpu_probe_anchors = "qsv+svt", 6
+    o.probe_crfs = [20, 26, 32, 38, 44]
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    enc._zc_ok = True
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning",
+                        lambda msg, *a, **k: warnings.append(msg.format(*a, **k)))
+    ran = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        ran.append(args)
+        if "-lavfi" not in args:
+            Path(args[-1]).write_bytes(b"ivf")
+            return _REBUILT_LINE if "gpuprobe_00000_" in args[-1] else ""
+        _write_score(args, 90.0)
+        return _ZC_LOG if "libvmaf_sycl=" in args[args.index("-lavfi") + 1] else ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    samples = enc.probe_all_verified([(0, 100), (100, 200)], list(o.probe_crfs))
+    assert set(samples) == {0, 1} and samples[0]
+
+    def scores(shot, scorer):
+        tag = f"score_{shot:05d}_"
+        return [c for c in ran if "-lavfi" in c and tag in c[c.index("-lavfi") + 1]
+                and f"{scorer}=" in c[c.index("-lavfi") + 1]]
+
+    assert scores(0, "libvmaf_sycl") == [] and scores(0, "libvmaf")
+    assert scores(1, "libvmaf_sycl")
+    assert (0, 100) in enc._zc_bad and (100, 200) not in enc._zc_bad
+    assert len(warnings) == 1 and "card probe encode" in warnings[0]
+    assert enc._zc_streak == 0 and enc._zc_fallbacks == 0
 
 
 def test_the_second_probe_is_placed_from_the_residual_spread(settings, info, plan, tmp_path):
