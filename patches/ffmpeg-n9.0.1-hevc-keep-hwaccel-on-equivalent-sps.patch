@@ -1,0 +1,360 @@
+Keep the VA-API hwaccel across an HEVC SPS change that does not affect it
+
+hevc activates a new SPS at an IRAP whose PPS points at an SPS object other
+than the active one (hevcdec.c:3217), and then always runs get_format()
+(hevcdec.c:3260). ff_get_format() begins with ff_hwaccel_uninit()
+(decode.c:1256): ff_vaapi_decode_uninit() destroys the VA decode context and
+config (vaapi_decode.c:744, 752), the hwaccel private data is freed and
+avctx->hw_frames_ctx is dropped (decode.c:1219-1226). hwaccel_init()
+(decode.c:1341) then builds a new frames context and a new VA context
+(vaapi_decode.c:701-720). This happens even when the new SPS differs only in
+fields the hwaccel never looks at.
+
+Stranger Things Blu-ray remuxes (HEVC Main10 4K, Dolby Vision profile 7)
+switch SPS/PPS at the logo -> programme IRAP and again before the closing.
+The SPS differs only in HRD bit_rate/cpb values (and on one episode
+bit_rate_scale/cpb_size_scale) and max_transform_hierarchy_depth_inter/intra,
+the PPS in transform_skip_enabled_flag. Measured on the production files (CPU
+only) at the splices that matter - S05E02 start 11.053s, S05E03 end
+3975.305s, S05E04 end 5016.511s:
+- the keyframe is IDR_N_LP with in-band VPS, SPS and PPS, and there are no
+  RASL pictures;
+- the VPS parses identically everywhere, so it is byte-identical and its
+  object is kept (ps.c:797-800);
+- both SPS variants are general_profile_idc 2 (Main 10), 3840x2160,
+  bit_depth_luma_minus8 2, chroma 4:2:0.
+So every keep condition below holds exactly where production crashed.
+
+Destroying the context there has two costs:
+- A new hw_frames_ctx reaches fftools, which rebuilds the filter graph
+  ("Reconfiguring filter graph because hwaccel changed"); see
+  ffmpeg-n9.0.1-keep-graph-on-equivalent-hwframes.patch.
+- The decoder thread destroys the context while the filter thread is still
+  syncing frames it already received (up to 2 are queued between them,
+  DEFAULT_FRAME_THREAD_QUEUE_SIZE); libvmaf_sycl calls vaSyncSurface on each
+  one. Zero-copy scores crossing the S05E03 and S05E04 end splices
+  segfaulted iHD on fc0 ("segfault at 10", iHD_drv_video.so+0x90a61c), with
+  compute (ccs) and blitter (bcs) engine resets.
+
+The crash is a destroy racing a status query on another thread, with no lock
+in common (intel-media-26.3.2, media-driver ff3fed1):
+- Decoder thread: vaDestroyContext -> DdiDecodeFunctions::DestroyContext ->
+  CleanUp (ddi_decode_functions.cpp:377-418, 1300) ->
+  DdiDecodeBase::DestroyContext, which runs codecHal->Destroy(), then
+  MOS_Delete(codecHal), then clears pCodecHal, and only then each surface's
+  pDecCtx (ddi_decode_base_specific.cpp:452, 453, 455, 464). The only lock
+  it takes is DecoderMutex, around the context-heap release
+  (ddi_decode_functions.cpp:400-403). codecHal->Destroy() reaches
+  HevcPipelineXe_Lpm_Plus_Base::Destroy()
+  (decode_hevc_pipeline_xe_lpm_plus_base.cpp:352-359) and
+  DecodePipeline::Uninitialize(), which waits for the submitted commands and
+  then runs MOS_Delete(m_statusReport)
+  (decode_pipeline.cpp:275, 282); MOS_Delete sets the pointer to nullptr
+  (mos_utilities.h:3132-3149).
+- Filter thread: SyncSurface reads pDecCtx with no lock and, while it is
+  still set, picks the decode component (media_libva_interface_next.cpp:
+  1377-1389). The decode StatusCheck reads pDecCtx again, takes SurfaceMutex,
+  reads pCodecHal (ddi_decode_functions.cpp:1020-1023) and goes on to
+  StatusReport, which calls decoder->GetCompletedReport()
+  (ddi_decode_functions.cpp:1048): the adapter
+  (decode_hevc_pipeline_adapter_xe2_hpm.cpp:123-126) -> the pipeline
+  (decode_hevc_pipeline_xe_lpm_plus_base.cpp:417-421) ->
+  m_statusReport->GetCompletedCount() (media_status_report.h:172-178).
+A status query that read pCodecHal before it was cleared and gets to
+GetCompletedReport after Uninitialize deleted m_statusReport dereferences
+NULL; one that gets there after MOS_Delete(codecHal) is a use-after-free
+with no fixed signature.
+
+That this is the faulting instruction is inferred from offsets, not from a
+symbolised backtrace. The code at +0x90a61c starts endbr64;
+mov 0x58(%rdi),%rax; mov 0x60(%rax),%rax; mov 0x10(%rax),%rdx, and the fault
+address is 0x10. In the 26.3.2 headers that is adapter->m_decoder at +0x58
+(codechal_common.h:409-425; decode_hevc_pipeline_adapter_xe2_hpm.h:74),
+pipeline->m_statusReport at +0x60 (media_pipeline.h:259-268, taking gmmlib's
+PLATFORM, not on disk, as 28 or 32 bytes, which both give +0x60) and
+m_completedCount at +0x10 (media_status_report.h:247-248): a NULL
+m_statusReport. An earlier crash at +0x9a9d5c, captured in an image with the
+same iHD build (26.3.2-1~24.04~ppa1, build-id
+8bf64c6215d4c43cf96dabb7336eff1e731b54dc), starts with the same
+instructions, so it is a second function in the same binary. That fits the
+per-codec adapter copies of GetCompletedReport (the AV1 one is
+decode_av1_pipeline_adapter_xe2_hpm.cpp:117-121). That crash was the AV1
+(distorted) decoder freed at thread exit, which
+ffmpeg-n9.0.1-keep-decoder-until-cleanup.patch fixed; these are the HEVC
+(reference) decoder re-initialising at the SPS change. A NULL check on
+pDecCtx (or decCtx) in iHD would not fix it: both pDecCtx and pCodecHal are
+still set when the status query reads them, and the pipeline is torn down
+underneath it.
+
+With this patch, hevc_frame_start() decides before set_sps() drops the old SPS
+whether the running hwaccel can decode the new SPS as it is. If it can,
+get_format() skips ff_get_format(). The VA config, VA context, frames context
+and hwaccel private data stay exactly as they were, so there is no destroy to
+race, and avctx->pix_fmt is set back to the hwaccel format that
+export_stream_params() overwrote (hevcdec.c:339). export_multilayer() and
+setup_multilayer() still run. One line is logged at INFO, because production
+reads run at -loglevel info and this is their only sign that a change was
+kept:
+"Keeping hwaccel hevc_vaapi for a new SPS: coded WxH, FMT, profile P unchanged
+(packet pts N)".
+
+Kept only when all of these hold (hwaccel_keeps_for_sps()):
+- A hwaccel is initialised (avctx->hwaccel, its private data and
+  hw_frames_ctx set), and it is VA-API. Other hwaccels were not checked, and
+  their state depends on other things: vulkan copies SPS fields, HRD
+  included, into its session parameters (vulkan_hevc.c:220-239), videotoolbox
+  builds its format description from the parameter sets (videotoolbox.c:874,
+  988), and nvdec and dxva2 size fixed surface pools at init (nvdec.c:416,
+  441; dxva2.c:620-634).
+- There is an old SPS. The first activation, and the one after a failed
+  get_format() (hevcdec.c:3262), go the usual way.
+- Same coded width and height as the old SPS, and the frames context has that
+  size. They set the frames size (vaapi_decode.c:619-621), the
+  vaCreateContext size (vaapi_decode.c:715-716) and the hardware limits check
+  (vaapi_decode.c:596-607). iHD sizes its HAL settings and bitstream and slice
+  buffers from them at context creation (ddi_decode_functions.cpp:174, 227,
+  238; ddi_decode_hevc_specific.cpp:928-983, 1180-1181, 1247).
+- Same sps->pix_fmt as the old SPS, and it equals avctx->sw_pix_fmt. pix_fmt
+  encodes bit depth, chroma format, GBR and, for 8-bit 4:2:0 only, full range
+  (ps.c:1190-1216, 971-983). ff_get_format() takes sw_pix_fmt from it
+  (decode.c:1247), and the surface fourcc is chosen from sw_pix_fmt
+  (vaapi_decode.c:329-390). Bit depth and chroma format also choose the
+  VAProfile, from which iHD fixes lumaChromaDepth and chromaFormat for the
+  life of the context (ddi_decode_hevc_specific.cpp:1184-1213), and
+  DecodeBasicFeature::Init locks m_is10Bit, m_chromaFormat and m_bitDepth from
+  those settings (decode_basic_feature.cpp:71-77). They size the HCP buffers
+  for every picture (decode_hevc_picture_packet.cpp:233-234), so this
+  condition is required, not only prudent. Only an 8-bit 4:2:0 range change
+  (YUV420P <-> YUVJ420P, ps.c:971-972) re-initialises. At 10 bits full and
+  limited range are both YUV420P10, so a range-only change keeps the hwaccel.
+  That is safe for VA-API: its picture parameters have no range field
+  (vaapi_hevc.c:146-211), and export_stream_params() still exports
+  color_range (hevcdec.c:350-354).
+- Same general_profile_idc, and it is Main, Main 10 or Main Still Picture. The
+  VAProfile comes from avctx->profile through vaapi_profile_map
+  (vaapi_decode.c:520-574), and per-picture buffer sizes depend on it
+  (vaapi_hevc.c:234, 301, 354, 468). RExt and SCC always re-initialise: their
+  VAProfile is derived from the SPS constraint flags (vaapi_hevc.c:597-657).
+- Same VPS object. What get_format() exports and sets up from the VPS
+  (layers, alpha, view IDs; hevcdec.c:577-578, 708, 718) is then unchanged. A
+  byte-identical VPS repeat keeps its object (ps.c:797-800).
+
+Deliberately not compared:
+- The DPB size. It sizes no pool: with libva >= 1 the decoder frames context
+  has initial_pool_size 0 (vaapi_decode.c:628-629; decode.c:1105 and 1161 add
+  nothing to 0) and its pool grows on demand (hwcontext_vaapi.c:541-542,
+  657-665). sps_max_dec_pic_buffering_minus1 goes to the driver with every
+  picture (vaapi_hevc.c:150), and iHD's HAL uses it only in a debug dump
+  (codechal_debug.cpp:305). It is only uncompared when the VPS is identical:
+  the VPS carries its own DPB size, reorder count and latency
+  (ps.c:849-851) and must be the same object, so a DPB change that also
+  changes the VPS re-initialises. A byte-identical VPS with only the SPS
+  values changed is the one case where not comparing it matters.
+- Level, tier, HRD, VUI timing, the conformance window, and every coding tool
+  or partitioning field. VA-API has no HRD field at all. The rest is filled
+  for each picture from the current SPS and PPS (vaapi_hevc.c:146-211;
+  transform depths 154-155, transform_skip 181). iHD copies it into its
+  picture parameters each time (ddi_decode_hevc_specific.cpp:286-303, 332),
+  and the HAL recomputes size and CTB layout per picture
+  (decode_hevc_basic_feature.cpp:558-570) and resizes MV buffers on demand
+  (decode_hevc_mv_buffers.cpp:57-73).
+
+Why after the change nothing still assumes a re-initialised hwaccel:
+- VAAPIDecodeContext holds only the VA IDs and device/frames pointers
+  (vaapi_decode.h:47-61), all still valid. No SPS or PPS pointer is cached.
+  vaapi_hevc_start_frame() takes h->pps and pps->sps for each picture
+  (vaapi_hevc.c:129-133).
+- The old SPS stays alive while it is compared: sps_list already holds the new
+  one (ps.c:1774-1779), but l->sps still references the old one until
+  set_sps() (hevcdec.c:730). DPB frames keep their own PPS reference, and
+  through it their SPS (refs.c:193). The keep path stores no SPS pointer.
+- The refs are still cleared (hevcdec.c:3251) and the previous sequence is
+  still bumped (hevcdec.c:3312). To iHD the IRAP is one more random-access
+  picture in a running context.
+- H.264 already works this way: it calls get_format() again only when coded
+  size, bit depth, chroma format or pixel format change (h264_slice.c:
+  1082-1095, 1136, 1154).
+
+Frame threading, which production reads use: the hevc VA-API hwaccel is
+ASYNC_SAFE but not THREAD_SAFE (vaapi_hevc.c:672), so one instance of its
+state is handed from thread to thread: stashed in ff_thread_finish_setup()
+(pthread_frame.c:693-697) and swapped into the next worker when its packet is
+submitted (pthread_frame.c:537-543). What serialises the keep test against
+the previous worker's use of that state is hwaccel_mutex: a worker holding a
+thread-unsafe hwaccel locks it before it decodes, so before
+hevc_frame_start() (pthread_frame.c:270-274), and a worker unlocks it only
+after its whole decode, slices and end_frame included (pthread_frame.c:
+302-312). So the test sees the live hwaccel with nothing running on it. The
+worker holds avctx->hwaccel, the private data and the propagated
+hw_frames_ctx (pthread_frame.c:384-393). On the keep path nothing is
+uninitialised, so the handover is unchanged. pix_fmt and sw_pix_fmt reach the
+next thread and the user as before (pthread_frame.c:353-354). Other threads
+pick up the SPS without get_format() (hevcdec.c:4028-4032). Worker contexts
+have their own in_pkt for the log line (pthread_frame.c:867).
+
+Interaction with the other patches:
+- keep-decoder-until-cleanup is still needed: it moves the one remaining
+  vaDestroyContext per decoder after the filtergraphs.
+- keep-graph-on-equivalent-hwframes is no longer reached for these changes.
+  Frames keep the same hw_frames_ctx pointer, so send_frame() sees no hwaccel
+  change and no second decoder pool is allocated. It still matters for
+  changes this patch re-initialises that end up with an equivalent frames
+  context (another VPS or profile_idc with the same size and format), for
+  other decoders, and as a guard.
+
+Conditions and limits:
+- Real changes still re-initialise, and the destroy-vs-sync race is still
+  there for them: a new coded size, bit depth, chroma format, 8-bit range,
+  profile or VPS, and any RExt/SCC stream. Such a read still rebuilds its
+  graph and logs "Reconfiguring filter graph".
+- With keep-decoder-until-cleanup, those changes and get_format() error paths
+  are the only destroys left in the middle of a zero-copy read. AV1, the
+  distorted input, is not one: at a repeated sequence header
+  get_pixel_format() returns before ff_get_format() when avctx->pix_fmt is
+  already in its list (av1dec.c:660-664). The other ff_hwaccel_uninit()
+  callers are close (avcodec.c:474, pthread_frame.c:769) and
+  pthread_frame.c:419 and 443, which only thread-safe hwaccels reach. A sync
+  strictly after a destroy has returned is safe only for a surface still in
+  that context's render-target table: BeginPicture sets pDecCtx before it
+  registers the surface (ddi_decode_base_specific.cpp:265, 281), and a
+  surface replaced in an inactive slot keeps a pDecCtx
+  (ddi_codec_base_specific.cpp:94-107) that dangles once CleanUp frees the
+  context (ddi_decode_functions.cpp:1302). With keep-decoder-until-cleanup
+  that last destroy comes after the filtergraphs, so fftools does not reach
+  it.
+- The user's get_format() callback is not called for a kept change. fftools'
+  callback (ffmpeg_dec.c:1313-1353) returns the same format for the same list,
+  and its multiview setup returns early unless views were requested
+  (ffmpeg_dec.c:1096-1101). hwaccel_flags and extra_hw_frames changed by an
+  API user between the two SPS are not re-read.
+- hevc_qsv is a separate decoder (qsvdec.c) and is not changed.
+- Verified offline only: applies at --fuzz=0 to n9.0.1 on its own and after
+  the four other ffmpeg-n9.0.1 patches, and hevcdec.c compiles with no
+  warnings. The new code has no #if, so it is compiled even where VA-API is
+  not configured. That the keep path is taken at the end splices, removes the
+  segfault, and decodes the same frames as software still needs a run on the
+  card. Line numbers are n9.0.1's (media-driver: intel-media-26.3.2,
+  ff3fed1); another FFMPEG_REF needs the patch re-cut.
+
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -560,7 +560,59 @@
+     }
+ }
+ 
+-static enum AVPixelFormat get_format(HEVCContext *s, const HEVCSPS *sps)
++/* Whether the hwaccel that is set up can decode pictures of a newly activated
++ * SPS as it is, so get_format() need not tear it down and build it again.
++ *
++ * ff_get_format() starts with ff_hwaccel_uninit() (decode.c:1256), which for
++ * VA-API destroys the decode context and drops the frames context
++ * (vaapi_decode.c:738-760, decode.c:1226). hevc runs it at every SPS
++ * activation, including one that changes only HRD or transform-depth fields,
++ * as Blu-ray remuxes do at a programme boundary. The filter thread can still
++ * be syncing frames of that context while the decoder thread destroys it, and
++ * iHD serialises neither side against the other: vaSyncSurface's status query
++ * calls into the codec pipeline that vaDestroyContext is tearing down. That
++ * segfaulted iHD in production. A NULL check on the surface's decode context
++ * in iHD would not fix it, because both pointers are still set when they are
++ * read; not destroying the context does.
++ *
++ * The VA-API hwaccel takes from the SPS only the VAProfile (avctx->profile),
++ * the coded size and the software format (vaapi_decode.c:478-650, 692-736),
++ * and sizes no surface pool from the DPB (vaapi_decode.c:628-629). Everything
++ * else it reads from the current SPS and PPS for each picture
++ * (vaapi_hevc.c:124-345). So it is kept when those are unchanged, its frames
++ * context still has the new coded size, and the VPS - the layers, alpha and
++ * views get_format() exports - is the same object. Not kept: RExt and SCC,
++ * whose VAProfile comes from the SPS constraint flags (vaapi_hevc.c:597-657),
++ * and every hwaccel other than VA-API, which is all this was checked for. */
++static int hwaccel_keeps_for_sps(const HEVCContext *s, const HEVCSPS *old_sps,
++                                 const HEVCSPS *sps)
++{
++    const AVCodecContext *avctx = s->avctx;
++    const AVHWFramesContext *frames;
++    int profile = sps->ptl.general_ptl.profile_idc;
++
++    if (!old_sps || !avctx->hwaccel || !avctx->internal->hwaccel_priv_data ||
++        !avctx->hw_frames_ctx || avctx->hwaccel->pix_fmt != AV_PIX_FMT_VAAPI)
++        return 0;
++
++    frames = (const AVHWFramesContext *)avctx->hw_frames_ctx->data;
++
++    return sps->vps     == old_sps->vps                         &&
++           sps->pix_fmt == old_sps->pix_fmt                     &&
++           sps->pix_fmt == avctx->sw_pix_fmt                    &&
++           sps->width   == old_sps->width                       &&
++           sps->height  == old_sps->height                      &&
++           profile      == old_sps->ptl.general_ptl.profile_idc &&
++           (profile == AV_PROFILE_HEVC_MAIN    ||
++            profile == AV_PROFILE_HEVC_MAIN_10 ||
++            profile == AV_PROFILE_HEVC_MAIN_STILL_PICTURE)      &&
++           frames->format == AV_PIX_FMT_VAAPI                   &&
++           frames->width  == sps->width                         &&
++           frames->height == sps->height;
++}
++
++static enum AVPixelFormat get_format(HEVCContext *s, const HEVCSPS *sps,
++                                     int keep_hwaccel)
+ {
+ #define HWACCEL_MAX (CONFIG_HEVC_DXVA2_HWACCEL + \
+                      CONFIG_HEVC_D3D11VA_HWACCEL * 2 + \
+@@ -709,9 +761,27 @@
+     if (ret < 0)
+         return ret;
+ 
+-    ret = ff_get_format(s->avctx, pix_fmts);
+-    if (ret < 0)
+-        return ret;
++    if (keep_hwaccel) {
++        /* hwaccel_keeps_for_sps(): the hwaccel keeps its VA config, decode
++         * context and frames context, so no frames context is replaced under
++         * frames still in use, and none reaches the caller as a new one. The
++         * user's get_format() is not asked again: the list it would get is the
++         * same (same pix_fmt and VPS), and export_stream_params() has just set
++         * pix_fmt to the software format, which is put back here. At INFO:
++         * reads run at -loglevel info, and one line per kept change is what
++         * shows the path was taken. */
++        av_log(s->avctx, AV_LOG_INFO, "Keeping hwaccel %s for a new SPS: "
++               "coded %dx%d, %s, profile %d unchanged (packet pts %"PRId64")\n",
++               s->avctx->hwaccel->name, sps->width, sps->height,
++               av_get_pix_fmt_name(sps->pix_fmt),
++               sps->ptl.general_ptl.profile_idc,
++               s->avctx->internal->in_pkt->pts);
++        ret = s->avctx->hwaccel->pix_fmt;
++    } else {
++        ret = ff_get_format(s->avctx, pix_fmts);
++        if (ret < 0)
++            return ret;
++    }
+     s->avctx->pix_fmt = ret;
+ 
+     // set up multilayer decoding, if requested by caller
+@@ -3217,6 +3287,7 @@
+     if (l->sps != sps) {
+         const HEVCSPS *sps_base = s->layers[0].sps;
+         enum AVPixelFormat pix_fmt = sps->pix_fmt;
++        int keep_hwaccel;
+ 
+         if (l != &s->layers[0]) {
+             if (!sps_base) {
+@@ -3250,6 +3321,10 @@
+ 
+         ff_hevc_clear_refs(l);
+ 
++        /* decided while l->sps still holds the old SPS, which set_sps() drops */
++        keep_hwaccel = l == &s->layers[0] &&
++                       hwaccel_keeps_for_sps(s, l->sps, sps);
++
+         ret = set_sps(s, l, sps);
+         if (ret < 0)
+             return ret;
+@@ -3257,7 +3332,7 @@
+         if (l == &s->layers[0]) {
+             export_stream_params(s, sps);
+ 
+-            ret = get_format(s, sps);
++            ret = get_format(s, sps, keep_hwaccel);
+             if (ret < 0) {
+                 set_sps(s, l, NULL);
+                 return ret;

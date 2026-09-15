@@ -1,0 +1,253 @@
+Keep the filter graph when a VA-API decoder's new frames context is equivalent
+
+fftools/ffmpeg_filter.c send_frame() rebuilds the whole filter graph
+("Reconfiguring filter graph because hwaccel changed", logged at INFO and not
+suppressed by -reinit_filter 0) whenever a frame arrives in a hw_frames_ctx
+other than the one the input was configured with. With -hwaccel vaapi, hevc
+calls get_format() on every in-band SPS change (hevcdec.c:3260), and
+ff_get_format() begins with ff_hwaccel_uninit(), which drops the decoder's
+frames context (decode.c:1256, 1226), so the first frame after the change
+always carries a new one - even when device, surface format and size are
+unchanged. Stranger Things Blu-ray remuxes switch SPS/PPS at the logo ->
+programme IRAP (11.053s on S05E02) and again before the closing.
+
+A rebuild frees the graph and configures a new one, so every stateful filter
+restarts in the middle of the read: setpts=PTS-STARTPTS rebases to 0 again,
+the input -t (a trim in the graph) counts its duration again from the new
+graph's first frame, fps drops its buffered frame, and libvmaf/libvmaf_sycl
+writes its log for the first segment before a second instance overwrites it
+with the rest. Measured on the B580: av1_vaapi probe encodes failed with
+AVERROR_BUG or emitted 77 frames for a 64-frame window, and a zero-copy score
+over 84 frames kept 59. A software decode of the same file does not rebuild:
+it has no frames context to change.
+
+With this patch, a new context that is VA-API, on the same device, with the
+same format, sw_format, width and height does not rebuild the graph: the input
+takes a reference to the new context, logs "Keeping filter graph" at VERBOSE,
+and the graph carries on. Every rebuild that still happens logs the same INFO
+"Reconfiguring filter graph" line as before.
+
+Why the configured graph can take frames from the new context (n9.0.1 lines):
+- buffersrc uses its context only to set up its output link (buffersrc.c:560);
+  its per-frame check compares size, format and colour, not the context
+  (buffersrc.c:231).
+- fps, trim, setpts, format and null never read hw_frames_ctx; a filter that
+  is not hwframe-aware forwards its input link's context (avfilter.c:428-438).
+- vaapi_vpp (scale_vaapi) takes each frame's surface (vaapi_vpp.c:555) and
+  colour format from the frame's own context (vaapi_vpp.c:432); its VA context
+  is created on its output surfaces (vaapi_vpp.c:230).
+- VA-API encoders read the context once at open for device and sw_format
+  (ffmpeg_enc.c:160, hw_base_encode.c:795) and use each frame's data[3] as the
+  input surface (vaapi_encode.c:847, 590, 171).
+- libvmaf_sycl (ffmpeg-n9.0.1-libvmaf-sycl-zerocopy.patch) takes the surface
+  from data[3] and the display from each frame's own context; the bit depth it
+  configures from sw_format is required to be equal.
+- hwdownload was the one filter that required the configured context by
+  pointer. The transfer dispatches on the frame's own context (hwcontext.c:
+  487-489) and checks size against it (hwcontext_vaapi.c:977), so it accepts
+  an equivalent context too, and says so once at VERBOSE ("Accepting frames
+  from an equivalent hwframe context"). Without that hunk a VA-API read
+  through hwdownload fails with EINVAL at the change and logs no rebuild line.
+
+Not compared: initial_pool_size, which follows the new SPS (and is 0 for both
+under libva >= 1, vaapi_decode.c:628), and the surface array, which no consumer
+of decoder frames reads.
+
+Conditions and limits:
+- Still rebuilds, as before: a switch to or from software frames, another
+  device or device type, a new coded size (even one that keeps the display
+  size, which a software decode would not rebuild for) or sw_format (bit
+  depth), and anything that already needs a rebuild for another reason: the
+  test runs only while need_reinit is still 0. That includes a new display
+  size (a conformance-window change, hevcdec.c:342-343), colour description
+  or range (a VUI change). fftools compares those on the frame itself
+  (ffmpeg_filter.c:3082-3088), so they rebuild a software decode too, and this
+  patch does nothing for them. Before a graph is first configured nothing
+  changes.
+- QSV is excluded: qsvvpp binds its session to the input context's surface
+  array (qsvvpp.c:579-587) and qsv_map_to looks surfaces up in the configured
+  context (hwcontext_qsv.c:2188). A QSV decoder that reinitialises at a
+  parameter change (qsvdec.c:827-829, 1022) allocates a new frames context
+  too (qsvdec.c:327-355), and its graphs still rebuild with every stateful
+  filter restarting; scdet, for one, has no previous picture for the first
+  frame after the change (vf_scdet.c:114-136).
+- Frames of the old context still inside a kept graph (fps's held frame,
+  framesync's queue, an encoder's lookahead) are now synced after the decoder
+  destroyed the VA decode context they came from; a rebuild used to free
+  them. hevc already outputs DPB pictures after that destroy (get_format() at
+  hevcdec.c:3260 runs before ff_hevc_output_frames() at 3312). In iHD
+  (media-driver ff3fed1, softlet) such a sync is safe only when both of these
+  hold:
+  (a) The sync starts after vaDestroyContext has returned. SyncSurface reads
+      the surface's pDecCtx with no lock (media_libva_interface_next.cpp:
+      1377-1380), and the decode StatusCheck reads it before taking
+      SurfaceMutex, dereferences it with no null check and calls into the
+      codec HAL (ddi_decode_functions.cpp:1020-1023, 1048). DestroyContext
+      tears that HAL down and deletes it before it clears pDecCtx, and takes
+      no lock StatusCheck takes (ddi_decode_base_specific.cpp:452-464).
+      This does not hold for every frame of the old context. Frames pushed
+      on by frames of the new context are synced after get_format() has
+      returned, but the up to 2 frames already queued between the decoder
+      and filter threads (DEFAULT_FRAME_THREAD_QUEUE_SIZE) can be synced
+      while the destroy is still running.
+  (b) The surface is still in the destroyed context's render-target table:
+      DestroyContext clears pDecCtx only there
+      (ddi_decode_base_specific.cpp:458-465), and a full table reuses
+      inactive slots without clearing theirs (ddi_codec_base_specific.cpp:
+      94-107). The table has 127 entries (media_libva_common_next.h:43),
+      which a decoder pool never approaches.
+  The race at the change itself - the decoder thread destroying the context
+  while the filter thread syncs the up to 2 frames queued between them - is
+  not changed here, but reads that used to be rebuilt now keep running on
+  the GPU across the change, so that race is exercised on every change a
+  read crosses. It has been seen in production: zero-copy scores crossing
+  the Stranger Things S05E03 and S05E04 closing SPS changes segfaulted iHD
+  on fc0 (iHD_drv_video.so+0x90a61c) with compute and blitter engine resets.
+  For SPS changes the VA-API hwaccel can decode as they are,
+  ffmpeg-n9.0.1-hevc-keep-hwaccel-on-equivalent-sps.patch removes it: hevc
+  no longer destroys the context there. Changes it still re-initialises
+  keep the race.
+- VRAM: the old context stays referenced by the graph's links and filters
+  (buffersrc, hwdownload, vaapi_vpp, libvmaf_sycl) and by an encoder, and its
+  pool destroys surfaces only when it is freed (hwcontext_vaapi.c:515-529).
+  So the surfaces it allocated stay allocated beside the new pool until the
+  command ends: one extra decoder pool per change a read crosses, estimated
+  at 10-25 surfaces: about 0.23-0.58 GiB for 4K P010 at 3 bytes a pixel
+  (about 0.12-0.3 GiB for 8-bit NV12). Not measured. A rebuild used to free
+  it for -f null scoring graphs; an encoder already kept it.
+- Verified offline only: applies at --fuzz=0 to n9.0.1 on its own and after
+  the three other ffmpeg-n9.0.1 patches, and both files compile with no
+  warnings. The behaviour above is from reading the source and still needs a
+  run on the card. Line numbers are n9.0.1's; another FFMPEG_REF needs the
+  patch re-cut.
+
+--- a/fftools/ffmpeg_filter.c
++++ b/fftools/ffmpeg_filter.c
+@@ -3061,6 +3061,46 @@
+     return str ? str : "unknown";
+ }
+ 
++/* Whether frames from hw frames context b can go through a filter graph that
++ * was configured for context a, so a change from a to b need not rebuild it.
++ *
++ * A hwaccel decoder allocates a new frames context every time get_format()
++ * runs, and hevc runs it on every in-band SPS change, including one that
++ * leaves the picture size and surface format as they were. Rebuilding the
++ * graph for that restarts every stateful filter in it mid-stream: the input
++ * -t trim, setpts=PTS-STARTPTS, fps, and a scorer writing its log.
++ *
++ * The graph does not need its frames to come from the context it was built
++ * with, as long as they are surfaces of the same kind on the same device:
++ * VA-API filters and encoders take the surface from each frame (data[3]) and
++ * the display from the frame's own hw_frames_ctx, and the old context stays
++ * referenced by the graph's links while the graph lives. VA-API only, because
++ * that is what was checked; QSV binds VPP sessions and derived mappings to a
++ * context's surface array. The pool size is not compared: it follows the new
++ * SPS's DPB, nothing downstream of a decoder allocates from its pool, and the
++ * old pool stays valid while the graph holds its context.
++ *
++ * Changes this does not cover still rebuild, in software decodes too: a new
++ * display size, colour description or range (a conformance-window or VUI
++ * change) differs in the frame itself, not only in its context. */
++static int hw_frames_equivalent(const AVBufferRef *a, const AVBufferRef *b)
++{
++    const AVHWFramesContext *fa, *fb;
++
++    if (!a || !b)
++        return 0;
++
++    fa = (const AVHWFramesContext *)a->data;
++    fb = (const AVHWFramesContext *)b->data;
++
++    return fa->device_ctx->type == AV_HWDEVICE_TYPE_VAAPI &&
++           fa->device_ctx       == fb->device_ctx &&
++           fa->format           == fb->format     &&
++           fa->sw_format        == fb->sw_format  &&
++           fa->width            == fb->width      &&
++           fa->height           == fb->height;
++}
++
+ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+                       InputFilter *ifilter, AVFrame *frame)
+ {
+@@ -3114,8 +3154,20 @@
+         need_reinit = 0;
+ 
+     if (!!ifp->hw_frames_ctx != !!frame->hw_frames_ctx ||
+-        (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data))
+-        need_reinit |= HWACCEL_CHANGED;
++        (ifp->hw_frames_ctx && ifp->hw_frames_ctx->data != frame->hw_frames_ctx->data)) {
++        if (!need_reinit && fgt->graph &&
++            hw_frames_equivalent(ifp->hw_frames_ctx, frame->hw_frames_ctx)) {
++            /* keep the graph, and hold the frames' own context: later frames
++             * then match by pointer again, and a rebuild for any other
++             * reason is configured with the context frames now come from */
++            ret = av_buffer_replace(&ifp->hw_frames_ctx, frame->hw_frames_ctx);
++            if (ret < 0)
++                return ret;
++            av_log(fg, AV_LOG_VERBOSE, "Keeping filter graph: input %s moved to "
++                   "an equivalent hw frames context\n", ifilter->name);
++        } else
++            need_reinit |= HWACCEL_CHANGED;
++    }
+ 
+     if (need_reinit) {
+         ret = ifilter_parameters_from_frame(ifilter, frame);
+--- a/libavfilter/vf_hwdownload.c
++++ b/libavfilter/vf_hwdownload.c
+@@ -33,6 +33,8 @@
+ 
+     AVBufferRef       *hwframes_ref;
+     AVHWFramesContext *hwframes;
++
++    int logged_equivalent;
+ } HWDownloadContext;
+ 
+ static int hwdownload_query_formats(const AVFilterContext *avctx,
+@@ -111,6 +113,23 @@
+     return 0;
+ }
+ 
++/* The test fftools' send_frame() uses to keep a filter graph when a VA-API
++ * decoder replaces its frames context with one of the same device, surface
++ * format and size (an in-band SPS change). The download itself goes through
++ * the frame's own context, so such a frame downloads exactly as one from the
++ * configured context would. The first such frame logs one verbose line, which
++ * is also what a build can grep for to prove this hunk is compiled in. */
++static int hwframes_equivalent(const AVHWFramesContext *a,
++                               const AVHWFramesContext *b)
++{
++    return a->device_ctx->type == AV_HWDEVICE_TYPE_VAAPI &&
++           a->device_ctx       == b->device_ctx &&
++           a->format           == b->format     &&
++           a->sw_format        == b->sw_format  &&
++           a->width            == b->width      &&
++           a->height           == b->height;
++}
++
+ static int hwdownload_filter_frame(AVFilterLink *link, AVFrame *input)
+ {
+     AVFilterContext *avctx = link->dst;
+@@ -124,12 +143,21 @@
+         err = AVERROR(EINVAL);
+         goto fail;
+     }
+-    if ((void*)ctx->hwframes != input->hw_frames_ctx->data) {
++    if ((void*)ctx->hwframes != input->hw_frames_ctx->data &&
++        !hwframes_equivalent(ctx->hwframes,
++                             (AVHWFramesContext*)input->hw_frames_ctx->data)) {
+         av_log(ctx, AV_LOG_ERROR, "Input frame is not the in the configured "
+                "hwframe context.\n");
+         err = AVERROR(EINVAL);
+         goto fail;
+     }
++    /* reached with a different context only if it passed the test above */
++    if ((void*)ctx->hwframes != input->hw_frames_ctx->data &&
++        !ctx->logged_equivalent) {
++        av_log(ctx, AV_LOG_VERBOSE,
++               "Accepting frames from an equivalent hwframe context.\n");
++        ctx->logged_equivalent = 1;
++    }
+ 
+     output = ff_get_video_buffer(outlink, ctx->hwframes->width,
+                                  ctx->hwframes->height);

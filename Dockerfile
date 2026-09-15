@@ -219,15 +219,25 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 # The zerocopy patch adds the libvmaf_sycl filter, which takes VA-API frames;
 # keep-decoder-until-cleanup stops ffmpeg destroying a decoder's VA context
 # while its frames are still queued, which crashed that filter in iHD.
+# keep-graph-on-equivalent-hwframes stops ffmpeg rebuilding a filter graph when
+# a VA-API decoder swaps in an identical frames context at an in-band SPS
+# change, which restarted setpts, -t, fps and libvmaf in the middle of a read.
+# hevc-keep-hwaccel-on-equivalent-sps stops hevc destroying its VA context at
+# all at such a change, when the new SPS keeps profile, size and format: that
+# destroy raced the filter thread's syncs of queued frames and segfaulted iHD.
 COPY patches/ffmpeg-n9.0.1-libvmaf-sycl.patch /build/
 COPY patches/ffmpeg-n9.0.1-libvmaf-sycl-zerocopy.patch /build/
 COPY patches/ffmpeg-n9.0.1-keep-decoder-until-cleanup.patch /build/
+COPY patches/ffmpeg-n9.0.1-keep-graph-on-equivalent-hwframes.patch /build/
+COPY patches/ffmpeg-n9.0.1-hevc-keep-hwaccel-on-equivalent-sps.patch /build/
 RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}.tar.gz" \
       | tar xz && \
     cd "FFmpeg-${FFMPEG_REF}" && \
     patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-libvmaf-sycl.patch && \
     patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-libvmaf-sycl-zerocopy.patch && \
     patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-keep-decoder-until-cleanup.patch && \
+    patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-keep-graph-on-equivalent-hwframes.patch && \
+    patch -p1 --fuzz=0 < /build/ffmpeg-n9.0.1-hevc-keep-hwaccel-on-equivalent-sps.patch && \
     ./configure --prefix=/usr/local \
         --enable-gpl --enable-nonfree \
         --enable-libvpx --enable-libx264 --enable-libx265 \
@@ -246,6 +256,14 @@ RUN curl -fsSL "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/${FFMPEG_REF}
     # component switches live in config_components.h, not config.h
     grep -q "^#define CONFIG_LIBVMAF_SYCL_FILTER 1" config_components.h && \
     ffmpeg -hide_banner -h filter=libvmaf_sycl 2>&1 | grep -q sycl_device && \
+    # Both keep-graph hunks are in what was built, not only in the tree: the
+    # fftools one in the binary, the hwdownload one in libavfilter (static, as
+    # configure defaults to, so it is the archive the binary was linked from).
+    grep -aq "Keeping filter graph" /usr/local/bin/ffmpeg && \
+    grep -aq "Accepting frames from an equivalent hwframe context" /usr/local/lib/libavfilter.a && \
+    # and the hevc keep-hwaccel hunk, in the static libavcodec the binary
+    # was linked from
+    grep -aq "Keeping hwaccel %s for a new SPS" /usr/local/lib/libavcodec.a && \
     mkdir -p /out/lib /out/bin && \
     cp -a /usr/local/lib/* /out/lib/ && \
     cp /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /out/bin/
