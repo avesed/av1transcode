@@ -2,6 +2,7 @@ import json
 import math
 import random
 import shutil
+import struct
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ from app.config import Settings, VideoParams
 from app.decisions import TranscodePlan
 from app.analyzer import MediaInfo
 from app import optimizer as opt
+from app import pgsocr
 
 
 @pytest.fixture()
@@ -6912,3 +6914,635 @@ def test_the_srt_companion_against_real_tools(settings, plan, tmp_path,
          str(enc.output)], check=True, capture_output=True, text=True).stdout)
     assert [(s["codec_name"], s["disposition"]["default"])
             for s in probed["streams"]] == [("ass", 0), ("subrip", 1)]
+
+
+# ---- PGS: kept as it is, with a plain-text srt READ OFF IT beside it ----
+#
+# The .sup fixtures below are built here rather than checked in: a PGS track
+# is a handful of segment types (see app.pgsocr), and writing them is the only
+# way a test can state exactly which byte carries the timing, the palette or
+# the bitmap. Every one of these is a shape the real format takes.
+def _pgs_seg(stype, pts, payload):
+    """One segment: "PG", 4B PTS, 4B DTS, 1B type, 2B length, payload."""
+    return b"PG" + struct.pack(">IIBH", pts, 0, stype, len(payload)) + payload
+
+
+def _pgs_rle(idx):
+    """Palette-index rows -> PGS run-length, the inverse of pgsocr.rle_decode.
+
+    Every branch of the decoder is exercised by a real bitmap: raw bytes for a
+    short coloured run, 0x00 0x80|n for a long one, 0x00 n for transparent,
+    and 0x00 0x00 to end the row.
+    """
+    out = bytearray()
+    for row in idx:
+        i = 0
+        while i < len(row):
+            c = int(row[i])
+            n = 1
+            while i + n < len(row) and int(row[i + n]) == c:
+                n += 1
+            i += n
+            if c == 0:
+                while n:
+                    take = min(n, 63)
+                    out += bytes((0x00, take))
+                    n -= take
+            elif n < 3:
+                out += bytes((c,)) * n         # a short run is cheaper raw
+            else:
+                while n:
+                    take = min(n, 63)
+                    out += bytes((0x00, 0x80 | take, c))
+                    n -= take
+        out += b"\x00\x00"                     # end of line
+    return bytes(out)
+
+
+def _pgs_compose(start, idx, screen=(1920, 1080), at=(0, 0), window=None):
+    """One COMPOSITION display set: PCS, WDS, PDS, ODS, END.
+
+    `at` places the object and `window` the window it names. They are the same
+    corner in an ordinary track and are separate here on purpose: a
+    composition is free to put an object outside its own window.
+    """
+    h, w = idx.shape
+    wx, wy, ww, wh = window or (0, 0, w, h)
+    pts = int(round(start * 90000))
+    pcs = (struct.pack(">HH", *screen) + b"\x10\x00\x00\x00\x00\x00"
+           + b"\x01" + struct.pack(">HBB", 0, 0, 0) + struct.pack(">HH", *at))
+    buf = bytearray(_pgs_seg(0x16, pts, pcs))
+    buf += _pgs_seg(0x17, pts, b"\x01\x00" + struct.pack(">HHHH", wx, wy, ww, wh))
+    # index 1 is opaque white, everything else stays transparent
+    buf += _pgs_seg(0x14, pts, b"\x00\x00" + bytes((1, 235, 128, 128, 255)))
+    rle = _pgs_rle(idx)
+    ods = (struct.pack(">HB", 0, 0) + b"\xc0"
+           + struct.pack(">I", len(rle) + 4)[1:] + struct.pack(">HH", w, h) + rle)
+    buf += _pgs_seg(0x15, pts, ods)
+    buf += _pgs_seg(0x80, pts, b"")
+    return bytes(buf)
+
+
+def _pgs_erase(end, screen=(1920, 1080)):
+    """The ERASE display set: a composition carrying NO object, which is what
+    ends the cue before it."""
+    epts = int(round(end * 90000))
+    return (_pgs_seg(0x16, epts, struct.pack(">HH", *screen)
+                     + b"\x10\x00\x00\x00\x00\x00" + b"\x00")
+            + _pgs_seg(0x80, epts, b""))
+
+
+def _make_sup(cues, screen=(1920, 1080)):
+    """[(start_s, end_s, index_array)] -> .sup bytes.
+
+    One window, one object, one palette, reused by every display set - which
+    is exactly the layout that makes WHEN the palette is bound load-bearing.
+    """
+    return b"".join(_pgs_compose(start, idx, screen) + _pgs_erase(end, screen)
+                    for start, end, idx in cues)
+
+
+def _block_text(rows, cols, seed=1):
+    """A deterministic, obviously non-blank bitmap. Not meant to be readable:
+    the tests that use it inject their own engine."""
+    import numpy as np
+
+    idx = np.zeros((rows, cols), np.uint8)
+    idx[seed:rows - seed, seed:cols - seed] = 1
+    return idx
+
+
+class _FakeEngine:
+    """An engine that is not tesseract and does not import it.
+
+    pgsocr.ocr_track promises it enters an engine through one call, so this is
+    also the test that the seam is real: a GPU model would be dropped in the
+    same way.
+    """
+
+    name = "fake"
+
+    def __init__(self, texts):
+        self.texts = list(texts)
+        self.seen = []
+
+    def recognise(self, rgba):
+        self.seen.append(rgba.shape)
+        return self.texts[len(self.seen) - 1], "primary"
+
+
+def test_a_sup_parses_into_cues_the_erase_display_set_closes():
+    """The cue count is the number of COMPOSITION display sets, never the
+    number of display sets: each cue here writes two."""
+    import numpy as np
+
+    sup = _make_sup([(1.418, 3.670, _block_text(20, 60)),
+                     (4.0, 5.5, _block_text(20, 60))])
+    cues, notes = pgsocr.parse_sup(sup)
+    assert [(round(c.start, 3), round(c.end, 3)) for c in cues] == [
+        (1.418, 3.670), (4.0, 5.5)]
+    # and the timing really is read from the 90 kHz PTS, not invented
+    assert notes["seg_16"] == 4 and len(cues) == 2
+    assert not [k for k in notes if not k.startswith("seg_")]
+    rgba = pgsocr.render(cues[0])
+    assert rgba.shape == (20, 60, 4)
+    assert (rgba[..., 3] > 0).any()          # something was actually drawn
+    assert isinstance(rgba, np.ndarray)
+
+
+def test_the_palette_is_bound_at_the_end_of_its_own_display_set():
+    """Every display set in a real track reuses object id 0 and palette id 0.
+    Bound any later, EVERY cue would render the last bitmap in the file - the
+    one defect that produces a whole track of confident, identical, wrong
+    subtitles instead of an obvious failure."""
+    wide = _block_text(20, 60)
+    narrow = _block_text(20, 12)
+    cues, _ = pgsocr.parse_sup(_make_sup([(1.0, 2.0, wide), (3.0, 4.0, narrow)]))
+    assert pgsocr.render(cues[0]).shape[1] == 60
+    assert pgsocr.render(cues[1]).shape[1] == 12
+
+
+def test_a_composition_that_replaces_an_open_cue_ends_it_there():
+    """Not every cue is closed by an erase: a composition can replace one
+    still on screen. Left open, that cue fell to the track's MEDIAN duration
+    and ran on past the subtitle that replaced it - two cues on screen at
+    once, and enough of them refuses the whole track at the overlap gate."""
+    idx = _block_text(20, 60)
+    cues, notes = pgsocr.parse_sup(
+        _pgs_compose(1.0, idx) + _pgs_compose(2.0, idx) + _pgs_erase(3.0))
+    assert [(round(c.start, 3), round(c.end, 3)) for c in cues] == [
+        (1.0, 2.0), (2.0, 3.0)]
+    assert not notes["cue_without_erase"]
+
+
+def test_an_object_outside_its_window_is_clipped_and_never_raises(tmp_path):
+    """A composition may place an object outside the window it names - once in
+    the 71-file batch. Clipped at one end only, a negative offset GREW the
+    slice and the canvas was then indexed from its end, so ocr_track raised
+    IndexError instead of returning a reason: the one thing this module
+    promises never happens, hours into a finished encode."""
+    sup = tmp_path / "a.sup"
+    sup.write_bytes(_pgs_compose(1.0, _block_text(20, 60), at=(60, 0),
+                                 window=(100, 0, 200, 50)) + _pgs_erase(2.0))
+    cues, _ = pgsocr.parse_sup(sup.read_bytes())
+    rgba = pgsocr.render(cues[0])
+    assert rgba.shape == (50, 200, 4)
+    assert (rgba[..., 3] > 0).any()      # the part inside the window is drawn
+    res = pgsocr.ocr_track(sup, engine=_FakeEngine(["a line of text"]),
+                           workers=1, lexicon=set())
+    assert res.text is not None
+
+
+def test_signal_map_makes_an_outlined_glyph_solid():
+    """PGS cues are white glyphs with a BLACK OUTLINE on a transparent ground.
+    Compositing over white leaves a stencil whose interior matches the page;
+    luma*alpha collapses outline and background together, which is what makes
+    the letters solid."""
+    import numpy as np
+
+    rgba = np.zeros((3, 3, 4), np.uint8)
+    rgba[1, 1] = (255, 255, 255, 255)        # glyph core
+    rgba[0, 1] = (0, 0, 0, 255)              # its outline
+    s = pgsocr.signal_map(rgba)
+    assert s[1, 1] > 0.99                    # core is ink
+    assert s[0, 1] == 0.0                    # outline is not
+    assert s[2, 2] == 0.0                    # nor is the transparent ground
+
+
+def test_ocr_track_returns_a_reason_rather_than_raising_on_a_damaged_sup(tmp_path):
+    """OCR must never fail an encode. A .sup that lost sync is the shape that
+    would otherwise raise out of the mux, hours into a job."""
+    bad = tmp_path / "broken.sup"
+    bad.write_bytes(b"NOTPGS" + b"\x00" * 40)
+    res = pgsocr.ocr_track(bad)
+    assert res.text is None and "lost sync" in res.why
+
+
+def test_ocr_track_drives_the_whole_pipeline_through_a_foreign_engine(tmp_path):
+    """The seam: an object with .name and recognise() gets the original RGBA
+    canvas and its text reaches the finished srt."""
+    sup = tmp_path / "a.sup"
+    sup.write_bytes(_make_sup([(1.418, 3.67, _block_text(20, 60)),
+                               (4.0, 5.5, _block_text(20, 60))]))
+    eng = _FakeEngine(["first line", "second line"])
+    res = pgsocr.ocr_track(sup, engine=eng, workers=1, lexicon={"first", "second", "line"})
+    assert res.why == "ok" and res.written == 2
+    assert res.text == ("1\n00:00:01,418 --> 00:00:03,670\nfirst line\n\n"
+                        "2\n00:00:04,000 --> 00:00:05,500\nsecond line\n")
+    assert eng.seen == [(20, 60, 4), (20, 60, 4)]
+
+
+def test_a_track_that_ocrs_to_nothing_is_refused_by_the_gates(tmp_path):
+    """A blank cue is a silently dropped subtitle, so a track that comes back
+    mostly blank must produce NO srt rather than a short one."""
+    sup = tmp_path / "a.sup"
+    sup.write_bytes(_make_sup([(i, i + 0.5, _block_text(20, 60))
+                               for i in range(1, 21)]))
+    res = pgsocr.ocr_track(sup, engine=_FakeEngine([""] * 19 + ["only one"]),
+                           workers=1, lexicon=set())
+    assert res.text is None
+    assert "empty_rate" in res.why or "chars_per_cue" in res.why
+
+
+def test_the_empty_cue_tolerance_is_the_bound_that_decides(tmp_path):
+    """cue_coverage and empty_rate are the same measurement the two ways up -
+    they sum to 1 - so bounding both meant the coverage bound always fired
+    first and the 1% empty tolerance this module documents never applied. A
+    track 0.8% of whose cues came back blank is inside that tolerance and
+    ships; coverage stays a REPORTED signal."""
+    n = 125
+    sup = tmp_path / "a.sup"
+    sup.write_bytes(_make_sup([(i, i + 0.5, _block_text(20, 60))
+                               for i in range(1, n + 1)]))
+    res = pgsocr.ocr_track(
+        sup, engine=_FakeEngine([""] + ["a line of text"] * (n - 1)),
+        workers=1, lexicon=set())
+    assert res.signals["empty_rate"] == 0.008
+    assert res.signals["cue_coverage"] == 0.992
+    assert res.text is not None and res.written == n - 1
+
+
+def test_the_oov_gate_skips_itself_rather_than_failing_a_short_track(tmp_path):
+    """Below MIN_TOKENS one unusual word moves the rate by most of a point, and
+    with no word list in the image the signal does not exist at all. Neither is
+    evidence of a bad read, so the gate says it skipped instead of passing
+    quietly - or failing every short track."""
+    sup = tmp_path / "a.sup"
+    sup.write_bytes(_make_sup([(1.0, 2.0, _block_text(20, 60))]))
+    res = pgsocr.ocr_track(sup, engine=_FakeEngine(["Zzyzx Qwghlm Brrraaap"]),
+                           workers=1, lexicon={"the"})
+    gate = [g for g in res.gates if g["name"] == "oov_rate"][0]
+    assert gate["pass"] and "tokens" in gate["skipped"]
+    assert res.text is not None                # and the track still ships
+
+
+def test_a_well_formed_initialism_is_never_snapped_to_another_one():
+    """The gazetteer repairs DAMAGE, and a token that already reads as an
+    initialism is not damage. Snapping it anyway rewrites one real acronym
+    into another, and nothing downstream can see that: the result is ASCII,
+    the right length, the right cue count - and it is the srt, the track that
+    TAKES the default flag, that carries the wrong word."""
+    doc = pgsocr.build_doc_context(["The U.S.S.R. archive", "back in the U.S.S.R."])
+    assert pgsocr.postprocess("He left the U.S.A. today", doc)[0] == \
+        "He left the U.S.A. today"
+    # measured over the raw OCR of all 73 real tracks: the 48 repairs of a
+    # damaged form all still happen, and only two rewrites of a correct read
+    # are refused
+    doc = pgsocr.build_doc_context(["S.H.I.E.L.D. is here"])
+    assert pgsocr.postprocess("S.H.I.LE.L.D.", doc)[0] == "S.H.I.E.L.D."
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("|'ve got it", "I've got it"),           # contraction: capital I
+    ("a bu|let", "a bullet"),                 # inside a lowercase word: l
+    ("S.H.|.E.L.D.", "S.H.I.E.L.D."),         # an initialism letter
+    ("-Yes.\n\"No.", "- Yes.\n- No."),        # a dash misread as a quote
+    ("-Yes.\n-No.", "- Yes.\n- No."),         # the space tesseract drops
+])
+def test_the_post_rules_each_fix_a_counted_error(raw, want):
+    doc = pgsocr.build_doc_context(["S.H.I.E.L.D. is here"], {"bullet"})
+    assert pgsocr.postprocess(raw, doc)[0] == want
+
+
+def test_a_one_sided_dash_is_left_alone_when_the_cue_is_one_line():
+    """The pair rule reads a two-line cue as the dialogue convention it is.
+    A single line starting with a dash is not a dropped sibling."""
+    assert pgsocr.postprocess("- Just me.")[0] == "- Just me."
+
+
+# ---- the optimizer side: extraction, flags, and what falls away ----
+_OCR_SRT = "1\n00:00:01,418 --> 00:00:03,670\nHELLO WORLD\n"
+
+
+def _pgs_probe(flags=("default",), language="eng", title="", codec=None,
+               extra=None):
+    """A source whose SECOND subtitle track is an image track: an English srt
+    first, so that the "only when the file has no text subtitle" reading of
+    this feature would produce no companion at all."""
+    tags = {"NUMBER_OF_FRAMES": "1422", "language": language}
+    if title:
+        tags["title"] = title
+    st = {"codec_name": codec or "hdmv_pgs_subtitle", "tags": tags}
+    st.update(extra or {})
+    return _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), {"codec_name": "subrip",
+                             "tags": {"NUMBER_OF_FRAMES": "512",
+                                      "language": "eng"}}),
+        ("subtitle", set(flags), st))
+
+
+def _stub_ocr(monkeypatch, ok=True, text=_OCR_SRT):
+    """_ocr_companion without tesseract: the command shape and the flag
+    handling are what these tests are about."""
+    def fake(self, sub):
+        if not ok:
+            return False
+        self._companion_path(sub).write_text(text, encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(opt.ShotEncoder, "_ocr_companion", fake)
+
+
+def test_an_english_pgs_track_is_extracted_by_the_demux_that_already_runs(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The whole point: a second full read of a 30-90GB remux is not
+    acceptable, so the .sup comes out as another output of the ONE command
+    that already builds audio_subs.mkv. Copied, never decoded, and with no
+    -copyts: measured, a production-shaped source extracts all 711 cue times
+    exactly without it."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_ocr(monkeypatch)
+    ran = _mux_with(enc, monkeypatch, _pgs_probe())
+    remux, = _remuxes(ran)
+    assert remux[remux.index(str(enc.tempdir / "audio_subs.mkv")) + 1:] == [
+        "-map", "0:s:1", "-c:s", "copy", "-f", "sup",
+        str(enc.tempdir / "sub_1.sup")]
+    assert "-copyts" not in remux
+    # one read of the source, not two
+    assert len([a for a in ran if a[1:3] == ["-hide_banner", "-y"]
+                and "-i" in a and a[a.index("-i") + 1] == str(enc.info.path)]) == 1
+    assert enc.subtitles_added == 1
+
+
+@pytest.mark.parametrize("language, codec, ocrd", [
+    ("eng", "hdmv_pgs_subtitle", True),
+    ("chi", "hdmv_pgs_subtitle", False),      # one model, and it is eng
+    ("jpn", "hdmv_pgs_subtitle", False),
+    ("", "hdmv_pgs_subtitle", False),         # untagged is not evidence
+    ("eng", "dvd_subtitle", False),           # VobSub: a format this cannot read
+    ("eng", "subrip", False),                 # already text
+], ids=["eng-pgs", "chi", "jpn", "untagged", "eng-vobsub", "text"])
+def test_only_english_pgs_tracks_are_ocrd(settings, info, plan, tmp_path,
+                                          monkeypatch, language, codec, ocrd):
+    """eng tesseract does not FAIL on Thai or Chinese, it invents - and the
+    invention would be muxed in as a subtitle track. Measured over the
+    library: 5005 image tracks, 1034 English, of which 929 PGS and 105
+    VobSub."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_ocr(monkeypatch)
+    ran = _mux_with(enc, monkeypatch,
+                    _pgs_probe(language=language, codec=codec))
+    remux, = _remuxes(ran)
+    assert ("-f" in remux and "sup" in remux) is ocrd
+    assert enc.subtitles_added == (1 if ocrd else 0)
+
+
+def test_the_srt_takes_the_default_flag_and_the_image_track_loses_it(
+        settings, info, plan, tmp_path, monkeypatch):
+    """THE WHOLE POINT. Two default subtitle tracks and a player takes the
+    first - the picture - and burns it in, which is the fault this exists to
+    fix. So the flag MOVES: the srt is default, the PGS is not."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_ocr(monkeypatch)
+    ran = _mux_with(enc, monkeypatch, _pgs_probe(flags=("default",)))
+    remux, = _remuxes(ran)
+    # the PGS is the output's s:1, and it is written WITHOUT default
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "0")]
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert final[final.index("-disposition:s:2") + 1] == "default"
+
+
+def test_the_srt_carries_the_language_title_forced_and_hearing_impaired(
+        settings, info, plan, tmp_path, monkeypatch):
+    """An SDH PGS read off the screen is still SDH. Drop the flag and Plex
+    offers it as ordinary English - exactly the track a deaf viewer must not
+    be handed. Unlike default, this one is COPIED: both tracks keep it."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_ocr(monkeypatch)
+    ran = _mux_with(enc, monkeypatch, _pgs_probe(
+        flags=("default", "forced", "hearing_impaired"), title="English SDH"))
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    meta = final[final.index("-metadata:s:s:2"):]
+    assert meta[:4] == ["-metadata:s:s:2", "language=eng",
+                        "-metadata:s:s:2", "title=English SDH (OCR)"]
+    assert meta[4:6] == ["-disposition:s:2",
+                         "default+forced+hearing_impaired"]
+    # and the image track keeps forced and hearing_impaired, losing only default
+    remux, = _remuxes(ran)
+    assert _dispositions(remux)[-1] == ("-disposition:s:1",
+                                        "forced+hearing_impaired")
+
+
+def test_mkvmerge_gets_the_same_flags_as_the_ffmpeg_fallback(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The two muxers write these separately, and an SDH track came out
+    hearing_impaired through one and plain through the other, decided by
+    nothing but whether mkvmerge was installed."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_ocr(monkeypatch)
+    sub = opt.SubStream(index=3, pos=1, codec="hdmv_pgs_subtitle",
+                        flags="default+forced+hearing_impaired", default=True,
+                        forced=True, language="eng", title="English SDH",
+                        empty=False, why="tag")
+    assert enc._companion_inputs([sub]) == [
+        "--sub-charset", "0:UTF-8", "--language", "0:eng",
+        "--track-name", "0:English SDH (OCR)",
+        "--default-track-flag", "0:yes", "--forced-display-flag", "0:yes",
+        "--hearing-impaired-flag", "0:yes", str(enc._companion_path(sub))]
+
+
+def test_an_ass_companion_is_never_given_the_hearing_impaired_flag(
+        settings, info, plan, tmp_path):
+    """The descriptive flags stay on the ASS beside it: that companion is the
+    same cues in a poorer format, not the same subtitles as text."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    sub = opt.SubStream(index=3, pos=1, codec="ass",
+                        flags="default+hearing_impaired", default=True,
+                        forced=False, language="eng", title="", empty=False,
+                        why="tag")
+    assert "--hearing-impaired-flag" not in enc._companion_inputs([sub])
+    assert enc._companion_metadata("/x/src.mkv", []) == []
+
+
+def test_an_ocr_that_fails_hands_the_default_flag_back(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The remux states its flags before the OCR has run, so a PGS whose text
+    copy never arrives is already written without its default. mkvmerge copies
+    that file's flags and promotes nothing, so the output would carry NO
+    default subtitle at all."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_ocr(monkeypatch, ok=False)
+    _, merges = _concat_via_mkvmerge(
+        enc, monkeypatch, _pgs_probe(),
+        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)))
+    merge, = merges
+    # audio at track 0, so the PGS (the output's s:1) is track 2
+    assert "--default-track-flag" in merge
+    assert merge[merge.index("--default-track-flag") + 1] == "2:yes"
+    assert enc.subtitles_added == 0
+
+
+def test_with_the_setting_off_nothing_is_extracted(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    settings.transcode.optimizer.pgs_ocr_srt = False
+    _stub_ocr(monkeypatch)
+    ran = _mux_with(enc, monkeypatch, _pgs_probe())
+    remux, = _remuxes(ran)
+    assert "sup" not in remux and enc.subtitles_added == 0
+
+
+def test_an_empty_image_track_is_never_ocrd(
+        settings, info, plan, tmp_path, monkeypatch):
+    """It would read nothing and write an empty track - which is the thing
+    drop_empty_subtitles exists to stop shipping."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    # BOTH of the other settings that ask for emptiness are off, so this also
+    # pins the probe: with only these two consulted, every stream came back
+    # empty=None and an empty PGS was extracted and OCR'd for nothing
+    settings.transcode.optimizer.drop_empty_subtitles = False
+    settings.transcode.optimizer.ass_srt_companion = False
+    _stub_ocr(monkeypatch)
+    # the language tag is restated because `extra` REPLACES tags: without it
+    # the track is left out for being untagged, which is a different rule and
+    # would let this pass with emptiness never measured at all
+    ran = _mux_with(enc, monkeypatch, _pgs_probe(
+        extra={"tags": {"NUMBER_OF_FRAMES": "0", "language": "eng"}}))
+    remux, = _remuxes(ran)
+    assert "sup" not in remux and enc.subtitles_added == 0
+
+
+def test_an_ass_and_a_pgs_in_one_file_each_get_their_own_companion(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Two kinds in one list, and the numbering has to be right from both
+    ends: "-map 0:s:N" counts the SOURCE's subtitles while "-metadata:s:s:N"
+    counts the OUTPUT's."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _stub_ocr(monkeypatch)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), {"codec_name": "ass",
+                             "tags": {"NUMBER_OF_FRAMES": "916",
+                                      "language": "jpn"}}),
+        ("subtitle", {"default"}, {"codec_name": "hdmv_pgs_subtitle",
+                                   "tags": {"NUMBER_OF_FRAMES": "1422",
+                                            "language": "eng"}})))
+    remux, = _remuxes(ran)
+    # the ASS copy first, then the image track's bitstream
+    assert _maps(remux) == ["0:a?", "0:s?", "0:t?", "0:s:0", "0:s:1"]
+    tail = remux[remux.index(str(enc.tempdir / "audio_subs.mkv")) + 1:]
+    assert tail == ["-map", "0:s:0", "-c:s", "srt",
+                    str(enc.tempdir / "sub_0.srt"),
+                    "-map", "0:s:1", "-c:s", "copy", "-f", "sup",
+                    str(enc.tempdir / "sub_1.sup")]
+    assert enc.subtitles_added == 2
+
+
+def _render_sup(tmp_path, ffmpeg, text="HELLO WORLD", start=0.2, end=1.5):
+    """A real PGS track carrying `text`, built with the tools already required.
+
+    ffmpeg has no PGS ENCODER, so the bitmap is rendered with libass onto a
+    black frame, read back as a PGM, and wrapped in the segments a .sup is
+    made of (see _make_sup). That is what lets this test assert on the TEXT
+    rather than only on stream counts: no stub can tell whether the palette,
+    the RLE and the 90 kHz timing are read the way a real player reads them.
+    """
+    import subprocess as sp
+
+    import numpy as np
+
+    (tmp_path / "burn.ass").write_text(
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 200\n\n"
+        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, "
+        "SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, "
+        "StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,DejaVu Sans,56,&H00FFFFFF,&H000000FF,&H00000000,"
+        "&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,10,10,10,1\n\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, "
+        "MarginV, Effect, Text\n"
+        f"Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{text}\n",
+        encoding="utf-8")
+    pgm = tmp_path / "cue.pgm"
+    try:
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "color=c=black:s=640x200:d=1:r=1", "-vf",
+                f"ass={tmp_path / 'burn.ass'}", "-frames:v", "1",
+                "-pix_fmt", "gray", str(pgm)], check=True, cwd=tmp_path)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with the libass 'ass' filter")
+    head = pgm.read_bytes().split(b"\n", 3)
+    w, h = (int(x) for x in head[1].split())
+    gray = np.frombuffer(head[3][:w * h], np.uint8).reshape(h, w)
+    if int((gray > 128).sum()) < 200:
+        pytest.skip("libass rendered no text (no usable font in this image)")
+    sup = tmp_path / "eng.sup"
+    sup.write_bytes(_make_sup([(start, end, (gray > 128).astype(np.uint8))],
+                              screen=(w, h)))
+    return sup
+
+
+@pytest.mark.skipif(
+    any(_REAL_WHICH(t) is None
+        for t in ("ffmpeg", "ffprobe", "mkvmerge", "tesseract")),
+    reason="needs a real ffmpeg, ffprobe, mkvmerge and tesseract")
+@pytest.mark.parametrize("muxer", ["mkvmerge", "ffmpeg"])
+def test_the_ocr_companion_against_real_tools(settings, plan, tmp_path,
+                                              monkeypatch, muxer):
+    """The whole thing for real, on a source carrying a genuine PGS track.
+
+    No stub can tell that ffmpeg copies a PGS out to a .sup with its 90 kHz
+    timing intact, that tesseract reads that bitmap back as the same words, or
+    which command decides the default flag in the finished file - the remux
+    writes audio_subs.mkv, mkvmerge copies that file's flags track for track,
+    and the ffmpeg fallback restates its own over them. Both muxers, on a
+    source whose PGS really is the default track.
+    """
+    import subprocess as sp
+
+    real = _REAL_WHICH
+    monkeypatch.setattr(shutil, "which", real if muxer == "mkvmerge" else
+                        (lambda n, *a, **k: None if "mkvmerge" in n
+                         else real(n, *a, **k)))
+    ffmpeg, ffprobe, mkvmerge = real("ffmpeg"), real("ffprobe"), real("mkvmerge")
+
+    def ff(*args):
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, args)],
+               check=True, cwd=tmp_path)
+
+    shot = tmp_path / "enc_00000.ivf"
+    try:
+        ff("-f", "lavfi", "-i", "testsrc=size=160x120:rate=5:duration=2",
+           "-c:v", "libsvtav1", "-preset", "12", shot)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with libsvtav1 to build the shot")
+    ff("-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac",
+       "sound.mka")
+    sup = _render_sup(tmp_path, ffmpeg)
+    source = tmp_path / "movie.mkv"
+    # the PGS is default AND hearing-impaired, which is the shape that made
+    # Plex burn a picture in: the companion must take the first and copy the
+    # second
+    sp.run([mkvmerge, "-q", "-o", str(source), str(shot), "sound.mka",
+            "--language", "0:eng", "--track-name", "0:English SDH",
+            "--default-track-flag", "0:yes", "--hearing-impaired-flag", "0:yes",
+            str(sup)], check=True, cwd=tmp_path)
+    info = MediaInfo(path=source)
+    info.fps, info.duration = 5.0, 2.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc.concat_shots([shot])
+
+    assert enc.subtitles_added == 1
+    probed = json.loads(sp.run(
+        [ffprobe, "-v", "error", "-select_streams", "s", "-show_entries",
+         "stream=codec_name:stream_disposition:stream_tags", "-of", "json",
+         str(enc.output)], check=True, capture_output=True, text=True).stdout)
+    subs = probed["streams"]
+    # the image track is KEPT, and the text copy sits beside it
+    assert [s["codec_name"] for s in subs] == ["hdmv_pgs_subtitle", "subrip"]
+    # exactly one default, and it is the TEXT track: with two, a player takes
+    # the first - the picture - and burns it in, which is the whole fault
+    assert [s["disposition"]["default"] for s in subs] == [0, 1]
+    # hearing_impaired is COPIED, not moved: an SDH track read off the screen
+    # is still SDH, and Plex labels it from this flag
+    assert [s["disposition"]["hearing_impaired"] for s in subs] == [1, 1]
+    assert [s["tags"]["language"] for s in subs] == ["eng", "eng"]
+    assert subs[1]["tags"].get("title") == "English SDH (OCR)"
+    # and the text is right, at the time the PGS carried it
+    ff("-i", enc.output, "-map", "0:s:1", "-c", "copy", "out.srt")
+    got = (tmp_path / "out.srt").read_text(encoding="utf-8")
+    assert "HELLO WORLD" in got
+    assert "00:00:00,200 --> 00:00:01,500" in got

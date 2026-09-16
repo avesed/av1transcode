@@ -646,6 +646,45 @@ class OptimizerSettings(BaseModel):
     # ShotEncoder._sanitise_srt) and silently drops \pos and \move, so a
     # typeset or signs track converts badly. That is what the ASS is for.
     ass_srt_companion: bool = True
+    # OCR every ENGLISH image subtitle track the mux keeps, and put the text
+    # beside it as an srt. The image track itself is kept and untouched: this
+    # is a companion, exactly like ass_srt_companion, never a replacement.
+    #
+    # It is the other half of drop_empty_subtitles' fault. Plex has no soft
+    # subtitle target for a bitmap track, so when it picks one it burns it
+    # into the picture and re-encodes the whole video (0.2-0.9x real time,
+    # transcoder at ~660% CPU). Dropping the EMPTY tracks stopped it choosing
+    # a track with nothing in it; this gives it something to send for the
+    # tracks that really do carry subtitles. The generated srt takes the
+    # default flag and the image track is written without it, or Plex would
+    # go on auto-selecting the picture (see ShotEncoder._companion_flags).
+    #
+    # ENGLISH ONLY, and that is a limit rather than a preference: the image
+    # ships one tesseract model (eng). Measured over the finished library,
+    # 5005 image tracks carry only 1034 English ones - the rest are Chinese,
+    # Japanese, Korean, Thai, Arabic - and eng does not FAIL on those, it
+    # returns confident garbage that would be written into the output as a
+    # subtitle track. Non-English image tracks are left completely alone.
+    # PGS only, for the same kind of reason: of those 1034 English tracks 929
+    # are PGS and 105 are DVD VobSub, which is a different container and a
+    # different bitmap layout that this parser cannot read (see app.pgsocr).
+    # A VobSub track is left alone exactly as a Chinese one is. Every English
+    # image track in the library is tagged plainly "eng"; the match is still
+    # written to accept the other spellings, since a tag is a tag.
+    #
+    # Accuracy, measured against a file's own SDH text track (Agents of
+    # S.H.I.E.L.D. S05E05, 711 cues): 0.1276% character error rate
+    # case-folded, 689 of 711 cues exact. Over a 71-file batch of the real
+    # library, 70 of 71 tracks passed the structural gates.
+    #
+    # Cost: the .sup extraction is an extra output on the demux that already
+    # builds audio_subs.mkv, so it is no extra pass over the source, and the
+    # OCR itself is bounded (see pgsocr.default_workers).
+    #
+    # It can never fail an encode. A missing tesseract, an unparseable track,
+    # a cue that hangs, a gate that does not hold - every one of them degrades
+    # to "no srt for that track" with a warning (see pgsocr.ocr_track).
+    pgs_ocr_srt: bool = True
 
 
 class DolbyVision(BaseModel):

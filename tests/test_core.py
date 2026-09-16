@@ -275,6 +275,23 @@ def test_settings_page_rail_lists_every_optimizer_group():
     assert groups and rail == groups, f"rail {rail} against groups {groups}"
 
 
+def test_the_subtitle_switches_are_all_in_the_subtitle_group():
+    """The rail test above says every group is reachable; this says a field is
+    in the group a user would look in. A subtitle switch filed under "verify
+    and debug" is one nobody finds, and all three of these are on by default -
+    so the one a user goes looking for is the one that just changed a track
+    they wanted left alone.
+    """
+    import re
+    from pathlib import Path
+
+    html = Path("app/static/settings.html").read_text()
+    block = re.search(r'\{ id: "grp-subs".*?\n  \]\},', html, re.S)
+    assert block, "grp-subs is not in OPT_GROUPS"
+    assert set(re.findall(r'F\("(\w+)"', block.group(0))) == {
+        "drop_empty_subtitles", "ass_srt_companion", "pgs_ocr_srt"}
+
+
 def test_config_yaml_documents_every_optimizer_field():
     """config.yaml is the only documentation most of these knobs have. A field
     that exists in the model but not in the shipped config is one a user can

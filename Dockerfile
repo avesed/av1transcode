@@ -411,6 +411,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# OCR for the English image subtitles (transcode.optimizer.pgs_ocr_srt, see
+# app/pgsocr.py). tesseract-ocr is the engine; wamerican is the word list the
+# out-of-vocabulary gate scores a track against, and without it that gate
+# skips itself rather than passing everything.
+#
+# osd.traineddata is deleted in the same layer: it is the orientation and
+# script detector, which is only ever loaded by --psm 0, and this code asks
+# for --psm 6 and --psm 7. Measured, it is 10.3MB of the package.
+#
+# THE MODEL IS FETCHED, not the packaged one, and that is the one number worth
+# arguing about. Ubuntu's tesseract-ocr-eng ships tessdata_fast (verified: its
+# eng.traineddata is byte-identical to upstream tessdata_fast, md5
+# d1be414fbb296b3ad777bfca655e194e). Measured on the same 711-cue track,
+# scored against that file's own SDH text track:
+#     packaged (fast)   0.3020% CER case-folded, 664/711 cues exact
+#     tessdata_best     0.1276% CER case-folded, 689/711 cues exact
+# So best halves the character error rate and turns 25 more cues perfect, for
+# 11.3MB more model (15.4 against 4.1) and ~40% more OCR CPU (168.3 against
+# 118.8 CPU-seconds for the whole track). A track is OCR'd once, forever, into
+# a file people then read; the CPU is spent in the mux, which is minutes at
+# the end of an encode that runs for hours. Deleting osd pays for most of the
+# size difference on its own.
+#
+# Pinned by tag AND checksum: this is a 15MB binary blob fetched at build
+# time, and a silent change in it would change every subtitle this ships.
+ARG TESSDATA_BEST_REF=4.1.0
+ARG TESSDATA_BEST_SHA256=8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tesseract-ocr wamerican \
+    && rm -f /usr/share/tesseract-ocr/*/tessdata/osd.traineddata \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL -o /tmp/eng.traineddata \
+        "https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/${TESSDATA_BEST_REF}/eng.traineddata" \
+    && echo "${TESSDATA_BEST_SHA256}  /tmp/eng.traineddata" | sha256sum -c - \
+    && mv /tmp/eng.traineddata \
+        "$(dirname "$(find /usr/share/tesseract-ocr -name eng.traineddata | head -1)")/eng.traineddata" \
+    && tesseract --list-langs 2>&1 | grep -qx eng \
+    && test -s /usr/share/dict/words
+
 COPY --from=ffmpeg-builder /out/bin/ffmpeg /out/bin/ffprobe /usr/local/bin/
 RUN mv /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg-real
 COPY ffmpeg-wrap.py /usr/local/bin/ffmpeg

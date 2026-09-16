@@ -5313,6 +5313,25 @@ class ShotEncoder:
     # maps S_TEXT/ASS to "ass" and S_TEXT/SSA to "ssa".
     _ASS_SUBS = {"ass", "ssa"}
 
+    # The bitmap subtitles app.pgsocr can read, which is HDMV PGS and only
+    # that. Measured over the finished library: 5005 image subtitle tracks,
+    # of which 4447 are PGS and 558 are DVD VobSub; among the 1034 English
+    # ones it is 929 PGS against 105 VobSub. VobSub is a different container
+    # and a different bitmap layout, so those 105 are left alone rather than
+    # fed to a parser that would mis-read them - the same rule as a Chinese
+    # track. A codec missing from here is never OCR'd, which is the safe way
+    # round: the cost is a track that keeps only its picture, and the cost of
+    # guessing the other way is garbage muxed in as a subtitle.
+    _IMAGE_SUBS = {"hdmv_pgs_subtitle"}
+
+    # Language tags that mean English. Every one of the library's 1034
+    # English image tracks is tagged plainly "eng", but a tag is only a tag:
+    # the two-letter and spelled-out forms are accepted as well. Anything
+    # else is NOT English for this purpose, including an empty tag - an
+    # untagged track is not evidence of English, and the image has one
+    # tesseract model, which does not fail on Thai, it invents.
+    _ENGLISH_TAGS = {"eng", "en", "english", "en-us", "en-gb", "eng-us"}
+
     # Every flag -disposition takes (libavformat/options.c), in ffmpeg's own
     # order. ffprobe prints a stream's flags under these same names.
     _DISPOSITIONS = ("default", "dub", "original", "comment", "lyrics",
@@ -5376,10 +5395,11 @@ class ShotEncoder:
         """The one probe behind _subtitle_plan, and what it makes of it."""
         kinds = {"audio": "a", "subtitle": "s"}
         drop = bool(self.opt.drop_empty_subtitles)
-        # Emptiness also decides whether a track gets a companion, so it is
-        # measured for either setting - and for neither, not at all (it can
-        # cost a second tool, see _index_entries).
-        measure = drop or bool(self.opt.ass_srt_companion)
+        # Emptiness also decides whether a track gets a companion of EITHER
+        # kind, so it is measured for any of the three settings - and for none
+        # of them, not at all (it can cost a second tool, see _index_entries).
+        measure = (drop or bool(self.opt.ass_srt_companion)
+                   or bool(self.opt.pgs_ocr_srt))
         matroska = False
         audio: List[str] = []
         subs: List[SubStream] = []
@@ -5711,12 +5731,51 @@ class ShotEncoder:
         return [s for s in plan.kept
                 if s.codec in self._ASS_SUBS and s.empty is not True]
 
+    def _ocr_companions(self, source: str) -> List[SubStream]:
+        """The kept ENGLISH image tracks that get a text copy read off the
+        picture (see app.pgsocr and config's pgs_ocr_srt).
+
+        Every English image track qualifies, not only the ones on a file with
+        no text subtitle: a source carrying an English srt AND an English SDH
+        PGS still gets the PGS turned into text, because those are different
+        subtitles and the SDH one is the track a deaf viewer needs. What stops
+        a second copy of the same thing is that each companion is tied to the
+        track it came from, not to the file.
+
+        Never for a track detected as empty - it would OCR nothing and write
+        an empty track, which is what drop_empty_subtitles exists to stop -
+        and never for a non-English or non-PGS one (see _IMAGE_SUBS and
+        _ENGLISH_TAGS for what those two limits cost and why).
+        """
+        if not self.opt.pgs_ocr_srt:
+            return []
+        plan = self._subtitle_plan(source)
+        if not plan.known:
+            return []
+        return [s for s in plan.kept
+                if s.codec in self._IMAGE_SUBS and s.empty is not True
+                and s.language.strip().lower() in self._ENGLISH_TAGS]
+
     def _companion_path(self, sub: SubStream) -> Path:
         return self.tempdir / f"sub_{sub.pos}.srt"
 
+    def _ocr_sup_path(self, sub: SubStream) -> Path:
+        """Where the demux drops one image track's bitstream for the OCR to
+        read. Deleted with the rest of the temp dir; a 42-minute PGS track
+        measured 26.5MB."""
+        return self.tempdir / f"sub_{sub.pos}.sup"
+
     def _companion_title(self, sub: SubStream) -> str:
         """A name that says what this track is, so nobody picks it expecting
-        the styling the ASS beside it carries."""
+        the styling the ASS beside it carries - or, for a track read off the
+        picture, mistakes it for one somebody typed.
+
+        The source's own title is kept in front of the tag, because that is
+        what tells the two apart in a menu: "English SDH (OCR)" beside
+        "English (OCR)".
+        """
+        if sub.codec in self._IMAGE_SUBS:
+            return f"{sub.title} (OCR)" if sub.title else "OCR (plain text)"
         return f"{sub.title} (SRT)" if sub.title else "SRT (plain text)"
 
     def _companion_outputs(self, companions: List[SubStream]) -> List[str]:
@@ -5725,10 +5784,31 @@ class ShotEncoder:
         One demux, measured: extracting all 42 subtitle tracks of a 2.2GB
         source alongside the remux took 4.3s against 3.3s for the remux alone,
         and produced 1.5MB of srt.
+
+        An image track comes out as its own raw bitstream instead - copied,
+        never decoded, into the .sup that app.pgsocr reads. The whole reason
+        it rides here is that the alternative is a second full read of a
+        30-90GB remux, and the batch measured that read at 50.7MB/s: 119.6GB
+        of source took 2358s just to extract.
+
+        NO -copyts, deliberately, and it was measured both ways. That option
+        is global - it would apply to audio_subs.mkv as well, where the mux
+        lead is already handled (see _mux_lead) - and it is not needed: on a
+        production-shaped source (video and audio at 0, PGS starting at
+        1.418s) the plain extraction reproduced all 711 cue times exactly,
+        delta 0 ticks. The 1.418s shift that shows up when the same track is
+        extracted from a SUBTITLE-ONLY file is ffmpeg subtracting that file's
+        own start_time, which a real source does not have.
         """
-        return [a for sub in companions
-                for a in ("-map", f"0:s:{sub.pos}", "-c:s", "srt",
-                          str(self._companion_path(sub)))]
+        args: List[str] = []
+        for sub in companions:
+            if sub.codec in self._IMAGE_SUBS:
+                args += ["-map", f"0:s:{sub.pos}", "-c:s", "copy",
+                         "-f", "sup", str(self._ocr_sup_path(sub))]
+            else:
+                args += ["-map", f"0:s:{sub.pos}", "-c:s", "srt",
+                         str(self._companion_path(sub))]
+        return args
 
     # What srtenc writes into the text that is not text: the <font> wrapper it
     # adds whenever the ASS style differs from its own defaults
@@ -5763,9 +5843,74 @@ class ShotEncoder:
             return False
         return True
 
-    def _companion_flags(self, sub: SubStream) -> Tuple[bool, bool]:
-        """(default, forced) for the companion made from `sub` - the only two
-        flags it is ever given, through EITHER muxer.
+    def _make_companion(self, sub: SubStream) -> bool:
+        """Turn one PROMISED companion into a file on disk. False = leave this
+        one out, and the flag it was lent goes back (see _restored_defaults).
+
+        Both kinds end here, so there is one answer to "did this companion
+        actually arrive": the demux writes an ASS companion itself, while an
+        image track arrives as a .sup that still has to be read.
+        """
+        if sub.codec in self._IMAGE_SUBS and not self._ocr_companion(sub):
+            return False
+        return self._sanitise_srt(self._companion_path(sub))
+
+    def _ocr_companion(self, sub: SubStream) -> bool:
+        """OCR one extracted image track into its .srt. False = no companion.
+
+        NOTHING HERE MAY FAIL THE JOB. By the time this runs the encode is
+        done - hours of it - and a subtitle nicety that raises would throw all
+        of it away. app.pgsocr.ocr_track already returns a reason rather than
+        raising, and the bare except is the second belt: a MemoryError, an
+        import that fails because numpy is not installed, a temp dir that
+        went read-only. Every one of them costs this one track its text copy
+        and nothing else.
+
+        A missing tesseract is not an error either, just a warning once per
+        track: the feature is on by default and an image without the binary
+        must still deliver the encode.
+        """
+        if shutil.which("tesseract") is None:
+            logger.warning("pgs_ocr_srt is on but tesseract is not installed; "
+                           "leaving s:{} ({}) as a picture", sub.pos, sub.language)
+            return False
+        try:
+            from app import pgsocr        # local: it pulls numpy in
+            workers = pgsocr.default_workers(int(sysres.cpu_budget()))
+            res = pgsocr.ocr_track(self._ocr_sup_path(sub), workers=workers)
+            if res.text is None:
+                logger.warning("no text copy of s:{} ({}{}): {}", sub.pos,
+                               sub.codec, f" {sub.language}" if sub.language else "",
+                               res.why)
+                return False
+            self._companion_path(sub).write_text(res.text, encoding="utf-8")
+            sig = res.signals or {}
+            # One line per track, with the numbers the gates were judged on -
+            # this is the only record of how well a track read. Gates that
+            # SKIPPED themselves are named too: oov_rate is the only signal
+            # here that tracks recognition quality rather than structure, and
+            # a short track (a forced or signs track, an extra) ships without
+            # it, so an operator who cannot see that cannot tell the two kinds
+            # of pass apart.
+            skipped = ", ".join(g["name"] for g in (res.gates or [])
+                                if g.get("skipped"))
+            logger.info(
+                "optimizer: OCR'd s:{} ({} {}) -> {} of {} cues in {:.1f}s "
+                "({} workers, {} chars, empty {:.1%}, fallback {:.1%}, "
+                "oov {:.1%}){}", sub.pos, sub.codec, sub.language or "und",
+                res.written, res.cues, res.seconds, workers,
+                sig.get("chars_total", 0), sig.get("empty_rate", 0.0),
+                sig.get("fallback_rate", 0.0), sig.get("oov_rate", 0.0),
+                f"; gates not applied: {skipped}" if skipped else "")
+            return True
+        except Exception as e:  # noqa: BLE001 - see the docstring
+            logger.warning("OCR of s:{} failed ({}); leaving it as a picture",
+                           sub.pos, e)
+            return False
+
+    def _companion_flags(self, sub: SubStream) -> Tuple[bool, bool, bool]:
+        """(default, forced, hearing_impaired) for the companion made from
+        `sub` - the only flags it is ever given, through EITHER muxer.
 
         One place, because the two muxers write it separately: mkvmerge takes
         --default-track-flag and --forced-display-flag, while the ffmpeg
@@ -5774,17 +5919,28 @@ class ShotEncoder:
         one through the other, decided by nothing but whether mkvmerge was
         there - two episodes of one season disagreeing.
 
-        `default` MOVES here: the companion takes it and the ASS it was made
+        `default` MOVES here: the companion takes it and the track it was made
         from is written without it (see _disposition_args). Copied, it left the
         output with TWO default subtitle tracks, and a player takes the first -
-        the ASS - which is the shape of the thing that made Plex pick the wrong
-        track in the first place, and it made the companion useless for the one
-        job it has. `forced` is copied and stays on both: a forced ASS and its
-        plain-text copy are both forced. The descriptive flags
-        (hearing_impaired and the rest) are not given to the companion at all;
-        they stay on the ASS track beside it, which is the track they describe.
+        the original - which is the shape of the thing that made Plex pick the
+        wrong track in the first place, and it made the companion useless for
+        the one job it has. `forced` is copied and stays on both: a forced
+        track and its plain-text copy are both forced.
+
+        `hearing_impaired` splits by what the companion IS, which is why this
+        returns three values and not two. For an ASS companion the descriptive
+        flags stay on the ASS beside it, which is the track they describe - the
+        companion is a rendering of the same cues in a poorer format. For an
+        OCR companion the srt is not a lesser copy of the picture, it is the
+        SAME subtitles as text, and an SDH PGS read off the screen is still
+        SDH: drop the flag and Plex stops labelling it SDH and offers it as
+        ordinary English, which is exactly the track a deaf viewer must not be
+        given. So the OCR companion carries it and the image track keeps it
+        too - unlike `default`, this one is copied, not moved.
         """
-        return sub.default, sub.forced
+        hearing = (sub.codec in self._IMAGE_SUBS
+                   and "hearing_impaired" in sub.flags.split("+"))
+        return sub.default, sub.forced, hearing
 
     def _companion_inputs(self, companions: List[SubStream]) -> List[str]:
         """Each companion as an mkvmerge input, with the flags it should carry.
@@ -5795,14 +5951,20 @@ class ShotEncoder:
         """
         args: List[str] = []
         for sub in companions:
-            default, forced = self._companion_flags(sub)
+            default, forced, hearing = self._companion_flags(sub)
             args += ["--sub-charset", "0:UTF-8"]
             if sub.language:
                 args += ["--language", f"0:{sub.language}"]
             args += ["--track-name", f"0:{self._companion_title(sub)}",
                      "--default-track-flag", "0:yes" if default else "0:no",
-                     "--forced-display-flag", "0:yes" if forced else "0:no",
-                     str(self._companion_path(sub))]
+                     "--forced-display-flag", "0:yes" if forced else "0:no"]
+            # Stated only when it is on. mkvmerge infers nothing here - the
+            # flag is off unless asked for - so an explicit "no" on every ASS
+            # companion would change a command shape that is already measured
+            # without changing a single finished file.
+            if hearing:
+                args += ["--hearing-impaired-flag", "0:yes"]
+            args.append(str(self._companion_path(sub)))
         return args
 
     def _companion_metadata(self, source: str,
@@ -5820,9 +5982,10 @@ class ShotEncoder:
         args: List[str] = []
         for i, sub in enumerate(companions):
             pos = kept + i
-            default, forced = self._companion_flags(sub)
-            value = "+".join(n for n, on in (("default", default),
-                                             ("forced", forced)) if on) or "0"
+            default, forced, hearing = self._companion_flags(sub)
+            value = "+".join(n for n, on in (
+                ("default", default), ("forced", forced),
+                ("hearing_impaired", hearing)) if on) or "0"
             if sub.language:
                 args += [f"-metadata:s:s:{pos}", f"language={sub.language}"]
             args += [f"-metadata:s:s:{pos}",
@@ -5959,10 +6122,17 @@ class ShotEncoder:
             # an HDR10 output.
             # The srt companions come out of this same demux, as extra outputs
             # of the one command (see _companion_outputs). Read before the
-            # flags, because a companion TAKES the default flag of the ASS it
+            # flags, because a companion TAKES the default flag of the track it
             # is made from. `planned` is that promise, made while they are
             # still only commands; whatever falls away after it is put back.
-            companions = self._companions(audio_src)
+            #
+            # Two kinds share one list, and the order is the order they are
+            # muxed in: the ASS copies first, then the English image tracks
+            # read off the picture. An image track's extra output is its own
+            # bitstream, and the OCR that turns it into text happens after
+            # this command, which is the only difference between them.
+            companions = (self._companions(audio_src)
+                          + self._ocr_companions(audio_src))
             planned = companions
             # The source's own flags, stated for every stream so that fftools
             # infers none (see _disposition_args). Probed once: the retry and
@@ -6013,10 +6183,13 @@ class ShotEncoder:
                                    "source's attachments")
                     self._run(base_args + ["-c:s", "copy", str(audio_subs)],
                               timeout=1800)
-            # A companion that could not be cleaned up is left out rather than
-            # shipped with srtenc's markup in it, and never fails the mux.
-            companions = [s for s in companions
-                          if self._sanitise_srt(self._companion_path(s))]
+            # A companion that could not be made is left out rather than
+            # shipped broken, and never fails the mux: an srt still carrying
+            # srtenc's markup, an image track whose OCR did not hold up, a
+            # file that came out empty. This is also where the OCR runs - the
+            # demux is finished by now, so nothing about it is on the critical
+            # path of the read (see _make_companion).
+            companions = [s for s in companions if self._make_companion(s)]
             # The flags again, now that it is known which companions there
             # really are: an ASS whose companion fell away - here, or in a
             # retry that left them all behind - keeps the default it lent it.
