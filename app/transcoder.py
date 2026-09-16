@@ -486,17 +486,30 @@ def run_full_transcode(
         if progress_cb:
             progress_cb(pct, stats)
 
+    # What the encode's own mux reported doing to the source's subtitle
+    # streams; nothing, for an engine that does no mux of ours (av1an).
+    subs_dropped = subs_added = 0
     try:
         if video.engine == "optimizer":
             from app.optimizer import run_shot_transcode
 
             logger.info("Starting optimizer engine (shot-based): {} -> {}", encode_input, output)
             t0 = time.monotonic()
-            run_shot_transcode(
+            mux = run_shot_transcode(
                 settings, info, plan, encode_input, output, tempdir,
                 log_path=log_path, progress_cb=on_progress, cancel_flag=cancel_flag,
                 stage_cb=stage_cb,
             )
+            # What that mux did to the source's subtitle streams, for the
+            # output check below: this engine drops the source's EMPTY
+            # subtitle tracks and can add an srt companion beside an ASS one,
+            # so the output's stream count is deliberately not the source's.
+            # Reported by the mux, never recomputed here - _verify_output also
+            # runs for the av1an engine, which does neither. A build (or a
+            # test stub) that returns nothing leaves this at "changed
+            # nothing", which is what the av1an branch is.
+            if mux is not None:
+                subs_dropped, subs_added = mux.dropped, mux.added
             logger.info("optimizer finished in {:.1f}s", time.monotonic() - t0)
         else:
             cmd = build_av1an_cmd(
@@ -511,7 +524,7 @@ def run_full_transcode(
             logger.info("av1an finished in {:.1f}s", time.monotonic() - t0)
 
         try:
-            _verify_output(settings, info, output)
+            _verify_output(settings, info, output, subs_dropped, subs_added)
         except TranscodeError:
             # A file that failed verification must not stay next to the source:
             # it is the thing that later gets mistaken for a finished archive.
@@ -600,7 +613,8 @@ def _cleanup_temp(tmp_files: List[Path], keep: bool) -> None:
             logger.warning("could not remove temp {}: {}", path, e)
 
 
-def _verify_output(settings: Settings, info: MediaInfo, output: Path) -> None:
+def _verify_output(settings: Settings, info: MediaInfo, output: Path,
+                   subtitles_dropped: int = 0, subtitles_added: int = 0) -> None:
     """Check the finished file against the source before the job is called done.
 
     Existence and a non-zero size were the only checks, so a truncated encode -
@@ -608,6 +622,12 @@ def _verify_output(settings: Settings, info: MediaInfo, output: Path) -> None:
     a success, and with transcode.delete_source that is the point at which the
     source gets deleted. Everything read here comes from the container header,
     so this costs one ffprobe rather than a pass over the file.
+
+    `subtitles_dropped` and `subtitles_added` are what the mux REPORTED doing
+    (see optimizer.MuxReport), not a predicate recomputed here: this runs for
+    both engines while only the optimizer engine muxes anything of ours, and
+    the numbers have to stay right when its settings are off and when its
+    detection degraded to keeping a track it could not read.
     """
     if not output.exists() or output.stat().st_size == 0:
         raise TranscodeError("the encoder produced no output file")
@@ -637,9 +657,15 @@ def _verify_output(settings: Settings, info: MediaInfo, output: Path) -> None:
     if out.audio_count != info.audio_count:
         problems.append(f"{out.audio_count} audio stream(s) against the "
                         f"source's {info.audio_count}")
-    if out.subtitle_count != info.subtitle_count:
+    # Still an equality, not a "<=": this check exists to catch a container
+    # silently refusing a stream, and a mux that drops or adds one says so.
+    expected_subs = max(0, info.subtitle_count - subtitles_dropped + subtitles_added)
+    if out.subtitle_count != expected_subs:
+        detail = (f" (the source's {info.subtitle_count}, "
+                  f"-{subtitles_dropped} empty, +{subtitles_added} srt)"
+                  if subtitles_dropped or subtitles_added else "")
         problems.append(f"{out.subtitle_count} subtitle stream(s) against the "
-                        f"source's {info.subtitle_count}")
+                        f"expected {expected_subs}{detail}")
     if problems:
         raise TranscodeError(
             f"output verification failed for {output.name}: " + "; ".join(problems))

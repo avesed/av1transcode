@@ -32,7 +32,8 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (Callable, Dict, Iterator, List, NamedTuple, Optional, Set,
+                    Tuple)
 
 from loguru import logger
 
@@ -106,20 +107,6 @@ def pick_crf(samples: List[Tuple[int, float]], target: float) -> float:
             return crf_lo + t * (crf_hi - crf_lo)
     # Non-monotone noise fallback: nearest sampled score.
     return float(min(pts, key=lambda p: abs(p[1] - target))[0])
-
-
-def _csv_first(line: str) -> str:
-    """The first field of one ffprobe `-of csv=p=0` line.
-
-    ffprobe prints a stream's child sections as extra fields even when only
-    one entry was asked for, so a stream with side data comes out as
-    "audio," rather than "audio". Every eac3 track in an mp4 carries an
-    "Audio Service Type" side data, so on the ATVP and DSNP WEB-DLs this
-    library is made of, `stream=codec_type` reads "video," "audio," - and a
-    membership test against "audio" said the file had no audio, the mux ran
-    video-only, and the output check failed every one of those jobs.
-    """
-    return line.split(",", 1)[0].strip()
 
 
 # What fftools prints at INFO when it tears a running filter graph down and
@@ -528,10 +515,16 @@ def run_shot_transcode(
     progress_cb: Optional[Callable[[float, Optional[dict]], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
     stage_cb: Optional[Callable[[str], None]] = None,
-) -> None:
-    """Run the full shot-based encode. Mirrors run_av1an's callback contract."""
-    ShotEncoder(settings, info, plan, source, output, tempdir, log_path,
-                progress_cb, cancel_flag, stage_cb).run()
+) -> "MuxReport":
+    """Run the full shot-based encode. Mirrors run_av1an's callback contract.
+
+    Returns what the final mux did to the source's subtitle streams, which
+    the output check needs and cannot work out for itself (see MuxReport).
+    """
+    enc = ShotEncoder(settings, info, plan, source, output, tempdir, log_path,
+                      progress_cb, cancel_flag, stage_cb)
+    enc.run()
+    return MuxReport(enc.subtitles_dropped, enc.subtitles_added)
 
 
 def _render_nodes() -> List[str]:
@@ -867,6 +860,71 @@ class GraphRebuilt(TranscodeError):
         super().__init__(f"ffmpeg rebuilt the filter graph of the {read}{where} ({reason})")
 
 
+class SubStream(NamedTuple):
+    """One subtitle stream of the mux source, as the subtitle plan sees it.
+
+    `pos` is what "-map 0:s:N" and "-map -0:s:N" count, `index` is the
+    ffprobe stream index the log line names; they differ on every source
+    whose subtitles are not its first streams. `empty` is None whenever the
+    signals could not decide, which always means KEEP.
+    """
+    index: int
+    pos: int
+    codec: str
+    flags: str                # the -disposition value: "+"-joined, or "0"
+    default: bool
+    forced: bool
+    language: str
+    title: str
+    empty: Optional[bool]
+    why: str                  # what decided `empty`, for the one log line
+
+
+class SubtitlePlan(NamedTuple):
+    """What the final mux knows about the source's audio and subtitles, from
+    ONE probe of it: which subtitles to keep, what codec each one is, and what
+    flags to state for every stream the remux writes.
+
+    It exists because those answers used to come from three separate ffprobes
+    feeding three independent enumerations of the same streams. That is the
+    shape the bug 4710560 fixed had: the numbering only has to drift in one of
+    them for the output to carry another stream's flags, and nothing says so.
+
+    `known` is False when the probe failed or could not be parsed. Then
+    nothing is dropped, no companion is made, and every caller degrades to the
+    behaviour it had before any of this existed - dropping a track is a
+    saving, never a correctness fix, so it is never worth a guess.
+    `drop` is the setting: with it off, emptiness is measured (the companion
+    rule needs it) but nothing is left out.
+    """
+    known: bool
+    drop: bool
+    audio: List[str]          # -disposition values, in output order
+    subs: List[SubStream]
+
+    @property
+    def kept(self) -> List[SubStream]:
+        """The subtitle streams the remux writes, in output order."""
+        return [s for s in self.subs if not (self.drop and s.empty is True)]
+
+    @property
+    def dropped(self) -> List[SubStream]:
+        return [s for s in self.subs if self.drop and s.empty is True]
+
+
+class MuxReport(NamedTuple):
+    """What the final mux did to the source's subtitle streams.
+
+    transcoder._verify_output compares stream counts and cannot recompute
+    this: it runs for the av1an engine too, which does no mux of ours at all,
+    and it has to stay right when the settings are off and when detection
+    degraded to keeping a track it could not read. So the mux reports, and
+    the check adds it to the source's count.
+    """
+    dropped: int = 0
+    added: int = 0
+
+
 class ShotEncoder:
     """Parallel shot-based encoder with per-shot interpolated CRF selection."""
 
@@ -933,6 +991,13 @@ class ShotEncoder:
         self._sycl_lock = threading.Lock()
         self._dataset_lock = threading.Lock()
         self._dataset_warned = False
+        # The mux's view of a source's streams, one probe per source (see
+        # _subtitle_plan), and what it then did to the subtitles - reported
+        # to the output check through run_shot_transcode.
+        self._sub_plans: Dict[str, SubtitlePlan] = {}
+        self._mkvmerge_ver: Optional[str] = None
+        self.subtitles_dropped = 0
+        self.subtitles_added = 0
         nodes = _render_nodes()
         self._gpu_vram = VramBudget(self._vram_budget_mb(), self._gpu_workers(),
                                     _render_pdev(nodes[0]) if nodes else None)
@@ -5230,26 +5295,23 @@ class ShotEncoder:
     # streams a Blu-ray remux carries, which are BITMAP subtitles: asking
     # ffmpeg to make srt out of them fails the whole job with "Subtitle
     # encoding currently only possible from text to text or bitmap to bitmap".
+    # ASS is deliberately NOT in here and must never be: srtenc drops \pos and
+    # \move outright (srt_move_cb is an empty stub) and writes drawing
+    # commands out as visible text, and a converted file makes the font
+    # attachments this mux carries dead weight. The plain-text copy goes
+    # BESIDE it instead - see _companions.
     _SUBS_NEEDING_CONVERSION = {"mov_text"}
 
-    def _subtitle_codec_args(self, source: str) -> List[str]:
-        """Per-stream -c:s arguments for remuxing `source`'s subtitles to mkv."""
-        try:
-            out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
-                             "-select_streams", "s",
-                             "-show_entries", "stream=codec_name",
-                             "-of", "csv=p=0", source], timeout=120)
-        except TranscodeError as e:
-            logger.warning("could not probe subtitle codecs ({}); copying", e)
-            return ["-c:s", "copy"]
-        codecs = [_csv_first(c) for c in out.splitlines() if _csv_first(c)]
-        if not codecs:
-            return ["-c:s", "copy"]
-        args: List[str] = []
-        for i, codec in enumerate(codecs):
-            convert = codec in self._SUBS_NEEDING_CONVERSION
-            args += [f"-c:s:{i}", "srt" if convert else "copy"]
-        return args
+    # The codecs libavcodec can encode srt FROM. It has no bitmap-to-text path
+    # at all (and no OCR), so this is a whitelist: a codec not named here is
+    # copied, because guessing wrong the other way costs the whole command.
+    _TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "mov_text", "text", "webvtt",
+                  "stl", "microdvd", "subviewer", "subviewer1", "jacosub",
+                  "sami", "realtext", "mpl2", "pjs", "vplayer"}
+
+    # What a player renders with libass. Both spellings occur: matroskadec
+    # maps S_TEXT/ASS to "ass" and S_TEXT/SSA to "ssa".
+    _ASS_SUBS = {"ass", "ssa"}
 
     # Every flag -disposition takes (libavformat/options.c), in ffmpeg's own
     # order. ffprobe prints a stream's flags under these same names.
@@ -5259,27 +5321,85 @@ class ShotEncoder:
                      "non_diegetic", "captions", "descriptions", "metadata",
                      "dependent", "still_image", "multilayer")
 
-    def _disposition_args(self, source: str) -> List[str]:
-        """-disposition arguments that put `source`'s own flags on every stream
-        a "-map a? -map s?" remux of it writes, in output order.
+    # ffprobe's codec_name against the Matroska codec ids mkvmerge prints for
+    # it: the one check that says the two tools are describing the same track
+    # (see _index_entries). A codec missing from here is not an error - it
+    # just cannot be checked, and then only the ordering vouches for it.
+    _MKV_CODEC_IDS = {
+        "subrip": ("S_TEXT/UTF8",),
+        "ass": ("S_TEXT/ASS", "S_TEXT/SSA"),
+        "ssa": ("S_TEXT/SSA", "S_TEXT/ASS"),
+        "webvtt": ("S_TEXT/WEBVTT",),
+        "hdmv_pgs_subtitle": ("S_HDMV/PGS",),
+        "hdmv_text_subtitle": ("S_HDMV/TEXTST",),
+        "dvd_subtitle": ("S_VOBSUB",),
+        "dvb_subtitle": ("S_DVBSUB",),
+    }
 
-        Left to itself, fftools marks the first stream of a type default when
-        the output holds more than one of that type and none of them is
-        (set_dispositions in ffmpeg_mux_init.c). Two PGS tracks with neither
-        default came out with the first one default, mkvmerge kept it, and
-        Plex picked that empty track and burned it in: 17 Stranger Things S04
-        outputs. One explicit -disposition turns the inference off for the
-        whole file; naming every stream leaves nothing to it.
+    # One probe, in json. NOT csv: ffprobe prints a stream's child sections as
+    # extra fields even when a single entry was asked for, so an eac3 track in
+    # an mp4 - every one of them carries "Audio Service Type" side data - comes
+    # out as "audio," and a membership test read that as no audio at all: the
+    # mux went video-only and the output check failed every ATVP and DSNP job.
+    # json cannot say that, and one parse of it answers every question below.
+    _PLAN_PROBE = ("format=format_name:stream=index,codec_type,codec_name,"
+                   "nb_frames,duration_ts:stream_disposition:stream_tags")
+
+    # `why` for a Matroska stream whose container should have counted its
+    # frames and did not - the one case mkvmerge gets asked about.
+    _NO_TAG = "no NUMBER_OF_FRAMES tag"
+
+    def _subtitle_plan(self, source: str) -> SubtitlePlan:
+        """`source`'s streams as one plan (see SubtitlePlan), probed once.
+
+        concat_shots asks four questions of it - is there anything to remux at
+        all, which subtitles are dropped, what codec is each kept one, what
+        flags do they carry - and the answer cannot change mid-mux, so it is
+        cached per source. The final phase is single-threaded.
         """
+        key = str(source)
+        if key in self._sub_plans:
+            return self._sub_plans[key]
+        plan = self._read_subtitle_plan(key)
+        if plan.dropped:
+            # once per job: what was left out, and what said it was empty
+            logger.info(
+                "optimizer: dropping {} empty subtitle stream(s) from {}: {}",
+                len(plan.dropped), Path(key).name,
+                "; ".join(f"s:{s.pos} (stream {s.index}) {s.codec}"
+                          f"{' ' + s.language if s.language else ''} {s.why}"
+                          for s in plan.dropped))
+        self._sub_plans[key] = plan
+        return plan
+
+    def _read_subtitle_plan(self, source: str) -> SubtitlePlan:
+        """The one probe behind _subtitle_plan, and what it makes of it."""
         kinds = {"audio": "a", "subtitle": "s"}
+        drop = bool(self.opt.drop_empty_subtitles)
+        # Emptiness also decides whether a track gets a companion, so it is
+        # measured for either setting - and for neither, not at all (it can
+        # cost a second tool, see _index_entries).
+        measure = drop or bool(self.opt.ass_srt_companion)
+        matroska = False
+        audio: List[str] = []
+        subs: List[SubStream] = []
         try:
             out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
-                             "-show_entries",
-                             "stream=index,codec_type:stream_disposition",
+                             "-show_entries", self._PLAN_PROBE,
                              "-of", "json", source], timeout=120)
             # _run folds stderr in: start at the JSON, past any error lines
             data, _ = json.JSONDecoder().raw_decode(out, out.index("{"))
-            values: Dict[str, List[str]] = {"a": [], "s": []}
+            fmt = str((data.get("format") or {}).get("format_name") or "")
+            matroska = "matroska" in fmt.split(",")
+            # Whether this file states any stream duration at all. A mov
+            # subtitle track with no cues reports duration_ts 0 and that is
+            # what says it is empty (see _stream_is_empty) - but a container
+            # that states no duration for ANYTHING, as a fragmented mp4 read
+            # without its fragments does, reports the same 0 for streams full
+            # of cues. Then the signal means "unknown", not "empty".
+            timed = any(str(s.get("duration_ts", "")).strip().isdigit()
+                        and int(s["duration_ts"]) > 0
+                        for s in data["streams"])
             for stream in data["streams"]:           # index order, as ffprobe lists
                 kind = kinds.get(stream.get("codec_type"))
                 if kind is None:
@@ -5291,30 +5411,492 @@ class ShotEncoder:
                     # naming a flag this ffmpeg lacks would fail the remux
                     logger.warning("dropping disposition flag(s) {} that "
                                    "ffmpeg does not take", ", ".join(unknown))
-                values[kind].append(
-                    "+".join(n for n in self._DISPOSITIONS if flags.get(n)) or "0")
+                value = "+".join(n for n in self._DISPOSITIONS
+                                 if flags.get(n)) or "0"
+                if kind == "a":
+                    audio.append(value)
+                    continue
+                tags = {str(k).lower(): str(v)
+                        for k, v in (stream.get("tags") or {}).items()}
+                empty, why = (self._stream_is_empty(stream, tags, matroska,
+                                                    timed)
+                              if measure else (None, "not measured"))
+                subs.append(SubStream(
+                    index=int(stream.get("index", -1)), pos=len(subs),
+                    codec=str(stream.get("codec_name") or ""), flags=value,
+                    default=bool(flags.get("default")),
+                    forced=bool(flags.get("forced")),
+                    language=tags.get("language", ""),
+                    title=tags.get("title", ""), empty=empty, why=why))
         except (TranscodeError, FileNotFoundError, ValueError, KeyError,
                 TypeError, AttributeError) as e:
-            # Not knowing the source's flags, clear the one that did the damage
-            # and leave the rest to ffmpeg's copy of the input. "-default" is
-            # prefixed, so it edits the copied flags instead of replacing them:
-            # the subtitles keep forced and the others, and the audio keeps
-            # exactly what it came with, a real default included. A genuine
-            # default subtitle lost costs a click in Plex; a false one costs a
-            # burn-in transcode. With a subtitle present, the audio's one change
-            # is that ffmpeg no longer invents a default among several tracks
-            # none of which is - the same guess, off for the whole file once a
-            # -disposition matches any stream. With no subtitle the option
-            # matches nothing and ffmpeg's old audio inference still applies.
-            logger.warning("could not probe the stream dispositions of {} ({}); "
-                           "clearing the default flag on its subtitles",
+            # Not knowing the source's streams, keep every subtitle it has and
+            # clear the one flag that did the damage, leaving the rest to
+            # ffmpeg's copy of the input. "-default" is prefixed, so it edits
+            # the copied flags instead of replacing them: the subtitles keep
+            # forced and the others, and the audio keeps exactly what it came
+            # with, a real default included. A genuine default subtitle lost
+            # costs a click in Plex; a false one costs a burn-in transcode.
+            # With a subtitle present, the audio's one change is that ffmpeg no
+            # longer invents a default among several tracks none of which is -
+            # the same guess, off for the whole file once a -disposition
+            # matches any stream. With no subtitle the option matches nothing
+            # and ffmpeg's old audio inference still applies.
+            logger.warning("could not probe the streams of {} ({}); muxing "
+                           "every subtitle it has and clearing the default "
+                           "flag on them", Path(source).name, e)
+            return SubtitlePlan(False, False, [], [])
+        if matroska and any(s.empty is None and s.why == self._NO_TAG
+                            for s in subs):
+            subs = self._index_entries(source, subs)
+        return SubtitlePlan(True, drop, audio, subs)
+
+    def _stream_is_empty(self, stream: dict, tags: Dict[str, str],
+                         matroska: bool,
+                         timed: bool) -> Tuple[Optional[bool], str]:
+        """Whether one subtitle stream carries no cues at all, and what said so.
+
+        True only on an explicit zero from a signal that counts cues; None -
+        "cannot tell" - for anything missing, unparseable or contradictory,
+        because the two mistakes do not cost the same. Keeping an empty track
+        costs one wrong entry in a player's menu. Dropping a real one destroys
+        the only copy of those subtitles: with transcode.delete_source the
+        source is gone minutes later.
+
+        Which signal is read depends on the container, and that is measured,
+        not a preference. Matroska carries mkvtoolnix/DVDFab statistics tags,
+        written per language as well (NUMBER_OF_FRAMES-eng), and leaves
+        nb_frames at N/A even for a 1448-cue PGS track.
+
+        mp4 has no such tag, and nb_frames CANNOT answer this however
+        promising it looks. ffprobe prints that field only when it is
+        non-zero - show_stream writes the optional "N/A" otherwise, which the
+        json writer suppresses - so a zero never reaches us; and the mov muxer
+        gives a cue-less mov_text track a padding sample anyway. Measured
+        here: a mov_text track whose only cue was cut away reads nb_frames
+        "1", never "0". What does say so is the track's own duration, which
+        the muxer sums from its samples - that same empty track reads
+        duration_ts 0, duration "0.000000" and no bit_rate at all, against
+        duration_ts 500000 for a ONE-cue track and 2709960000-2766642000 for
+        the eight real mov_text tracks of the ATVP WEB-DL in sample/. Two
+        guards keep that from ever being a guess: a sample table that counts
+        more than the muxer's padding wins over the header, and a file that
+        states no duration for any stream (`timed`) decides nothing at all.
+
+        ffprobe -count_packets is the ground truth and is unusable: it prints
+        N/A rather than 0 for a zero-packet stream - the very case - and it
+        reads the whole file, 390s for the first 600s of one output over NAS.
+        """
+        if matroska:
+            values = [v for k, v in tags.items()
+                      if k == "number_of_frames"
+                      or k.startswith("number_of_frames-")]
+            counts = [int(v) for v in values if re.fullmatch(r"\s*\d+\s*", v)]
+            if len(counts) != len(values):
+                return None, "unparseable NUMBER_OF_FRAMES"
+            if not counts:
+                return None, self._NO_TAG
+            # the language-suffixed copies hold the same number; take the
+            # largest, so any disagreement keeps the track
+            return max(counts) == 0, f"NUMBER_OF_FRAMES={max(counts)}"
+        nb = str(stream.get("nb_frames", "")).strip()
+        if nb.isdigit() and int(nb) > 1:
+            # more samples than the muxer's own padding: whatever the header
+            # says about the duration, this track has cues in it
+            return False, f"nb_frames={int(nb)}"
+        ts = str(stream.get("duration_ts", "")).strip()
+        if not ts.isdigit():
+            return None, "no duration_ts"
+        if int(ts) > 0:
+            # NOT "a short one is empty": a forced or signs track can hold a
+            # single cue, and it is then the only copy of that translation
+            # anywhere.
+            return False, f"duration_ts={int(ts)}"
+        if not timed:
+            return None, "no stream of this file states a duration"
+        return True, "duration_ts=0"
+
+    def _index_entries(self, source: str,
+                       subs: List[SubStream]) -> List[SubStream]:
+        """Fill the streams with no statistics tag in from `mkvmerge -J`.
+
+        Measured across the library: an empty PGS reports num_index_entries 0,
+        a real one 1034-1508 (matching its own tag exactly), an ASS track with
+        no tags 10-18, an untagged SRT 721; the read is header-only and costs
+        0.198-2.3s per file. It is worth a second tool because 25% of the
+        library's subtitle streams carry no tag at all - every mov_text, 280
+        of 281 ass, 380 subrip - and 497 of 5005 IMAGE streams, which are the
+        ones a player burns in.
+
+        Matroska only: on mp4 mkvmerge reports codec_id and num_index_entries
+        as None for every subtitle track, so there is nothing to read.
+
+        Not every mkvmerge reports it. v74 - the one in the image actually
+        deployed, which is bookworm-based where the Dockerfile's runtime stage
+        is ubuntu:24.04 and v82 - prints no num_index_entries property at all,
+        for any track, on a file it wrote itself with cues. That leaves this
+        fallback inert and every untagged stream kept, which is safe but
+        silent, so it says so once by name.
+
+        The mapping is the risk here, not the number. mkvmerge ids count
+        tracks while ffprobe indexes count streams, and matroskadec turns an
+        image attachment into a stream of its own, so the two lists are
+        matched by subtitle ORDER and then checked against each other's codec.
+        Anything that does not line up exactly leaves every stream as it was,
+        which is to say kept.
+        """
+        mkvmerge = self.settings.tools.mkvmerge
+        if not shutil.which(mkvmerge):
+            return subs
+        try:
+            proc = subprocess.run([mkvmerge, "-J", source], capture_output=True,
+                                  text=True, timeout=300)
+            tracks = [t for t in json.loads(proc.stdout).get("tracks", [])
+                      if t.get("type") == "subtitles"]
+        except (OSError, ValueError, TypeError, AttributeError,
+                subprocess.SubprocessError) as e:
+            logger.warning("mkvmerge could not index {} ({}); keeping every "
+                           "subtitle stream it would have answered for",
                            Path(source).name, e)
-            return ["-disposition:s", "-default"]
+            return subs
+        if tracks and not any("num_index_entries" in (t.get("properties") or {})
+                              for t in tracks):
+            logger.warning("{} reports no num_index_entries, so the subtitle "
+                           "streams of {} that carry no NUMBER_OF_FRAMES tag "
+                           "cannot be checked for cues and are all kept "
+                           "(mkvtoolnix v82, the one the image's runtime "
+                           "stage installs, does report it)",
+                           self._mkvmerge_version(mkvmerge), Path(source).name)
+            return subs
+        if len(tracks) != len(subs):
+            logger.warning("mkvmerge lists {} subtitle track(s) in {} where "
+                           "ffprobe lists {}; keeping them all", len(tracks),
+                           Path(source).name, len(subs))
+            return subs
+        for track, sub in zip(tracks, subs):
+            expect = self._MKV_CODEC_IDS.get(sub.codec)
+            found = str((track.get("properties") or {}).get("codec_id") or "")
+            if expect is not None and found.upper() not in expect:
+                logger.warning("mkvmerge reads subtitle track {} of {} as {} "
+                               "where ffprobe reads {}; keeping them all",
+                               track.get("id"), Path(source).name,
+                               found or "nothing", sub.codec)
+                return subs
+        out: List[SubStream] = []
+        for track, sub in zip(tracks, subs):
+            entries = (track.get("properties") or {}).get("num_index_entries")
+            if sub.empty is not None or not isinstance(entries, int):
+                out.append(sub)          # already decided, or nothing to add
+            else:
+                out.append(sub._replace(empty=entries == 0,
+                                        why=f"num_index_entries={entries}"))
+        return out
+
+    def _mkvmerge_version(self, mkvmerge: str) -> str:
+        """The first line of `mkvmerge --version`, for that one warning.
+
+        Cached: it is a second process, and the answer cannot change mid-job.
+        Only ever read once the fallback has already turned out to be inert,
+        so a tagged library never pays for it.
+        """
+        if self._mkvmerge_ver is None:
+            self._mkvmerge_ver = "this mkvmerge"
+            try:
+                proc = subprocess.run([mkvmerge, "--version"],
+                                      capture_output=True, text=True, timeout=60)
+                first = (proc.stdout or "").strip().splitlines()
+                if first:
+                    self._mkvmerge_ver = first[0].strip()
+            except (OSError, subprocess.SubprocessError, AttributeError):
+                pass                      # the name is a nicety, not the point
+        return self._mkvmerge_ver
+
+    def _subtitle_codec_args(self, source: str) -> List[str]:
+        """Per-stream -c:s arguments for remuxing `source`'s subtitles to mkv.
+
+        Numbered over the streams the remux KEEPS: "-c:s:N" addresses the
+        output, so a dropped stream renumbers every one after it.
+        """
+        plan = self._subtitle_plan(source)
+        kept = plan.kept
+        if not plan.known or not kept:
+            return ["-c:s", "copy"]
         args: List[str] = []
-        for kind in ("a", "s"):
-            for i, value in enumerate(values[kind]):
-                args += [f"-disposition:{kind}:{i}", value]
+        for i, sub in enumerate(kept):
+            convert = sub.codec in self._SUBS_NEEDING_CONVERSION
+            args += [f"-c:s:{i}", "srt" if convert else "copy"]
         return args
+
+    def _disposition_args(self, source: str,
+                          companions: Optional[List[SubStream]] = None) -> List[str]:
+        """-disposition arguments that put `source`'s own flags on every stream
+        a "-map a? -map s?" remux of it writes, in output order.
+
+        Left to itself, fftools marks the first stream of a type default when
+        the output holds more than one of that type and none of them is
+        (set_dispositions in ffmpeg_mux_init.c). Two PGS tracks with neither
+        default came out with the first one default, mkvmerge kept it, and
+        Plex picked that empty track and burned it in: 17 Stranger Things S04
+        outputs. One explicit -disposition turns the inference off for the
+        whole file; naming every stream leaves nothing to it.
+
+        Numbered over the KEPT streams, from the same plan the drop maps come
+        from, so the two cannot disagree about which stream is s:1.
+
+        `companions` are the srt copies written beside their ASS tracks (see
+        _companions), and each one TAKES the default flag off the track it was
+        made from: a player offered two default subtitle tracks takes the
+        first, which is the ASS, and the companion then exists for nothing -
+        being the track Plex can send instead of burning the picture in is the
+        whole point of it. Only that flag moves. Only for an ASS that really
+        gets a companion, and never for another track that happens to be
+        default too.
+
+        Measured on mkvmerge v82: it copies each track's flags out of
+        audio_subs.mkv and promotes nothing of its own, so for that muxer this
+        is what decides the flag in the finished file. The ffmpeg fallback mux
+        restates the same list over its own inputs, where it overrides what
+        they carry (measured: a default ASS in audio_subs.mkv came out with
+        the flag off). One list, stated twice, is what keeps the two muxers
+        from disagreeing.
+        """
+        plan = self._subtitle_plan(source)
+        if not plan.known:
+            return ["-disposition:s", "-default"]
+        moved = {sub.pos for sub in companions or [] if sub.default}
+        args: List[str] = []
+        for i, value in enumerate(plan.audio):
+            args += [f"-disposition:a:{i}", value]
+        for i, sub in enumerate(plan.kept):
+            value = sub.flags
+            if sub.pos in moved:
+                # the rest of the flags as they were, and "0" once nothing is
+                # left: an empty value is not a -disposition ffmpeg takes
+                value = "+".join(n for n in value.split("+")
+                                 if n != "default") or "0"
+            args += [f"-disposition:s:{i}", value]
+        return args
+
+    def _drop_args(self, source: str) -> List[str]:
+        """"-map -0:s:N?" for every subtitle stream of `source` with no cues.
+
+        Negative maps, not a positive map per kept stream: "-map 0:s?" has to
+        go on tolerating a source with no subtitles at all, and this way the
+        two retries below inherit the drop from base_args for free.
+
+        The trailing "?" is what stops the ordering being load-bearing. A
+        negative map that matches nothing is a hard parse failure in ffmpeg
+        9.0.1 ("Stream map '-0:s:0' matches no streams"), which is what a
+        negative map placed before its positive one amounts to; with the "?"
+        it is a no-op instead.
+        """
+        return [a for sub in self._subtitle_plan(source).dropped
+                for a in ("-map", f"-0:s:{sub.pos}?")]
+
+    def _companions(self, source: str) -> List[SubStream]:
+        """The kept ASS/SSA tracks that get a plain-text srt copy beside them.
+
+        Not a conversion: the ASS track is copied through untouched, and the
+        companion is an extra stream. Plex's own soft-subtitle target for the
+        Web client is ASS, so this buys nothing there - it is for the players
+        that have no ASS target and burn the picture instead. Never for a
+        track detected as empty: it would produce an empty file, and an empty
+        track is the thing this release exists to stop shipping.
+        """
+        if not self.opt.ass_srt_companion:
+            return []
+        plan = self._subtitle_plan(source)
+        if not plan.known:
+            return []
+        return [s for s in plan.kept
+                if s.codec in self._ASS_SUBS and s.empty is not True]
+
+    def _companion_path(self, sub: SubStream) -> Path:
+        return self.tempdir / f"sub_{sub.pos}.srt"
+
+    def _companion_title(self, sub: SubStream) -> str:
+        """A name that says what this track is, so nobody picks it expecting
+        the styling the ASS beside it carries."""
+        return f"{sub.title} (SRT)" if sub.title else "SRT (plain text)"
+
+    def _companion_outputs(self, companions: List[SubStream]) -> List[str]:
+        """Extra outputs on the command that already demuxes audio_subs.mkv.
+
+        One demux, measured: extracting all 42 subtitle tracks of a 2.2GB
+        source alongside the remux took 4.3s against 3.3s for the remux alone,
+        and produced 1.5MB of srt.
+        """
+        return [a for sub in companions
+                for a in ("-map", f"0:s:{sub.pos}", "-c:s", "srt",
+                          str(self._companion_path(sub)))]
+
+    # What srtenc writes into the text that is not text: the <font> wrapper it
+    # adds whenever the ASS style differs from its own defaults
+    # (srt_style_apply) and the "{\anN}" it copies through literally. \pos and
+    # \move never arrive - ass_split routes both to an empty callback - so
+    # there is nothing to strip for those, and nothing to recover either.
+    _SRT_JUNK = re.compile(r"</?font[^>]*>|\{\\an\d\}")
+
+    def _sanitise_srt(self, path: Path) -> bool:
+        """Strip that junk out of one companion. False = leave this one out.
+
+        Written back as UTF-8 without a BOM, which is what mkvmerge is then
+        told to expect (--sub-charset): it otherwise guesses from the locale
+        and mangles CJK.
+        """
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.warning("could not read the srt companion {} ({}); leaving "
+                           "it out", path.name, e)
+            return False
+        clean = self._SRT_JUNK.sub("", text)
+        if not clean.strip():
+            logger.warning("the srt companion {} came out empty; leaving it "
+                           "out", path.name)
+            return False
+        try:
+            path.write_text(clean, encoding="utf-8")
+        except OSError as e:
+            logger.warning("could not write the srt companion {} ({}); "
+                           "leaving it out", path.name, e)
+            return False
+        return True
+
+    def _companion_flags(self, sub: SubStream) -> Tuple[bool, bool]:
+        """(default, forced) for the companion made from `sub` - the only two
+        flags it is ever given, through EITHER muxer.
+
+        One place, because the two muxers write it separately: mkvmerge takes
+        --default-track-flag and --forced-display-flag, while the ffmpeg
+        fallback restated the ASS's whole -disposition value. An SDH ASS then
+        produced a hearing_impaired companion through one muxer and a plain
+        one through the other, decided by nothing but whether mkvmerge was
+        there - two episodes of one season disagreeing.
+
+        `default` MOVES here: the companion takes it and the ASS it was made
+        from is written without it (see _disposition_args). Copied, it left the
+        output with TWO default subtitle tracks, and a player takes the first -
+        the ASS - which is the shape of the thing that made Plex pick the wrong
+        track in the first place, and it made the companion useless for the one
+        job it has. `forced` is copied and stays on both: a forced ASS and its
+        plain-text copy are both forced. The descriptive flags
+        (hearing_impaired and the rest) are not given to the companion at all;
+        they stay on the ASS track beside it, which is the track they describe.
+        """
+        return sub.default, sub.forced
+
+    def _companion_inputs(self, companions: List[SubStream]) -> List[str]:
+        """Each companion as an mkvmerge input, with the flags it should carry.
+
+        The language and title come from the ASS the file was made from, and
+        the flags from _companion_flags, which the ffmpeg fallback reads too.
+        mkvmerge converts nothing itself, so the srt must already be srt.
+        """
+        args: List[str] = []
+        for sub in companions:
+            default, forced = self._companion_flags(sub)
+            args += ["--sub-charset", "0:UTF-8"]
+            if sub.language:
+                args += ["--language", f"0:{sub.language}"]
+            args += ["--track-name", f"0:{self._companion_title(sub)}",
+                     "--default-track-flag", "0:yes" if default else "0:no",
+                     "--forced-display-flag", "0:yes" if forced else "0:no",
+                     str(self._companion_path(sub))]
+        return args
+
+    def _companion_metadata(self, source: str,
+                            companions: List[SubStream]) -> List[str]:
+        """The same values for the ffmpeg fallback mux, which takes each .srt
+        as a bare input carrying no language or title of its own.
+
+        They are the last subtitle streams of the output, in the order they
+        are mapped, so their positions follow every kept one.
+
+        The flags are _companion_flags', not the ASS's own value: the same
+        track has to come out the same way whichever muxer ran.
+        """
+        kept = len(self._subtitle_plan(source).kept)
+        args: List[str] = []
+        for i, sub in enumerate(companions):
+            pos = kept + i
+            default, forced = self._companion_flags(sub)
+            value = "+".join(n for n, on in (("default", default),
+                                             ("forced", forced)) if on) or "0"
+            if sub.language:
+                args += [f"-metadata:s:s:{pos}", f"language={sub.language}"]
+            args += [f"-metadata:s:s:{pos}",
+                     f"title={self._companion_title(sub)}",
+                     f"-disposition:s:{pos}", value]
+        return args
+
+    def _restored_defaults(self, source: str, planned: List[SubStream],
+                           companions: List[SubStream]) -> List[str]:
+        """mkvmerge options giving audio_subs.mkv's own tracks back a default
+        flag a companion took and then did not use.
+
+        The remux states its flags before any companion exists as a file, so an
+        ASS whose companion fell away afterwards - a retry that left them
+        behind, an srt that came out empty - is already written without its
+        default. Measured on mkvmerge v82: it copies that file's flags and
+        promotes nothing of its own, so the output would then carry NO default
+        subtitle at all. The ffmpeg fallback restates the whole list and needs
+        nothing from here.
+
+        mkvmerge numbers tracks over the whole file, and the remux wrote every
+        audio stream and then every kept subtitle, so the subtitle at s:N is
+        track len(audio)+N (measured on an audio_subs.mkv: id=0 the audio, id=1
+        and id=2 the subtitles). Nothing is stated for a track that kept its
+        flag: mkvmerge exits 1 on a track id it cannot find, which would cost
+        the whole mkvmerge mux for an option that had nothing to say.
+        """
+        lost = ({sub.pos for sub in planned if sub.default}
+                - {sub.pos for sub in companions})
+        if not lost:
+            return []
+        plan = self._subtitle_plan(source)
+        return [a for i, sub in enumerate(plan.kept) if sub.pos in lost
+                for a in ("--default-track-flag", f"{len(plan.audio) + i}:yes")]
+
+    def _srt_retry_args(self, source: str,
+                        companions: List[SubStream]) -> Optional[List[str]]:
+        """Last-ditch -c:s for the ffmpeg fallback mux, after a plain "-c copy"
+        of audio_subs.mkv has already failed. None = do not retry at all.
+
+        This used to be a blanket "-c:s srt", which cannot work for a bitmap
+        track: libavcodec has no bitmap-to-text path, so on any source with a
+        PGS or VobSub stream the retry failed too, with the same "only
+        possible from text to text or bitmap to bitmap" that
+        _SUBS_NEEDING_CONVERSION exists to avoid. Said honestly: this is a
+        recovery path that was DEAD for bitmap subtitles, not a job-killer of
+        its own - it only ever runs once a plain copy has failed, and a job
+        that reaches it is already failing. Converting the text tracks only
+        gives it a chance on a mixed file instead of none.
+
+        And where a KEPT subtitle track exists but none of them is text,
+        there is nothing to try: the retry would be the command that just
+        failed, run again over the whole file. That is what None says.
+
+        A source with no subtitle stream at all is not that case, and must
+        not be confused with it. Its retry names no stream either way, so it
+        is the identical command run a second time - which is exactly what
+        this path was before any of this, and what rescues a mux that failed
+        transiently (an ENOSPC that cleared, an NFS hiccup on dirs.work).
+        """
+        plan = self._subtitle_plan(source)
+        if not plan.known:
+            return ["-c:s", "srt"]        # no plan, no idea which is which
+        args: List[str] = []
+        convertible = False
+        for i, sub in enumerate(plan.kept):
+            text = sub.codec in self._TEXT_SUBS
+            convertible = convertible or text
+            args += [f"-c:s:{i}", "srt" if text else "copy"]
+        for i in range(len(companions)):
+            args += [f"-c:s:{len(plan.kept) + i}", "copy"]     # already srt
+        if not plan.kept:
+            return args                   # nothing to convert, nothing to lose
+        return args if convertible else None
 
     def concat_shots(self, ivf_paths: List[Path],
                      shots: Optional[List[Shot]] = None) -> None:
@@ -5342,6 +5924,13 @@ class ShotEncoder:
         audio_src = str(self.info.path if self.info.path else self.source)
         audio_subs: Optional[Path] = self.tempdir / "audio_subs.mkv"
         dispositions: List[str] = []
+        restored: List[str] = []
+        # One probe, one plan, one set of stream numbers: which subtitles are
+        # kept, what codec each one is, which flags to restate and which get a
+        # companion all come from it, so the drop and the guard below cannot
+        # drift apart (see SubtitlePlan).
+        plan = self._subtitle_plan(audio_src)
+        companions: List[SubStream] = []
         if not self._has_audio_or_subs(audio_src):
             # Nothing to carry over, and asking anyway is actively dangerous:
             # "-map 0:a? -map 0:s?" against a video-only source maps NOTHING,
@@ -5355,6 +5944,10 @@ class ShotEncoder:
             logger.info("optimizer: source has no audio or subtitle streams; "
                         "muxing video only")
             audio_subs = None
+            # A source whose every subtitle is empty lands here, and those
+            # streams are still dropped - there is simply no remux to drop
+            # them in. The output check is told the same number either way.
+            self.subtitles_dropped = len(plan.dropped)
         else:
             # NB: no -map_metadata -1 here: it strips per-stream LANGUAGE tags
             # from the subtitle/audio streams (Plex then shows every subtitle
@@ -5364,13 +5957,23 @@ class ShotEncoder:
             # Matroska reader takes the segment title of every input
             # (maybe_set_segment_title). A "DV.HDR10.PLUS" title can land on
             # an HDR10 output.
+            # The srt companions come out of this same demux, as extra outputs
+            # of the one command (see _companion_outputs). Read before the
+            # flags, because a companion TAKES the default flag of the ASS it
+            # is made from. `planned` is that promise, made while they are
+            # still only commands; whatever falls away after it is put back.
+            companions = self._companions(audio_src)
+            planned = companions
             # The source's own flags, stated for every stream so that fftools
             # infers none (see _disposition_args). Probed once: the retry and
             # the ffmpeg fallback mux below write the same streams in the same
             # order.
-            dispositions = self._disposition_args(audio_src)
+            dispositions = self._disposition_args(audio_src, companions)
+            # The empty subtitle streams are left out here, in base_args, so
+            # that both retries below inherit the drop (see _drop_args).
             base_args = [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
                          "-i", audio_src, "-map", "0:a?", "-map", "0:s?",
+                         *self._drop_args(audio_src),
                          "-c:a", "copy", *dispositions]
             # The source's attachments too: the fonts its ASS subtitles are
             # styled with, without which a player substitutes its own and CJK
@@ -5386,9 +5989,14 @@ class ShotEncoder:
             try:
                 self._run(base_args + attachments
                           + self._subtitle_codec_args(audio_src)
-                          + [str(audio_subs)], timeout=1800)
+                          + [str(audio_subs)]
+                          + self._companion_outputs(companions), timeout=1800)
             except TranscodeError:
                 logger.warning("subtitle remux failed, retrying with a plain copy")
+                # Every retry goes without them. They are an addition, and
+                # this path is already one failure deep; the tracks the output
+                # must not lose are the source's own.
+                companions = []
                 try:
                     self._run(base_args + attachments
                               + ["-c:s", "copy", str(audio_subs)], timeout=1800)
@@ -5405,6 +6013,20 @@ class ShotEncoder:
                                    "source's attachments")
                     self._run(base_args + ["-c:s", "copy", str(audio_subs)],
                               timeout=1800)
+            # A companion that could not be cleaned up is left out rather than
+            # shipped with srtenc's markup in it, and never fails the mux.
+            companions = [s for s in companions
+                          if self._sanitise_srt(self._companion_path(s))]
+            # The flags again, now that it is known which companions there
+            # really are: an ASS whose companion fell away - here, or in a
+            # retry that left them all behind - keeps the default it lent it.
+            # This restates them for the ffmpeg fallback mux; audio_subs.mkv is
+            # written by now, so the mkvmerge mux is told per track instead
+            # (see _restored_defaults).
+            dispositions = self._disposition_args(audio_src, companions)
+            restored = self._restored_defaults(audio_src, planned, companions)
+            self.subtitles_dropped = len(plan.dropped)
+            self.subtitles_added = len(companions)
         # Final mux via mkvmerge: ffmpeg's -c copy remux of the concat leaves
         # the shot-boundary structure that Plex's 4K AV1 transcode hangs on
         # (runs for 10-20 min then stops producing HLS segments; verified on
@@ -5423,7 +6045,7 @@ class ShotEncoder:
             attachments_from = (audio_src if self._source_attachments(audio_src)
                                 else None)
             if self._mkvmerge_mux(mkvmerge, video_only, audio_subs,
-                                  attachments_from):
+                                  attachments_from, companions, restored):
                 return
             if attachments_from is not None:
                 # e.g. a source mkvmerge cannot parse (exit 2). What
@@ -5431,7 +6053,8 @@ class ShotEncoder:
                 # rebuild Plex needs is kept.
                 logger.warning("mkvmerge failed with {} as an attachment source; "
                                "muxing again without it", Path(audio_src).name)
-                if self._mkvmerge_mux(mkvmerge, video_only, audio_subs):
+                if self._mkvmerge_mux(mkvmerge, video_only, audio_subs,
+                                      None, companions, restored):
                     return
         logger.warning("mkvmerge unavailable or failed; falling back to ffmpeg mux")
         # fallback: global metadata comes from the first input (video_only,
@@ -5444,6 +6067,9 @@ class ShotEncoder:
         base += ["-i", str(video_only)]
         if audio_subs is not None:
             base += ["-i", str(audio_subs)]
+        # one input per companion, after audio_subs: inputs 2, 3, ...
+        for sub in companions:
+            base += ["-i", str(self._companion_path(sub))]
         base += ["-map", "0:v:0"]
         if audio_subs is not None:
             # audio_subs holds the source's audio then its subtitles, in order,
@@ -5452,8 +6078,14 @@ class ShotEncoder:
             # whatever attachments the remux copied - optional, as there are
             # none from an mp4. Image attachments and the source's UIDs are
             # what this path cannot keep (see the mkvmerge mux above).
-            base += ["-map", "1:a?", "-map", "1:s?", "-map", "1:t?",
-                     *dispositions]
+            base += ["-map", "1:a?", "-map", "1:s?", "-map", "1:t?"]
+        for i, _sub in enumerate(companions):
+            base += ["-map", f"{i + 2}:0"]
+        if audio_subs is not None:
+            base += [*dispositions]
+        # the companions come last, carrying the language, title and flags of
+        # the ASS track each was made from
+        base += self._companion_metadata(audio_src, companions)
         base += ["-c", "copy"]
         try:
             self._run(base + [str(self.output)], timeout=1800)
@@ -5463,36 +6095,43 @@ class ShotEncoder:
                     self.output.unlink()
                 except OSError:
                     pass
-            logger.warning("subtitle stream copy failed, converting subtitles to srt")
-            self._run(base + ["-c:s", "srt", str(self.output)], timeout=1800)
+            retry = self._srt_retry_args(audio_src, companions)
+            if retry is None:
+                # Nothing here can be turned into text - every subtitle the
+                # mux kept is a bitmap one - so this retry would be the
+                # command that just failed, run again over the whole file.
+                # Fail with the real error instead of paying for that.
+                logger.error("subtitle stream copy failed, and no subtitle in "
+                             "this file can be converted to text")
+                raise
+            logger.warning("subtitle stream copy failed, converting the text "
+                           "subtitles to srt")
+            self._run(base + retry + [str(self.output)], timeout=1800)
         if not self.output.exists() or self.output.stat().st_size == 0:
             raise TranscodeError("optimizer produced no output file")
 
     def _has_audio_or_subs(self, source: str) -> bool:
-        """Whether `source` has audio or subtitles for the remux to copy over.
+        """Whether `source` has audio, or a subtitle the remux will keep.
 
         Attachments do not count. mkvmerge takes every one of them from the
         source itself (see _source_attachments), images and UIDs included,
         which the remux's copy could not; for attachments alone that copy
         would serve only the ffmpeg fallback mux.
 
-        Assumed present when ffprobe cannot say: running the remux for nothing
-        wastes a pass, but skipping it wrongly silently drops the audio.
+        Read off the same plan as the drop, which is the only way the two can
+        agree: a source with audio and nothing but empty subtitles must still
+        be remuxed, and a source with ONLY empty subtitles must not - once
+        they are dropped that command maps zero streams, and ffmpeg with no
+        output stream allocates ~8.2GB before it exits (see concat_shots).
+
+        Assumed present when the probe cannot say, exactly as before: running
+        the remux for nothing wastes a pass, skipping it wrongly silently
+        drops the audio. Nothing is dropped in that case either.
         """
-        # One probe over every stream's type. NB not "-select_streams a,s":
-        # ffprobe takes a single stream specifier, not a list, and rejects that
-        # with "Invalid stream specifier" - which this method would then treat
-        # as "cannot tell", quietly restoring the behaviour it exists to avoid.
-        try:
-            out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
-                             "-show_entries", "stream=codec_type",
-                             "-of", "csv=p=0", source], timeout=120)
-        except (TranscodeError, FileNotFoundError) as e:
-            logger.warning("could not probe {} for audio/subtitle streams ({}); "
-                           "assuming there are some", Path(source).name, e)
+        plan = self._subtitle_plan(source)
+        if not plan.known:
             return True
-        kinds = {_csv_first(line) for line in out.splitlines()}
-        return bool(kinds & {"audio", "subtitle"})
+        return bool(plan.audio) or bool(plan.kept)
 
     def _source_attachments(self, source: str) -> bool:
         """Whether `source` is a Matroska file with attachments, for the final
@@ -5544,8 +6183,20 @@ class ShotEncoder:
 
     def _mkvmerge_mux(self, mkvmerge: str, video_only: Path,
                       audio_subs: Optional[Path],
-                      attachments_from: Optional[str] = None) -> bool:
+                      attachments_from: Optional[str] = None,
+                      companions: Optional[List[SubStream]] = None,
+                      remux_flags: Optional[List[str]] = None) -> bool:
         """Final mux with mkvmerge. Returns True on a valid output file.
+
+        `companions` are sanitised .srt files to add as tracks of their own,
+        after audio_subs.mkv's (see _companion_inputs). mkvmerge appends per
+        input file, so they land last, which is also where the ffmpeg fallback
+        puts them.
+
+        `remux_flags` are options for audio_subs.mkv itself - the default flag
+        of an ASS whose companion was promised and then did not arrive (see
+        _restored_defaults). An mkvmerge option applies to the file that
+        FOLLOWS it, so they go with that input and not with the companions.
 
         `attachments_from` is a source to take every attachment from, and
         nothing else: its tracks, chapters and tags are audio_subs.mkv's
@@ -5575,7 +6226,9 @@ class ShotEncoder:
             if audio_subs is not None:
                 if attachments_from is not None:
                     inputs.append("--no-attachments")
+                inputs += remux_flags or []
                 inputs.append(str(audio_subs))
+                inputs += self._companion_inputs(companions or [])
             if attachments_from is not None:
                 inputs += ["--no-video", "--no-audio", "--no-subtitles",
                            "--no-buttons", "--no-track-tags", "--no-chapters",

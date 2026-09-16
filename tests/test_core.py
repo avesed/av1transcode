@@ -260,6 +260,21 @@ def test_settings_page_covers_every_editable_optimizer_field():
     assert not missing, f"not on the settings form and not exempt: {sorted(missing)}"
 
 
+def test_settings_page_rail_lists_every_optimizer_group():
+    """The left rail is hand-written HTML while the groups themselves are
+    rendered from OPT_GROUPS, so a new group appears in the page and not in
+    the rail unless someone remembers both. The switch a user goes looking for
+    is the one that just dropped a track they wanted.
+    """
+    import re
+    from pathlib import Path
+
+    html = Path("app/static/settings.html").read_text()
+    groups = re.findall(r'\{ id: "(grp-\w+)"', html)
+    rail = re.findall(r'href="#(grp-\w+)"', html)
+    assert groups and rail == groups, f"rail {rail} against groups {groups}"
+
+
 def test_config_yaml_documents_every_optimizer_field():
     """config.yaml is the only documentation most of these knobs have. A field
     that exists in the model but not in the shipped config is one a user can
@@ -328,6 +343,38 @@ def test_verify_output_rejects_lost_subtitles(settings, monkeypatch, tmp_path):
 
     with pytest.raises(TranscodeError, match="subtitle"):
         _verify(settings, monkeypatch, tmp_path, _out_info(tmp_path, subs=1))
+
+
+def test_verify_output_counts_what_the_mux_reported(settings, monkeypatch,
+                                                    tmp_path):
+    """The optimizer engine leaves the source's EMPTY subtitle tracks out and
+    can add an srt companion beside an ASS one, so the output deliberately
+    does not match the source. The numbers come from what that mux reported
+    doing - this check also runs for the av1an engine, which does neither, and
+    has to stay right when the settings are off or when detection degraded to
+    keeping a track it could not read."""
+    from app import transcoder
+    from app.transcoder import TranscodeError
+
+    out = tmp_path / "out.av1.mkv"
+    out.write_bytes(b"x" * 1024)
+    src = _src_info(tmp_path)                     # three subtitle streams
+
+    def verify(subs, dropped=0, added=0):
+        monkeypatch.setattr(transcoder, "analyze",
+                            lambda _s, _p: _out_info(out, subs=subs))
+        transcoder._verify_output(settings, src, out, dropped, added)
+
+    verify(1, dropped=2)                          # two empty tracks left out
+    verify(4, added=1)                            # one srt companion added
+    verify(2, dropped=2, added=1)                 # both at once
+    verify(3)                                     # av1an: nothing changed
+    # the same output from an engine that dropped nothing is still a fault,
+    # and so is a track lost on top of the ones the mux accounted for
+    with pytest.raises(TranscodeError, match="subtitle"):
+        verify(1)
+    with pytest.raises(TranscodeError, match="subtitle"):
+        verify(0, dropped=2)
 
 
 def test_verify_output_rejects_an_unprobeable_file(settings, monkeypatch, tmp_path):
@@ -454,6 +501,26 @@ def test_run_full_transcode_keeps_a_verified_output(settings, monkeypatch, tmp_p
     transcoder.run_full_transcode(settings, info, plan, src, out)
     assert out.exists()
     assert list(settings.dirs.work.iterdir()) == []
+
+
+def test_run_full_transcode_verifies_against_the_muxs_own_report(
+        settings, monkeypatch, tmp_path):
+    """The engine's mux says what it did to the subtitle streams and the check
+    adds that to the source's count. A source with three of them, two empty
+    and one ASS, comes out with two: one kept plus its srt companion."""
+    from app import optimizer, transcoder
+
+    info, plan, src, out = _full_transcode_fixture(settings, tmp_path)
+
+    def encode(_s, _i, _p, _src, output, _tempdir, **_kw):
+        Path(output).write_bytes(b"good output")
+        return optimizer.MuxReport(dropped=2, added=1)
+
+    monkeypatch.setattr(optimizer, "run_shot_transcode", encode)
+    monkeypatch.setattr(transcoder, "analyze",
+                        lambda _s, _p: _out_info(out, subs=2))
+    transcoder.run_full_transcode(settings, info, plan, src, out)
+    assert out.exists()
 
 
 def test_analyze_records_the_video_streams_lead(settings, monkeypatch, tmp_path):

@@ -618,6 +618,34 @@ class OptimizerSettings(BaseModel):
     verify_shots: int = 10
     # Keep per-shot probe files in the temp dir for debugging.
     keep_probes: bool = False
+    # Leave the source's EMPTY subtitle tracks out of the output.
+    #
+    # Plex auto-selected one of those on a 4K HDR output of ours and, PGS
+    # being a bitmap format it has no soft target for, burned it into the
+    # picture: the whole video re-encoded at 0.2-0.9x real time with the
+    # transcoder at ~660% CPU, 16 threads all inside the subtitle overlay's
+    # scale, once per frame - for a track with nothing in it. Measured over
+    # the finished library: 4349 of 5344 files carry subtitles, 110 image
+    # streams are empty by their own tag, and 42 of our own 45 outputs carry
+    # nothing but empty tracks.
+    # Detection is header-only and degrades to KEEPING the track at every
+    # step (see ShotEncoder._stream_is_empty): a wrong drop destroys the only
+    # copy of those subtitles - with transcode.delete_source the source is
+    # gone - while a wrong keep costs one menu entry. false = mux every
+    # subtitle stream the source has, exactly as before.
+    drop_empty_subtitles: bool = True
+    # Add a plain-text srt copy beside every ASS/SSA track kept from the
+    # source. The ASS track itself is untouched: this is a companion, never a
+    # conversion.
+    #
+    # It rides on the demux that already builds audio_subs.mkv (one extra
+    # output on the same ffmpeg command, ~35KB per track), and gives a player
+    # that will not render ASS something to show other than a burn-in. What
+    # it cannot be is a replacement: ffmpeg's srt encoder writes <font> tags
+    # and a literal {\anN} into the text (both stripped again, see
+    # ShotEncoder._sanitise_srt) and silently drops \pos and \move, so a
+    # typeset or signs track converts badly. That is what the ASS is for.
+    ass_srt_companion: bool = True
 
 
 class DolbyVision(BaseModel):

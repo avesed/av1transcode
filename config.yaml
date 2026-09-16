@@ -350,6 +350,33 @@ transcode:
                                  # 来自 probe_max_frames 对长镜头的截断。
     fractional_crf: false        # pass decimal CRF to SVT-AV1 (needs support)
     keep_probes: false           # keep per-shot probe files for debugging
+    drop_empty_subtitles: true   # 丢掉源里"一条字幕都没有"的空字幕轨(默认开)。
+                                 # 起因: Plex 在一集 4K HDR 输出上自动选中了一条空的 PGS 轨,
+                                 # 而 PGS 是图形字幕、服务器没有对应的软字幕目标格式, 于是整个画面
+                                 # 被重编码来烧字幕: 0.2-0.9 倍速、转码进程约 660% CPU
+                                 # (16 个线程全耗在字幕叠加的 scale 上, 每帧一次), 而那条轨里
+                                 # 什么都没有。成品库实测: 5344 个文件里 4349 个带字幕, 110 条
+                                 # 图形字幕轨按自身 tag 就是空的; 我们自己发出去的 45 个输出里,
+                                 # 42 个的字幕轨全是空的。
+                                 # 判定只读文件头: mkv 看 NUMBER_OF_FRAMES 统计 tag(含 -eng 这种
+                                 # 带语言后缀的副本), 没有 tag 再用 mkvmerge -J 的
+                                 # num_index_entries(实测每个文件 0.198-2.3 秒; 但 v74 压根不报这个
+                                 # 属性, 遇到就整份保留并打一条日志); mp4 看轨道自己的时长
+                                 # duration_ts —— nb_frames 用不了: ffprobe 只在非零时才打印它,
+                                 # 而且 mov 会给没有字幕的轨补一个 padding sample, 实测空轨读出来
+                                 # 是 "1"; 空轨 duration_ts=0, 单条字幕的轨是 500000, 真实的
+                                 # ATVP mov_text 轨是 27 亿。
+                                 # 任何一步读不到、读不懂、两个工具对不上, 一律保留 —— 丢错一条
+                                 # 等于毁掉那份字幕的唯一副本(开了 delete_source 源文件已经没了),
+                                 # 留错一条只是菜单里多一项。false = 和以前一样全部复制。
+    ass_srt_companion: true      # 每条保留下来的 ASS/SSA 字幕旁边再挂一条纯文本 srt(默认开)。
+                                 # ASS 轨本身原样保留、绝不转换: 这是"附加"而不是"替换"。
+                                 # 它搭在本来就要跑的那一次 demux 上(同一条 ffmpeg 命令多一个输出),
+                                 # 每条约 35KB, 给那些不渲染 ASS、只会烧字幕的播放器一个软字幕选择。
+                                 # 它不能反过来当替代品: ffmpeg 的 srt 编码器会往文本里写 <font>
+                                 # 标签和字面的 {\anN}(这两样会被清掉), 而 \pos/\move 是它自己
+                                 # 直接丢弃的, 所以特效/排版字幕转出来一定是坏的 —— ASS 就是为
+                                 # 这个留着的。
 
   hdr:
     preserve: true             # keep mastering display / CLL on output

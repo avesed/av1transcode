@@ -1875,11 +1875,13 @@ def test_ssimulacra2_error_names_the_missing_plugins(settings, info, plan, tmp_p
 
 
 # ---- subtitle codec selection for the mux ----
-def _sub_args(enc, probe_out, fail=False):
+def _sub_args(enc, *streams, fail=False, **kw):
+    """_subtitle_codec_args against a stubbed plan probe of `streams`
+    (see _probe_json)."""
     def fake_run(self, args, timeout=None):
         if fail:
             raise opt.TranscodeError("ffprobe exploded")
-        return probe_out
+        return _probe_json(*streams, **kw)
     enc._run = fake_run.__get__(enc)
     return enc._subtitle_codec_args("/x/src.mkv")
 
@@ -1889,7 +1891,7 @@ def test_bitmap_subtitles_are_copied_not_converted(settings, info, plan, tmp_pat
     it fails the entire job: "Subtitle encoding currently only possible from
     text to text or bitmap to bitmap"."""
     enc = make_encoder(settings, info, plan, tmp_path)
-    args = _sub_args(enc, "hdmv_pgs_subtitle\nhdmv_pgs_subtitle\n")
+    args = _sub_args(enc, ("subtitle", set()), ("subtitle", set()))
     assert args == ["-c:s:0", "copy", "-c:s:1", "copy"]
     assert "srt" not in args
 
@@ -1897,12 +1899,28 @@ def test_bitmap_subtitles_are_copied_not_converted(settings, info, plan, tmp_pat
 def test_mov_text_is_still_converted(settings, info, plan, tmp_path):
     """tx3g only exists in MP4 - Matroska cannot carry it, so it must convert."""
     enc = make_encoder(settings, info, plan, tmp_path)
-    assert _sub_args(enc, "mov_text\n") == ["-c:s:0", "srt"]
+    assert _sub_args(enc, ("subtitle", set(), {"codec_name": "mov_text"}),
+                     fmt="mov,mp4,m4a,3gp,3g2,mj2") == ["-c:s:0", "srt"]
+
+
+def test_ass_is_copied_never_converted(settings, info, plan, tmp_path):
+    """The whole point of the companion track: an ASS converted IN PLACE loses
+    \\pos and \\move (srt_move_cb is an empty stub), turns drawing commands into
+    visible text, and leaves the font attachments this mux carries with nothing
+    to style. Pinned, because "just convert it" keeps looking like the fix."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert opt.ShotEncoder._SUBS_NEEDING_CONVERSION == {"mov_text"}
+    args = _sub_args(enc, ("subtitle", set(), {"codec_name": "ass"}),
+                     ("subtitle", set(), {"codec_name": "ssa"}))
+    assert args == ["-c:s:0", "copy", "-c:s:1", "copy"]
 
 
 def test_mixed_subtitle_codecs_are_handled_per_stream(settings, info, plan, tmp_path):
     enc = make_encoder(settings, info, plan, tmp_path)
-    args = _sub_args(enc, "mov_text\nhdmv_pgs_subtitle\nsubrip\ndvd_subtitle\n")
+    args = _sub_args(enc, ("subtitle", set(), {"codec_name": "mov_text"}),
+                     ("subtitle", set()),
+                     ("subtitle", set(), {"codec_name": "subrip"}),
+                     ("subtitle", set(), {"codec_name": "dvd_subtitle"}))
     assert args == ["-c:s:0", "srt", "-c:s:1", "copy",
                     "-c:s:2", "copy", "-c:s:3", "copy"]
 
@@ -1911,8 +1929,8 @@ def test_subtitle_probe_failure_falls_back_to_copy(settings, info, plan, tmp_pat
     """Copy is the safe default: it is right for every codec except tx3g,
     whereas srt is wrong for every bitmap one and kills the job."""
     enc = make_encoder(settings, info, plan, tmp_path)
-    assert _sub_args(enc, "", fail=True) == ["-c:s", "copy"]
-    assert _sub_args(enc, "\n") == ["-c:s", "copy"]
+    assert _sub_args(enc, fail=True) == ["-c:s", "copy"]
+    assert _sub_args(enc, ("video", set()), ("audio", set())) == ["-c:s", "copy"]
 
 
 # ---- fractional CRF must reach SVT-AV1, not ffmpeg's integer -crf option ----
@@ -2811,8 +2829,8 @@ def test_video_only_source_skips_the_audio_remux(settings, info, plan, tmp_path,
         args = [str(a) for a in args]
         ran.append(args)
         if "ffprobe" in args[0]:
-            if "stream=codec_type" in args:
-                return "video\n"           # video only: nothing to remux
+            if opt.ShotEncoder._PLAN_PROBE in args:
+                return _probe_json(("video", set()))   # video only: nothing to remux
             return ""
         Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
         return ""
@@ -2841,9 +2859,10 @@ def test_source_with_audio_still_gets_remuxed(settings, info, plan, tmp_path,
         args = [str(a) for a in args]
         ran.append(args)
         if "ffprobe" in args[0]:
-            if "stream=codec_type" in args:
-                return "video\naudio\n"    # an audio stream is present
-            return ""                      # ... but no subtitle streams
+            if opt.ShotEncoder._PLAN_PROBE in args:
+                # an audio stream is present, but no subtitle streams
+                return _probe_json(("video", set()), ("audio", {"default"}))
+            return ""
         Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
         return ""
 
@@ -2914,32 +2933,93 @@ def test_audio_detection_survives_ffprobes_trailing_csv_fields(settings, info, p
     no audio at all: the mux went video-only and the output check failed the
     job. Measured on every ATVP/DSNP mp4 tried."""
     enc = make_encoder(settings, info, plan, tmp_path)
-    enc._run = (lambda self, args, timeout=None: "video,\naudio,\naudio,\n").__get__(enc)
+    side_data = {"side_data_list": [{"side_data_type": "Audio Service Type"}]}
+    probe = _probe_json(("video", set()), ("audio", {"default"}, side_data),
+                        ("audio", set(), side_data),
+                        ("subtitle", set(), {"codec_name": "mov_text",
+                                             "nb_frames": "923"}),
+                        fmt="mov,mp4,m4a,3gp,3g2,mj2")
+    probes = []
+
+    def fake_run(self, args, timeout=None):
+        probes.append([str(a) for a in args])
+        return probe
+
+    enc._run = fake_run.__get__(enc)
     assert enc._has_audio_or_subs("x.mp4") is True
-    enc._run = (lambda self, args, timeout=None: "video,\n").__get__(enc)
-    assert enc._has_audio_or_subs("x.mp4") is False
-
-
-def test_subtitle_codecs_survive_trailing_csv_fields_too(settings, info, plan, tmp_path):
-    enc = make_encoder(settings, info, plan, tmp_path)
-    enc._run = (lambda self, args, timeout=None: "mov_text,\nhdmv_pgs_subtitle\n").__get__(enc)
-    assert enc._subtitle_codec_args("x.mp4") == ["-c:s:0", "srt", "-c:s:1", "copy"]
+    assert enc._subtitle_codec_args("x.mp4") == ["-c:s:0", "srt"]
+    # and one probe answered both: the plan is read once per source
+    assert len(probes) == 1
+    enc._run = (lambda self, args, timeout=None:
+                _probe_json(("video", set()))).__get__(enc)
+    assert enc._has_audio_or_subs("y.mp4") is False
 
 
 # ---- stream dispositions through the audio/subtitle remux and the final mux ----
-def _probe_json(*streams):
-    """ffprobe -of json for (codec_type, set flags) streams, every known flag
-    printed as 0 or 1 the way ffprobe prints them."""
-    return json.dumps({"streams": [
-        {"index": i, "codec_type": kind,
-         "disposition": {n: int(n in flags) for n in opt.ShotEncoder._DISPOSITIONS}}
-        for i, (kind, flags) in enumerate(streams)]}, indent=4)
+def _probe_json(*streams, fmt="matroska,webm"):
+    """ffprobe -of json for the one plan probe of the mux source.
+
+    Each stream is (codec_type, set of its set flags), optionally with a third
+    member overriding codec_name, nb_frames, duration_ts or tags. Every known
+    disposition flag is printed as 0 or 1, the way ffprobe prints them, and a
+    subtitle stream comes with a frame count AND a duration that say it is NOT
+    empty - the tests about emptiness override those.
+
+    duration_ts is a json number here because that is how ffprobe prints it,
+    and every stream carries one: a file that states no duration anywhere is
+    its own case (see the fragmented-mp4 test).
+    """
+    codecs = {"video": "hevc", "audio": "eac3", "subtitle": "hdmv_pgs_subtitle"}
+    out = []
+    for i, stream in enumerate(streams):
+        kind, flags = stream[0], stream[1]
+        extra = dict(stream[2]) if len(stream) > 2 else {}
+        st = {"index": i, "codec_type": kind,
+              "codec_name": extra.pop("codec_name", codecs.get(kind, "")),
+              "duration_ts": 2709960000,
+              "disposition": {n: int(n in flags)
+                              for n in opt.ShotEncoder._DISPOSITIONS}}
+        if kind == "subtitle":
+            st["nb_frames"] = "1448"
+            st["tags"] = {"NUMBER_OF_FRAMES": "1448"}
+        st.update(extra)
+        out.append(st)
+    return json.dumps({"streams": out, "format": {"format_name": fmt}}, indent=4)
 
 
-def _mux_with(enc, monkeypatch, probe, fail=lambda args: False):
-    """concat_shots down the ffmpeg fallback mux, with `probe` as what the
-    disposition probe prints (raised instead when it is an exception) and
-    `fail` picking the commands that fail. Returns every command run."""
+# What ffmpeg's srt encoder writes out of an ASS cue, measured on n9.0.1: the
+# <font> wrapper it adds whenever the style differs from its own defaults, and
+# {\anN} copied through into the text. \pos and \move never appear - the
+# splitter routes both to an empty callback - and <i> does survive.
+_SRTENC_OUT = ("1\n00:00:00,200 --> 00:00:01,500\n"
+               '<font face="Source Han Sans SC Medium" size="24">'
+               "{\\an8}人多力量大</font>\n\n"
+               "2\n00:00:02,000 --> 00:00:03,000\n<i>italics survive</i>\n\n")
+
+
+def _write_outputs(args, srt=None):
+    """Write whatever the command was about to write. An output is an argument
+    that is not an option, not the value of one, and not an input - which a
+    remux with an srt companion beside it needs, since its own .mkv is no
+    longer the last argument.
+
+    `srt` overrides what an .srt output gets, for the companion that comes out
+    with nothing in it - "" included, which is the case that matters."""
+    for i, a in enumerate(args):
+        if not i or a.startswith("-") or args[i - 1] == "-i":
+            continue
+        if a.endswith(".srt"):
+            Path(a).write_text(_SRTENC_OUT if srt is None else srt,
+                               encoding="utf-8")
+        elif a.endswith((".mkv", ".ivf")):
+            Path(a).write_bytes(b"\x1aE\xdf\xa3")
+
+
+def _mux_with(enc, monkeypatch, probe, fail=lambda args: False, srt=None):
+    """concat_shots down the ffmpeg fallback mux, with `probe` as what the one
+    plan probe prints (raised instead when it is an exception), `fail` picking
+    the commands that fail and `srt` what an extracted companion contains.
+    Returns every command run."""
     monkeypatch.setattr(opt.shutil, "which",
                         lambda n, *a, **k: None if "mkvmerge" in n else f"/usr/bin/{n}")
     enc._lead_of = lambda path: 0.0
@@ -2949,16 +3029,14 @@ def _mux_with(enc, monkeypatch, probe, fail=lambda args: False):
         args = [str(a) for a in args]
         ran.append(args)
         if "ffprobe" in args[0]:
-            if "stream=codec_type" in args:
-                return "video\naudio\nsubtitle\n"
-            if "stream=index,codec_type:stream_disposition" in args:
+            if opt.ShotEncoder._PLAN_PROBE in args:
                 if isinstance(probe, Exception):
                     raise probe
                 return probe
-            return "hdmv_pgs_subtitle\nhdmv_pgs_subtitle\n"      # subtitle codecs
+            return ""
         if fail(args):
             raise opt.TranscodeError("mux failed")
-        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        _write_outputs(args, srt)
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2980,7 +3058,15 @@ def _dispositions(cmd):
 
 
 def _remuxes(ran):
-    return [a for a in ran if a[-1].endswith("audio_subs.mkv")]
+    """The commands that WRITE audio_subs.mkv.
+
+    Not "the last argument is it": an srt companion is an extra output of that
+    same command, after it. And not "it appears anywhere" either - the final
+    mux takes the same file as an input.
+    """
+    return [a for a in ran
+            if any(x.endswith("audio_subs.mkv") and a[i - 1] != "-i"
+                   for i, x in enumerate(a) if i)]
 
 
 def test_remux_states_every_disposition_so_no_subtitle_is_made_default(
@@ -3027,9 +3113,11 @@ def test_retries_and_the_ffmpeg_fallback_mux_carry_the_same_dispositions(
             return True                  # per-stream codec remux: plain-copy retry
         return args[-1] == str(enc.output) and "srt" not in args   # srt retry
 
+    # one bitmap track and one text one: the srt retry has something it can
+    # actually convert (see _srt_retry_args)
     ran = _mux_with(enc, monkeypatch, _probe_json(
-        ("video", {"default"}), ("audio", {"default"}),
-        ("subtitle", set()), ("subtitle", {"default", "forced"})), fail)
+        ("video", {"default"}), ("audio", {"default"}), ("subtitle", set()),
+        ("subtitle", {"default", "forced"}, {"codec_name": "subrip"})), fail)
     remux, retry = _remuxes(ran)
     final, final_srt = [a for a in ran if a[-1] == str(enc.output)]
     assert "-c:s:0" in remux and "-c:s:0" not in retry
@@ -3038,8 +3126,8 @@ def test_retries_and_the_ffmpeg_fallback_mux_carry_the_same_dispositions(
                 ("-disposition:s:1", "default+forced")]
     for cmd in (remux, retry, final, final_srt):
         assert _dispositions(cmd) == expected
-    # the one probe of the source serves all four
-    assert sum("stream=index,codec_type:stream_disposition" in a for a in ran) == 1
+    # the one probe of the source serves all four commands
+    assert sum(opt.ShotEncoder._PLAN_PROBE in a for a in ran) == 1
     assert enc.output.exists()
 
 
@@ -3061,7 +3149,10 @@ def test_a_failed_disposition_probe_clears_subtitle_defaults_and_goes_on(
         # ffmpeg copies from the source
         assert _dispositions(cmd) == [("-disposition:s", "-default")]
     assert enc.output.exists()
-    assert any("stream dispositions" in str(w[0]) for w in warnings)
+    assert any("could not probe the streams" in str(w[0]) for w in warnings)
+    # and nothing is dropped on a plan nobody could read
+    assert enc.subtitles_dropped == 0
+    assert not any(a.startswith("-0:s") for cmd in (remux, final) for a in cmd)
 
 
 def test_disposition_probe_reads_past_error_lines_and_drops_unknown_flags(
@@ -3144,10 +3235,12 @@ def _attachment_probe(format_name, *streams):
         for kind, pic in streams], "format": {"format_name": format_name}}, indent=4)
 
 
-def _concat_via_mkvmerge(enc, monkeypatch, kinds, probe, rc=lambda cmd: 0):
-    """concat_shots down the mkvmerge mux, with `kinds` as what the stream
-    type probe prints and `probe` as what the attachment probe prints (raised
-    when an exception). `rc` gives each mkvmerge run its exit code. Returns
+def _concat_via_mkvmerge(enc, monkeypatch, streams, probe, rc=lambda cmd: 0,
+                         srt=None):
+    """concat_shots down the mkvmerge mux, with `streams` as what the one plan
+    probe prints and `probe` as what the attachment probe prints (raised
+    when an exception). `rc` gives each mkvmerge run its exit code, and `srt`
+    what an extracted companion contains, as in _mux_with. Returns
     (the commands _run ran, the mkvmerge commands)."""
     monkeypatch.setattr(opt.shutil, "which", lambda n, *a, **k: f"/usr/bin/{n}")
     enc._lead_of = lambda path: 0.0
@@ -3157,8 +3250,8 @@ def _concat_via_mkvmerge(enc, monkeypatch, kinds, probe, rc=lambda cmd: 0):
         args = [str(a) for a in args]
         ran.append(args)
         if "ffprobe" in args[0]:
-            if "stream=codec_type" in args:
-                return kinds
+            if opt.ShotEncoder._PLAN_PROBE in args:
+                return streams
             if _ATTACHMENT_PROBE in args:
                 # the original file, as for the audio: a Dolby Vision job's
                 # enc.source is a stripped intermediate with no attachments
@@ -3167,7 +3260,7 @@ def _concat_via_mkvmerge(enc, monkeypatch, kinds, probe, rc=lambda cmd: 0):
                     raise probe
                 return probe
             return ""
-        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        _write_outputs(args, srt)
         return ""
 
     def fake_mkvmerge(cmd, capture_output=False, text=False, timeout=None):
@@ -3277,7 +3370,10 @@ def test_mkvmerge_takes_only_the_attachments_from_the_source(settings, info, pla
 def test_mkvmerge_reads_the_original_source_only_for_its_attachments(
         settings, info, plan, tmp_path, monkeypatch, probe, takes):
     enc = make_encoder(settings, info, plan, tmp_path)
-    ran, merges = _concat_via_mkvmerge(enc, monkeypatch, "video\naudio\nsubtitle\n", probe)
+    ran, merges = _concat_via_mkvmerge(
+        enc, monkeypatch,
+        _probe_json(("video", set()), ("audio", {"default"}), ("subtitle", set())),
+        probe)
     merge, = merges
     audio_subs = str(enc.tempdir / "audio_subs.mkv")
     # Dolby Vision encodes a stripped intermediate: attachments, like the
@@ -3303,7 +3399,7 @@ def test_an_mkvmerge_that_cannot_read_the_source_muxes_again_without_it(
     warnings = []
     monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
     ran, merges = _concat_via_mkvmerge(
-        enc, monkeypatch, "video\naudio\n",
+        enc, monkeypatch, _probe_json(("video", set()), ("audio", {"default"})),
         _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("attachment", 0)),
         rc=lambda cmd: 2 if str(enc.info.path) in cmd else 0)
     first, second = merges
@@ -3323,14 +3419,17 @@ def test_a_video_only_source_keeps_its_attachments_without_a_remux(
     to write."""
     enc = make_encoder(settings, info, plan, tmp_path)
     ran, merges = _concat_via_mkvmerge(
-        enc, monkeypatch, "video\nattachment\nvideo\n",
+        enc, monkeypatch,
+        _probe_json(("video", set()), ("attachment", set()),
+                    ("video", {"attached_pic"})),
         _attachment_probe(_MKV, ("video", 0), ("attachment", 0), ("video", 1)))
     assert not any("audio_subs.mkv" in " ".join(a) for a in ran)
     merge, = merges
     assert merge[1:] == ["-o", str(enc.output), "--title", "",
                          str(enc.tempdir / "video_only.mkv"), *_SOURCE_ONLY,
                          str(enc.info.path)]
-    enc._run = (lambda self, args, timeout=None: "video\nattachment\n").__get__(enc)
+    enc._run = (lambda self, args, timeout=None:
+                _probe_json(("video", set()), ("attachment", set()))).__get__(enc)
     assert enc._has_audio_or_subs("x.mkv") is False
 
 
@@ -3414,11 +3513,20 @@ def test_attachments_reach_the_final_file_against_real_tools(
                 for t in j["tracks"] if t["type"] == "subtitles"]
 
     src, out = ident(source), ident(enc.output)
-    assert [t["type"] for t in out["tracks"]] == [t["type"] for t in src["tracks"]]
+    # the source's own tracks, plus the srt companion every kept ASS gets
+    assert [t["type"] for t in out["tracks"]] == (
+        [t["type"] for t in src["tracks"]]
+        + ["subtitles"] * enc.subtitles_added)
     if container == "mp4":
         assert attachments(out) == []
+        assert enc.subtitles_added == 0          # mov_text is not ASS
     else:
-        assert subtitles(out) == [(False, False), (False, True)] == subtitles(src)
+        assert subtitles(src) == [(False, False), (False, True)]
+        # each ASS keeps its own flags and its companion carries the same two,
+        # through EITHER muxer - the half that used to disagree, since the
+        # ffmpeg fallback restated the ASS's whole disposition value
+        assert enc.subtitles_added == 2
+        assert subtitles(out) == subtitles(src) * 2
         assert len(attachments(src)) == 2
         if muxer == "mkvmerge":
             # every one, the image and the UIDs included
@@ -5717,3 +5825,1090 @@ def test_max_crf_caps_delivery_without_narrowing_the_probe_range(
     hard = {20: t - 1.0, 60: t - 6.0}      # misses it everywhere
     chosen = enc.pick_all_crfs({0: easy, 1: hard}, grid)
     assert chosen[0] == 45.0 and chosen[1] == 25.0
+
+
+# ---- empty subtitle tracks: measured once, dropped in one place ----
+#
+# Plex auto-selected an EMPTY PGS track on a 4K HDR output of ours and burned
+# it into the picture: 0.2-0.9x real time, ~660% CPU, every thread inside the
+# subtitle overlay's scale, for a track with nothing in it.
+
+# the statistics tag an empty Matroska subtitle track carries (mkvmerge v82
+# and DVDFab13 both write it; measured on the S04E09 source AND our output)
+_EMPTY = {"tags": {"NUMBER_OF_FRAMES": "0"}}
+
+
+def _mkvmerge_json(*tracks):
+    """`mkvmerge -J`: (codec_id, num_index_entries) per subtitle track."""
+    return json.dumps({"tracks": [
+        {"id": i, "type": "subtitles",
+         "properties": {"codec_id": codec, "num_index_entries": entries}}
+        for i, (codec, entries) in enumerate(tracks)]})
+
+
+def _plan_of(enc, monkeypatch, probe, mkvmerge=None, has_mkvmerge=True,
+             source="/x/src.mkv"):
+    """_subtitle_plan against a stubbed plan probe and, for a stream with no
+    statistics tag, a stubbed `mkvmerge -J`. Returns (plan, mkvmerge runs)."""
+    monkeypatch.setattr(
+        opt.shutil, "which",
+        lambda n, *a, **k: None if not has_mkvmerge and "mkvmerge" in n
+        else f"/usr/bin/{n}")
+    enc._run = (lambda self, args, timeout=None: probe).__get__(enc)
+    runs = []
+
+    def fake_mkvmerge(cmd, capture_output=False, text=False, timeout=None):
+        runs.append([str(c) for c in cmd])
+        if "--version" in runs[-1]:
+            # only asked once the -J answer turned out to carry no counts
+            return types.SimpleNamespace(
+                returncode=0, stderr="",
+                stdout="mkvmerge v74.0.0 ('You Oughta Know') 64-bit\n")
+        if isinstance(mkvmerge, Exception):
+            raise mkvmerge
+        return types.SimpleNamespace(returncode=0, stdout=mkvmerge or "",
+                                     stderr="")
+
+    monkeypatch.setattr(opt.subprocess, "run", fake_mkvmerge)
+    return enc._subtitle_plan(source), runs
+
+
+def test_an_empty_subtitle_track_is_dropped_and_the_kept_one_renumbers(
+        settings, info, plan, tmp_path, monkeypatch):
+    """S04E09's shape: two PGS tracks, the first one empty. "-c:s:N" and
+    "-disposition:s:N" address the OUTPUT, so dropping s:0 makes the second
+    track s:0 - and getting that wrong puts one track's flags on another
+    without a word, which is the bug 4710560 had to fix."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), _EMPTY),
+        ("subtitle", {"default", "forced"}, {"codec_name": "subrip"})))
+    remux, = _remuxes(ran)
+    # the negative map sits after the positive one it edits, and carries "?"
+    assert _maps(remux) == ["0:a?", "0:s?", "-0:s:0?", "0:t?"]
+    assert remux[remux.index("-c:s:0") + 1] == "copy"
+    assert "-c:s:1" not in remux
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "default+forced")]
+    assert enc.subtitles_dropped == 1
+
+
+def test_the_middle_track_being_the_empty_one_renumbers_both_lists(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The case a "drop the first one" mistake survives. The empty track is
+    also the one flagged default here - The Morning Show S01E03 ships exactly
+    that, subrip, default+forced, titled "Forced", 0 frames - so dropping it
+    takes a false default out with it."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", {"forced"}, {"codec_name": "subrip"}),
+        ("subtitle", {"default"}, _EMPTY),
+        ("subtitle", set(), {"codec_name": "mov_text"})))
+    remux, = _remuxes(ran)
+    assert _maps(remux) == ["0:a?", "0:s?", "-0:s:1?", "0:t?"]
+    assert [remux[remux.index(f"-c:s:{i}") + 1] for i in (0, 1)] == ["copy", "srt"]
+    assert "-c:s:2" not in remux
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "forced"),
+                                    ("-disposition:s:1", "0")]
+    assert "default" not in [v for _, v in _dispositions(remux)][1:]
+
+
+@pytest.mark.parametrize("extra, dropped", [
+    ({"tags": {"NUMBER_OF_FRAMES": "0"}}, True),
+    ({"tags": {"NUMBER_OF_FRAMES-eng": "0"}}, True),
+    ({"tags": {"number_of_frames": "0"}}, True),
+    ({"tags": {"NUMBER_OF_FRAMES": "1"}}, False),
+    ({"tags": {"NUMBER_OF_FRAMES": "1448"}}, False),
+    ({"tags": {"NUMBER_OF_FRAMES": "0", "NUMBER_OF_FRAMES-eng": "12"}}, False),
+    ({"tags": {"NUMBER_OF_FRAMES": "N/A"}}, False),
+    ({"tags": {"NUMBER_OF_FRAMES": ""}}, False),
+    ({"tags": {}}, False),
+], ids=["zero", "lang-suffixed", "lower-case", "one-cue", "real", "disagree",
+        "not-a-number", "empty-string", "no-tag-no-mkvmerge"])
+def test_only_an_explicit_zero_drops_a_matroska_track(
+        settings, info, plan, tmp_path, monkeypatch, extra, dropped):
+    """One cue is a real track - a forced/signs track can hold exactly one,
+    and it is then the only copy of that translation anywhere. Everything
+    unreadable keeps the track: the two mistakes do not cost the same."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    got, _ = _plan_of(enc, monkeypatch, _probe_json(("subtitle", set(), extra)),
+                      has_mkvmerge=False)
+    assert bool(got.dropped) is dropped
+
+
+@pytest.mark.parametrize("extra, dropped", [
+    ({"nb_frames": "1", "duration_ts": 0}, True),
+    ({"nb_frames": None, "duration_ts": 0}, True),
+    ({"nb_frames": "1", "duration_ts": 0,
+      "tags": {"NUMBER_OF_FRAMES": "1448"}}, True),
+    ({"nb_frames": "3", "duration_ts": 500000}, False),
+    ({"nb_frames": "730", "duration_ts": 2709960000}, False),
+    ({"nb_frames": "730", "duration_ts": 0}, False),
+    ({"nb_frames": "0"}, False),
+    ({"duration_ts": "N/A"}, False),
+    ({"duration_ts": None}, False),
+], ids=["empty", "empty-and-untallied", "mkv-tag-is-not-read", "one-cue",
+        "real", "sample-table-disagrees", "nb-frames-zero-cannot-happen",
+        "not-a-number", "absent"])
+def test_an_mp4_is_decided_by_the_tracks_own_duration(
+        settings, info, plan, tmp_path, monkeypatch, extra, dropped):
+    """nb_frames cannot answer this, however promising it looks, and the whole
+    mp4 half of the feature was a silent no-op while it was what got read.
+
+    Measured on real files here: ffprobe prints nb_frames only when it is
+    non-zero (it writes the optional "N/A" otherwise, which the json writer
+    suppresses), and the mov muxer gives a cue-less mov_text track a padding
+    sample anyway - a track whose only cue was cut away reads nb_frames "1",
+    never "0". The track's own duration is what says so: duration_ts 0 on that
+    same empty track, 500000 on a ONE-cue track, 2709960000-2766642000 on the
+    eight real mov_text tracks of the ATVP WEB-DL in sample/. A sample table
+    that counts more than the padding wins over the header; Matroska's tag is
+    not read here at all, because the container decides which signal is."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    got, _ = _plan_of(enc, monkeypatch,
+                      _probe_json(("video", set()),
+                                  ("subtitle", set(), extra),
+                                  fmt="mov,mp4,m4a,3gp,3g2,mj2"),
+                      has_mkvmerge=False)
+    assert bool(got.dropped) is dropped
+
+
+def test_a_file_that_states_no_duration_at_all_decides_nothing(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A fragmented mp4 read without its fragments reports duration_ts 0 for
+    every stream it has, cues or not. The signal means "unknown" there, and
+    only the presence of a real duration somewhere in the file tells the two
+    apart - without that guard this would drop every subtitle such a file
+    carries."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    got, _ = _plan_of(
+        enc, monkeypatch,
+        _probe_json(("video", set(), {"duration_ts": 0}),
+                    ("subtitle", set(), {"nb_frames": None, "duration_ts": 0}),
+                    fmt="mov,mp4,m4a,3gp,3g2,mj2"),
+        has_mkvmerge=False)
+    assert got.dropped == []
+    assert [s.why for s in got.subs] == ["no stream of this file states a duration"]
+
+
+def test_a_matroska_track_with_no_tag_is_decided_by_mkvmerge(
+        settings, info, plan, tmp_path, monkeypatch):
+    """25% of the library's subtitle streams carry no statistics tag at all -
+    every mov_text, 280 of 281 ass, 380 subrip - and 497 of 5005 IMAGE
+    streams, which are the ones a player burns in. Measured: an empty PGS
+    indexes 0 entries, a real one 1034-1508 (matching its own tag exactly),
+    an untagged ASS 10-18, an untagged SRT 721."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    got, runs = _plan_of(
+        enc, monkeypatch,
+        _probe_json(("subtitle", set(), {"tags": {}}),
+                    ("subtitle", set(), {"codec_name": "subrip", "tags": {}})),
+        mkvmerge=_mkvmerge_json(("S_HDMV/PGS", 0), ("S_TEXT/UTF8", 721)))
+    assert [s.pos for s in got.dropped] == [0]
+    assert [s.why for s in got.subs] == ["num_index_entries=0",
+                                         "num_index_entries=721"]
+    assert [r[1] for r in runs] == ["-J"]
+
+
+@pytest.mark.parametrize("mkvmerge", [
+    _mkvmerge_json(("S_HDMV/PGS", 0)),                     # one track, two here
+    _mkvmerge_json(("S_TEXT/UTF8", 0), ("S_HDMV/PGS", 0)),  # codecs swapped
+    _mkvmerge_json(("S_HDMV/PGS", None), ("S_TEXT/UTF8", None)),
+    "not json at all",
+    OSError("mkvmerge is not there"),
+], ids=["count-mismatch", "codec-mismatch", "no-entries", "no-json", "failed"])
+def test_an_mkvmerge_answer_that_does_not_line_up_keeps_everything(
+        settings, info, plan, tmp_path, monkeypatch, mkvmerge):
+    """mkvmerge ids count TRACKS while ffprobe indexes count STREAMS, and
+    matroskadec turns an image attachment into a stream of its own. So the two
+    lists are matched by subtitle order and then checked against each other's
+    codec; anything that does not line up exactly drops nothing at all."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    got, _ = _plan_of(
+        enc, monkeypatch,
+        _probe_json(("subtitle", set(), {"tags": {}}),
+                    ("subtitle", set(), {"codec_name": "subrip", "tags": {}})),
+        mkvmerge=mkvmerge)
+    assert got.dropped == []
+    assert got.kept == got.subs
+
+
+def test_an_mkvmerge_that_reports_no_index_entries_says_so_once(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Not every mkvmerge has the property this fallback reads. v74 - the one
+    in the image actually deployed, which is bookworm-based where the
+    Dockerfile's runtime stage is ubuntu:24.04 and v82 - prints no
+    num_index_entries at all, for any track, on a file it wrote itself with
+    cues. Every untagged stream is then kept, which is safe; what it must not
+    be is silent, because 25% of the library's subtitle streams carry no tag
+    and the feature would look like it simply found nothing to drop."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    warnings = []
+    monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
+    got, runs = _plan_of(
+        enc, monkeypatch, _probe_json(("subtitle", set(), {"tags": {}})),
+        mkvmerge=json.dumps({"tracks": [
+            {"id": 0, "type": "subtitles",
+             "properties": {"codec_id": "S_HDMV/PGS", "number": 1}}]}))
+    assert got.dropped == [] and got.subs[0].empty is None
+    # the -J answer, then the version for the one warning that names it
+    assert [r[1] for r in runs] == ["-J", "--version"]
+    assert len(warnings) == 1
+    said = warnings[0][0].format(*warnings[0][1:])
+    assert "v74.0.0" in said and "num_index_entries" in said
+
+
+def test_mkvmerge_is_only_asked_when_a_matroska_tag_is_missing(
+        settings, info, plan, tmp_path, monkeypatch):
+    """It is a second tool and a second read (0.198-2.3s per file measured), so
+    a tagged file never pays for it - and an mp4 never asks, because mkvmerge
+    reports codec_id and num_index_entries as None for every subtitle track
+    there anyway."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _, runs = _plan_of(enc, monkeypatch, _probe_json(("subtitle", set())),
+                       source="/x/tagged.mkv")
+    assert runs == []
+    _, runs = _plan_of(enc, monkeypatch,
+                       _probe_json(("subtitle", set(), {"tags": {},
+                                                        "nb_frames": "N/A"}),
+                                   fmt="mov,mp4,m4a,3gp,3g2,mj2"),
+                       source="/x/movie.mp4")
+    assert runs == []
+
+
+def test_what_was_dropped_is_logged_once_per_job(settings, info, plan,
+                                                 tmp_path, monkeypatch):
+    """The only record of which stream was left out and what decided it. An
+    operator asking afterwards has nothing else to go on: with
+    transcode.delete_source the source is gone minutes later, so there is
+    nothing left to re-probe."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    lines = []
+    monkeypatch.setattr(opt.logger, "info", lambda *a, **k: lines.append(a))
+    _plan_of(enc, monkeypatch, _probe_json(
+        ("video", set()),
+        ("subtitle", set(), {"codec_name": "subrip",
+                             "tags": {"NUMBER_OF_FRAMES": "0",
+                                      "language": "fre"}}),
+        ("subtitle", set())), has_mkvmerge=False)
+    enc._subtitle_plan("/x/src.mkv")          # cached: not logged twice
+    assert len(lines) == 1
+    said = lines[0][0].format(*lines[0][1:])
+    # the output-side number, the stream index the file itself uses, what the
+    # track is, whose it is, and what said it was empty
+    assert "s:0 (stream 1) subrip fre NUMBER_OF_FRAMES=0" in said
+
+
+def test_with_the_subtitle_settings_off_the_commands_are_todays(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Byte for byte what this mux ran before any of it existed, including for
+    a track that IS empty and an ASS that would get a companion."""
+    settings.transcode.optimizer.drop_empty_subtitles = False
+    settings.transcode.optimizer.ass_srt_companion = False
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), _EMPTY),
+        ("subtitle", set(), {"codec_name": "ass", "tags": {}})))
+    remux, = _remuxes(ran)
+    assert remux == [enc.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
+                     "-i", str(enc.info.path), "-map", "0:a?", "-map", "0:s?",
+                     "-c:a", "copy", "-disposition:a:0", "default",
+                     "-disposition:s:0", "0", "-disposition:s:1", "0",
+                     "-map", "0:t?", "-c:t", "copy",
+                     "-c:s:0", "copy", "-c:s:1", "copy",
+                     str(enc.tempdir / "audio_subs.mkv")]
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _maps(final) == ["0:v:0", "1:a?", "1:s?", "1:t?"]
+    assert enc.subtitles_dropped == 0 and enc.subtitles_added == 0
+
+
+def test_a_source_with_nothing_but_empty_subtitles_skips_the_remux(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The guard and the drop have to agree by construction. Once the empty
+    streams are gone this command maps ZERO streams, and ffmpeg with no output
+    stream allocates ~8.2GB before it exits - an OOM kill at the very last
+    step of a finished encode. The streams still count as dropped: the output
+    carries none of them either way."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("subtitle", set(), _EMPTY),
+        ("subtitle", set(), _EMPTY)))
+    assert _remuxes(ran) == []
+    assert enc.subtitles_dropped == 2
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert final.count("-i") == 1 and "1:s?" not in final
+
+
+def test_audio_beside_only_empty_subtitles_still_gets_its_remux(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}), ("subtitle", set(), _EMPTY)))
+    remux, = _remuxes(ran)
+    assert _maps(remux) == ["0:a?", "0:s?", "-0:s:0?", "0:t?"]
+    assert _dispositions(remux) == [("-disposition:a:0", "default")]
+    assert enc.subtitles_dropped == 1
+
+
+def test_the_drop_reaches_both_remux_retries(
+        settings, info, plan, tmp_path, monkeypatch):
+    """It lives in base_args for exactly this reason: the plain-copy retry and
+    the one without the attachments are built from the same list."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(
+        enc, monkeypatch,
+        _probe_json(("video", set()), ("audio", {"default"}),
+                    ("subtitle", set(), _EMPTY), ("subtitle", set())),
+        fail=lambda a: any(x.endswith("audio_subs.mkv") for x in a) and "0:t?" in a)
+    first, retry, bare = _remuxes(ran)
+    for cmd in (first, retry, bare):
+        assert "-0:s:0?" in cmd
+    assert _maps(bare) == ["0:a?", "0:s?", "-0:s:0?"]
+    assert enc.subtitles_dropped == 1
+
+
+def test_the_whole_mux_runs_off_one_probe_of_the_original_source(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A Dolby Vision job encodes a stripped intermediate, so audio, subtitles
+    and flags all come from info.path - and from ONE probe of it, which is
+    what keeps the drop maps, the codecs and the dispositions counting the
+    same streams."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert str(enc.source) != str(enc.info.path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), _EMPTY), ("subtitle", set())))
+    probes = [a for a in ran if opt.ShotEncoder._PLAN_PROBE in a]
+    assert len(probes) == 1 and probes[0][-1] == str(enc.info.path)
+
+
+# ---- ASS: kept as it is, with a plain-text srt beside it ----
+def _ass_probe(**tags):
+    """A source whose second subtitle track is an ASS with `tags`."""
+    return _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), {"codec_name": "hdmv_pgs_subtitle"}),
+        ("subtitle", {"default"}, dict(
+            {"codec_name": "ass",
+             "tags": {"NUMBER_OF_FRAMES": "916", "language": "chi",
+                      "title": "简体"}}, **tags)))
+
+
+def test_an_ass_track_gets_a_sanitised_srt_companion(
+        settings, info, plan, tmp_path, monkeypatch):
+    """One demux: the companion is an extra OUTPUT of the command that already
+    writes audio_subs.mkv (measured at 4.3s against 3.3s for 42 tracks of a
+    2.2GB source). The ASS itself is copied through untouched."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe())
+    remux, = _remuxes(ran)
+    companion = str(enc.tempdir / "sub_1.srt")
+    # the remux is unchanged up to audio_subs.mkv; the companion follows it
+    assert remux[remux.index(str(enc.tempdir / "audio_subs.mkv")) + 1:] == [
+        "-map", "0:s:1", "-c:s", "srt", companion]
+    assert [remux[remux.index(f"-c:s:{i}") + 1] for i in (0, 1)] == ["copy", "copy"]
+    # srtenc's markup is stripped, the text and <i> are not
+    text = Path(companion).read_text(encoding="utf-8")
+    assert "<font" not in text and "{\\an" not in text
+    assert "人多力量大" in text and "<i>italics survive</i>" in text
+    # and it is muxed in as a track of its own, last, with the ASS's own
+    # language, a title that says what it is, and the ASS's flags
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert final.count("-i") == 3
+    assert _maps(final) == ["0:v:0", "1:a?", "1:s?", "1:t?", "2:0"]
+    meta = final[final.index("-metadata:s:s:2"):]
+    assert meta[:6] == ["-metadata:s:s:2", "language=chi",
+                        "-metadata:s:s:2", "title=简体 (SRT)",
+                        "-disposition:s:2", "default"]
+    assert enc.subtitles_added == 1
+
+
+def test_a_companion_beside_a_dropped_track_counts_from_both_ends(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The one place the two features meet, and the one that can silently go
+    wrong: "-map 0:s:N" counts the SOURCE's subtitles, where the dropped track
+    is still present, while "-disposition:s:N" and "-metadata:s:s:N" count the
+    OUTPUT's, where it is not. An empty track before the ASS moves one and not
+    the other."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), _EMPTY),
+        ("subtitle", {"default"}, {"codec_name": "ass",
+                                   "tags": {"NUMBER_OF_FRAMES": "916",
+                                            "language": "chi"}})))
+    remux, = _remuxes(ran)
+    # the last map belongs to the companion, which is a second output of this
+    # same command
+    assert _maps(remux) == ["0:a?", "0:s?", "-0:s:0?", "0:t?", "0:s:1"]
+    # the ASS is s:1 of the source and s:0 of the output, and each number is
+    # read off the end it belongs to
+    assert remux[remux.index(str(enc.tempdir / "audio_subs.mkv")) + 1:] == [
+        "-map", "0:s:1", "-c:s", "srt", str(enc.tempdir / "sub_1.srt")]
+    # and the ASS, being the output's s:0, is the one that gives its default
+    # flag to the companion below
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0")]
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert final[final.index("-metadata:s:s:1"):][:6] == [
+        "-metadata:s:s:1", "language=chi",
+        "-metadata:s:s:1", "title=SRT (plain text)",
+        "-disposition:s:1", "default"]
+    assert (enc.subtitles_dropped, enc.subtitles_added) == (1, 1)
+
+
+def test_mkvmerge_takes_each_companion_as_an_input_of_its_own(
+        settings, info, plan, tmp_path, monkeypatch):
+    """--sub-charset is load-bearing: mkvmerge otherwise guesses the charset
+    from the locale and mangles CJK. It converts nothing itself, so the file
+    handed to it has to be srt already."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _, merges = _concat_via_mkvmerge(
+        enc, monkeypatch, _ass_probe(),
+        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0),
+                          ("attachment", 0)))
+    merge, = merges
+    assert merge[1:] == ["-o", str(enc.output),
+                         str(enc.tempdir / "video_only.mkv"), "--no-attachments",
+                         str(enc.tempdir / "audio_subs.mkv"),
+                         "--sub-charset", "0:UTF-8", "--language", "0:chi",
+                         "--track-name", "0:简体 (SRT)",
+                         "--default-track-flag", "0:yes",
+                         "--forced-display-flag", "0:no",
+                         str(enc.tempdir / "sub_1.srt"),
+                         *_SOURCE_ONLY, str(enc.info.path)]
+
+
+@pytest.mark.parametrize("flags, default, forced", [
+    ({"default"}, "0:yes", "0:no"),
+    (set(), "0:no", "0:no"),
+    ({"forced"}, "0:no", "0:yes"),
+    ({"default", "forced"}, "0:yes", "0:yes"),
+], ids=["default", "neither", "forced", "both"])
+def test_a_companion_is_default_only_when_its_ass_was(
+        settings, info, plan, tmp_path, flags, default, forced):
+    """This ADDS a track, it does not promote one. A second track flagged
+    default is the shape of the thing that made Plex pick the wrong one."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    sub = opt.SubStream(index=3, pos=1, codec="ass", flags="0",
+                        default="default" in flags, forced="forced" in flags,
+                        language="jpn", title="", empty=False, why="tag")
+    args = enc._companion_inputs([sub])
+    assert args[args.index("--default-track-flag") + 1] == default
+    assert args[args.index("--forced-display-flag") + 1] == forced
+    # no title to borrow: the name still says what the track is
+    assert args[args.index("--track-name") + 1] == "0:SRT (plain text)"
+
+
+def test_the_companion_carries_the_same_flags_through_either_muxer(
+        settings, info, plan, tmp_path):
+    """It was default/forced through mkvmerge and the ASS's WHOLE disposition
+    value through the ffmpeg fallback. An SDH source then came out
+    hearing_impaired through one muxer and plain through the other - two
+    episodes of one season disagreeing, decided by nothing but whether
+    mkvmerge was there, and neither path wrong by its own comment."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    sub = opt.SubStream(index=3, pos=0, codec="ass",
+                        flags="default+hearing_impaired", default=True,
+                        forced=False, language="eng", title="", empty=False,
+                        why="NUMBER_OF_FRAMES=916")
+    enc._sub_plans["/x/src.mkv"] = opt.SubtitlePlan(True, True, [], [sub])
+    inputs = enc._companion_inputs([sub])
+    assert inputs[inputs.index("--default-track-flag") + 1] == "0:yes"
+    assert inputs[inputs.index("--forced-display-flag") + 1] == "0:no"
+    assert "hearing" not in " ".join(inputs)
+    # the ffmpeg fallback states those same two flags and no others; the
+    # descriptive ones stay on the ASS track beside it
+    meta = enc._companion_metadata("/x/src.mkv", [sub])
+    assert meta[meta.index("-disposition:s:1") + 1] == "default"
+
+
+def test_the_default_flag_moves_from_the_ass_to_its_companion(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Copied, it left the output with TWO default subtitle tracks; a player
+    takes the first, which is the ASS, and the companion was then useless for
+    the one job it has - being the text track Plex can send instead of burning
+    the picture in. So it moves: the companion is default and the ASS is not."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe())
+    remux, = _remuxes(ran)
+    # measured on mkvmerge v82: it copies audio_subs.mkv's flags track for
+    # track, so for that muxer this command is what decides them
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "0")]
+    # the ffmpeg fallback decides for itself, and has to say the same thing:
+    # measured, its -disposition overrides what audio_subs.mkv carries
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _dispositions(final) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "0"),
+                                    ("-disposition:s:2", "default")]
+
+
+def test_mkvmerge_is_told_nothing_about_the_ass_it_took_the_flag_from(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The remux above already wrote audio_subs.mkv without that flag, and
+    mkvmerge copies it from there. Stating it a second time here would be a
+    second place to get the track number wrong, for no gain."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran, merges = _concat_via_mkvmerge(
+        enc, monkeypatch, _ass_probe(),
+        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)))
+    remux, = _remuxes(ran)
+    assert _dispositions(remux)[1:] == [("-disposition:s:0", "0"),
+                                        ("-disposition:s:1", "0")]
+    merge, = merges
+    # the companion, and only the companion, is declared default here
+    assert merge.count("--default-track-flag") == 1
+    assert merge[merge.index("--default-track-flag") + 1] == "0:yes"
+    assert merge.index("--default-track-flag") > merge.index(
+        str(enc.tempdir / "audio_subs.mkv"))
+
+
+def test_a_companion_for_a_plain_ass_leaves_neither_of_them_default(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Only a flag that is there moves. Nothing is promoted: a source whose
+    subtitles are all off must stay that way, or the companion becomes a
+    default track the source never had."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", set(), {"codec_name": "ass",
+                             "tags": {"NUMBER_OF_FRAMES": "916"}})))
+    remux, = _remuxes(ran)
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0")]
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _dispositions(final) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "0")]
+    assert enc.subtitles_added == 1
+
+
+def test_only_the_default_flag_moves_and_the_others_stay_put(
+        settings, info, plan, tmp_path, monkeypatch):
+    """forced is copied and belongs on both tracks - a forced ASS and its
+    plain-text copy are both forced. The descriptive flags stay on the ASS
+    alone: an SDH track does not stop being hearing_impaired because a copy
+    was made of it."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", {"default", "forced", "hearing_impaired"},
+         {"codec_name": "ass", "tags": {"NUMBER_OF_FRAMES": "916"}})))
+    remux, = _remuxes(ran)
+    assert _dispositions(remux) == [
+        ("-disposition:a:0", "default"),
+        ("-disposition:s:0", "forced+hearing_impaired")]
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _dispositions(final)[-1] == ("-disposition:s:1", "default+forced")
+
+
+def test_a_default_pgs_beside_a_default_ass_is_left_alone(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Only an ASS that really got a companion gives its flag up. A bitmap
+    track can never have one - libavcodec has no bitmap-to-text path - so
+    nothing about it changes, however many default tracks the source ships."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", set()), ("audio", {"default"}),
+        ("subtitle", {"default"}),
+        ("subtitle", {"default", "forced"},
+         {"codec_name": "ass", "tags": {"NUMBER_OF_FRAMES": "916"}})))
+    remux, = _remuxes(ran)
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "default"),
+                                    ("-disposition:s:1", "forced")]
+    assert enc.subtitles_added == 1
+
+
+def test_with_the_companion_off_a_default_ass_keeps_its_flag(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Nothing to move it to, so nothing moves: byte for byte the command this
+    mux ran before the flag did."""
+    settings.transcode.optimizer.ass_srt_companion = False
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe())
+    remux, = _remuxes(ran)
+    assert remux == [enc.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
+                     "-i", str(enc.info.path), "-map", "0:a?", "-map", "0:s?",
+                     "-c:a", "copy", "-disposition:a:0", "default",
+                     "-disposition:s:0", "0", "-disposition:s:1", "default",
+                     "-map", "0:t?", "-c:t", "copy",
+                     "-c:s:0", "copy", "-c:s:1", "copy",
+                     str(enc.tempdir / "audio_subs.mkv")]
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _dispositions(final) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "default")]
+
+
+def test_an_empty_default_ass_keeps_the_flag_it_cannot_lend(
+        settings, info, plan, tmp_path, monkeypatch):
+    """An empty track gets no companion - it would write an empty file - so
+    there is nothing to move the flag to. With the drop off it stays in the
+    output, default and all."""
+    settings.transcode.optimizer.drop_empty_subtitles = False
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch,
+                    _ass_probe(tags={"NUMBER_OF_FRAMES": "0"}))
+    remux, = _remuxes(ran)
+    assert not any(a.endswith(".srt") for a in remux)
+    assert _dispositions(remux) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "default")]
+    assert enc.subtitles_added == 0
+
+
+def test_a_companion_that_comes_out_empty_hands_the_default_back(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The remux states its flags before any companion exists as a file, so one
+    that is then left out - here, an srt with nothing in it - has already taken
+    the ASS's default with it. The final mux states it back, or the output ends
+    up with no default subtitle at all."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe(), srt="")
+    remux, = _remuxes(ran)
+    assert _dispositions(remux)[-1] == ("-disposition:s:1", "0")
+    assert enc.subtitles_added == 0
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _dispositions(final) == [("-disposition:a:0", "default"),
+                                    ("-disposition:s:0", "0"),
+                                    ("-disposition:s:1", "default")]
+
+
+def test_mkvmerge_is_told_to_put_a_lost_default_back(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The mkvmerge mux cannot restate that list: it copies audio_subs.mkv's
+    own flags, and that file is written by the time the companion turns out to
+    be empty. Measured on v82, it promotes nothing of its own either, so the
+    output would carry NO default subtitle.
+
+    The fixture is shaped to pin that id and nothing else: THREE audio tracks
+    and a dropped one before the ASS, so the audio count, the kept subtitle
+    count and the ASS's own source position are three different numbers. The
+    ASS is the output's s:1, and the remux wrote every audio stream before any
+    subtitle, so it is track 3 + 1 (measured on such an audio_subs.mkv: id 0-2
+    the audio, 3 and 4 the subtitles). Measured too, on mkvmerge v82: a wrong
+    id does not fail. "1:yes" exits 0 and makes the second AUDIO track default,
+    leaving the output with no default subtitle at all - which no one-audio,
+    nothing-dropped fixture can tell apart from the right answer."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _, merges = _concat_via_mkvmerge(
+        enc, monkeypatch,
+        _probe_json(("video", set()), ("audio", {"default"}), ("audio", set()),
+                    ("audio", set()),
+                    ("subtitle", set(), _EMPTY), ("subtitle", set()),
+                    ("subtitle", {"default"},
+                     {"codec_name": "ass",
+                      "tags": {"NUMBER_OF_FRAMES": "916"}})),
+        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)),
+        srt="")
+    merge, = merges
+    audio_subs = merge.index(str(enc.tempdir / "audio_subs.mkv"))
+    assert merge[audio_subs - 2:audio_subs] == ["--default-track-flag", "4:yes"]
+    assert not any(a.endswith(".srt") for a in merge)
+    assert (enc.subtitles_dropped, enc.subtitles_added) == (1, 0)
+
+
+def test_nothing_is_put_back_for_a_companion_that_took_nothing(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A plain ASS lends no flag, so a companion of its own that falls away
+    leaves nothing to restore. Stating one anyway would invent a default track
+    the source never had - and a track id mkvmerge cannot find exits 1, which
+    would cost the whole mkvmerge mux."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    _, merges = _concat_via_mkvmerge(
+        enc, monkeypatch,
+        _probe_json(("video", set()), ("audio", {"default"}),
+                    ("subtitle", set(), {"codec_name": "ass",
+                                         "tags": {"NUMBER_OF_FRAMES": "916"}})),
+        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)),
+        srt="")
+    merge, = merges
+    assert "--default-track-flag" not in merge
+    assert enc.subtitles_added == 0
+
+
+@pytest.mark.parametrize("probe, companions", [
+    (_ass_probe(), ["sub_1.srt"]),
+    (_ass_probe(tags={"NUMBER_OF_FRAMES": "0"}), []),
+    (_probe_json(("video", set()), ("subtitle", set())), []),
+    (opt.TranscodeError("ffprobe exploded"), []),
+], ids=["ass", "empty-ass", "no-ass", "probe-failed"])
+def test_which_tracks_get_a_companion(settings, info, plan, tmp_path,
+                                      monkeypatch, probe, companions):
+    """Never for an empty track: it would write an empty file, and an empty
+    subtitle track is the thing this release exists to stop shipping."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    if isinstance(probe, Exception):
+        def boom(self, args, timeout=None):
+            raise probe
+        enc._run = boom.__get__(enc)
+    else:
+        enc._run = (lambda self, args, timeout=None: probe).__get__(enc)
+    assert [Path(enc._companion_path(s)).name
+            for s in enc._companions("/x/src.mkv")] == companions
+
+
+def test_no_companion_for_an_empty_ass_even_with_the_drop_off(
+        settings, info, plan, tmp_path):
+    """With the drop off the empty track stays in the output, and it must
+    still not get a companion: that would add a SECOND empty track. Emptiness
+    is measured for either setting, and only the drop is gated on its own."""
+    settings.transcode.optimizer.drop_empty_subtitles = False
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._run = (lambda self, args, timeout=None:
+                _ass_probe(tags={"NUMBER_OF_FRAMES": "0"})).__get__(enc)
+    assert enc._companions("/x/src.mkv") == []
+
+
+def test_no_companion_with_the_flag_off(settings, info, plan, tmp_path,
+                                        monkeypatch):
+    settings.transcode.optimizer.ass_srt_companion = False
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe())
+    remux, = _remuxes(ran)
+    assert remux[-1] == str(enc.tempdir / "audio_subs.mkv")
+    assert not any(a.endswith(".srt") for a in remux)
+    assert enc.subtitles_added == 0
+
+
+def test_a_remux_retry_leaves_the_companions_behind(
+        settings, info, plan, tmp_path, monkeypatch):
+    """They are an addition, and the retry path is already one failure deep.
+    What the output must not lose is the source's own tracks."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe(),
+                    fail=lambda a: any(x.endswith(".srt") for x in a))
+    first, retry = _remuxes(ran)
+    assert any(a.endswith(".srt") for a in first)
+    assert not any(a.endswith(".srt") for a in retry)
+    assert enc.subtitles_added == 0
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert _maps(final) == ["0:v:0", "1:a?", "1:s?", "1:t?"]
+    # the first remux had already lent the ASS's default flag to a companion
+    # that no longer exists, so the final mux states it back
+    assert _dispositions(first)[-1] == ("-disposition:s:1", "0")
+    assert _dispositions(final)[-1] == ("-disposition:s:1", "default")
+
+
+@pytest.mark.parametrize("raw, want", [
+    ('<font face="Tahoma" size="50" color="#eeeeee">hello</font>', "hello"),
+    ("{\\an8}Top-aligned note", "Top-aligned note"),
+    ('<font face="Source Han Sans SC Medium" size="24">人多力量大</font>',
+     "人多力量大"),
+    ("<i>kept</i> <b>and</b> <u>kept</u>", "<i>kept</i> <b>and</b> <u>kept</u>"),
+], ids=["font", "an8", "cjk", "styles-survive"])
+def test_the_companion_loses_srtencs_markup_and_nothing_else(
+        settings, info, plan, tmp_path, raw, want):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    f = tmp_path / "sub_0.srt"
+    f.write_text(f"1\n00:00:00,200 --> 00:00:01,500\n{raw}\n\n", encoding="utf-8")
+    assert enc._sanitise_srt(f) is True
+    assert f.read_text(encoding="utf-8") == (
+        f"1\n00:00:00,200 --> 00:00:01,500\n{want}\n\n")
+
+
+def test_a_companion_with_nothing_left_in_it_is_left_out(settings, info, plan,
+                                                         tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    f = tmp_path / "sub_0.srt"
+    f.write_text("", encoding="utf-8")
+    assert enc._sanitise_srt(f) is False
+    assert enc._sanitise_srt(tmp_path / "never_written.srt") is False
+
+
+def test_a_companion_that_sanitises_to_nothing_never_reaches_the_mux(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A companion that came out with nothing in it - an ASS srtenc wrote no
+    cue out of, or a file that could not be read back - must not be handed to
+    the mux: mkvmerge refuses an unparsable input, the ffmpeg fallback then
+    maps a file with no stream ("matches no streams"), and a mux that did take
+    it would leave _verify_output expecting one more subtitle stream than
+    exists - which deletes the finished output."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe(), srt="")
+    remux, = _remuxes(ran)
+    assert remux[-1] == str(enc.tempdir / "sub_1.srt")   # extracted as always
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    assert not any(a.endswith(".srt") for a in final)
+    assert _maps(final) == ["0:v:0", "1:a?", "1:s?", "1:t?"]
+    assert not any(a.startswith("-metadata:s:s:") for a in final)
+    assert enc.subtitles_added == 0
+
+
+def test_the_last_ditch_retry_converts_only_the_text_subtitles(
+        settings, info, plan, tmp_path, monkeypatch):
+    """It ran "-c:s srt" over EVERY subtitle, which cannot work for a bitmap
+    track - libavcodec has no bitmap-to-text path - so on any source with a
+    PGS or VobSub stream this recovery was dead. It only ever runs after a
+    plain copy has already failed, so it never killed a job that was not
+    failing; it just never rescued one either."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(
+        enc, monkeypatch,
+        _probe_json(("video", set()), ("audio", {"default"}),
+                    ("subtitle", set()),
+                    ("subtitle", set(), {"codec_name": "subrip"})),
+        fail=lambda a: a[-1] == str(enc.output) and "-c:s:0" not in a)
+    final, retry = [a for a in ran if a[-1] == str(enc.output)]
+    assert "-c:s" not in retry                      # never the blanket form
+    assert retry[retry.index("-c:s:0") + 1] == "copy"   # the PGS is copied
+    assert retry[retry.index("-c:s:1") + 1] == "srt"    # the subrip converts
+    assert "srt" not in final
+    assert enc.output.exists()
+
+
+def test_there_is_no_last_ditch_retry_when_nothing_can_be_converted(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Every subtitle a Blu-ray remux carries is a bitmap one, so this retry
+    has nothing to convert - and the command it would run is the one that just
+    failed, over the whole file again. It raises the real error instead."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    errors = []
+    monkeypatch.setattr(opt.logger, "error", lambda *a, **k: errors.append(a))
+    with pytest.raises(opt.TranscodeError, match="mux failed"):
+        _mux_with(enc, monkeypatch,
+                  _probe_json(("video", set()), ("audio", {"default"}),
+                              ("subtitle", set()), ("subtitle", set())),
+                  fail=lambda a: a[-1] == str(enc.output))
+    assert any("can be converted to text" in str(e[0]) for e in errors)
+
+
+def test_a_source_with_no_subtitles_still_gets_its_identical_retry(
+        settings, info, plan, tmp_path, monkeypatch):
+    """Nothing to convert is not the same as nothing to try, and the two must
+    not be folded together. This retry names no subtitle stream either way, so
+    for a source with no subtitles it is the command that just failed run once
+    more - which is what this path always was, and what survives a transient
+    failure (an ENOSPC that cleared, an NFS hiccup on dirs.work). Returning
+    None here would throw a finished encode away."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    attempts = []
+
+    def fail(args):
+        if args[-1] != str(enc.output):
+            return False
+        attempts.append(args)
+        return len(attempts) == 1              # only the first one fails
+
+    ran = _mux_with(enc, monkeypatch,
+                    _probe_json(("video", set()), ("audio", {"default"})),
+                    fail=fail)
+    final, retry = [a for a in ran if a[-1] == str(enc.output)]
+    assert retry == final                      # the identical command, again
+    assert enc.output.exists()
+
+
+def test_the_last_ditch_retry_without_a_plan_is_what_it_always_was(
+        settings, info, plan, tmp_path, monkeypatch):
+    """No plan, no idea which stream is which. Blanket srt is then no worse
+    than the behaviour this replaced, and for a text-only source it works."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, opt.TranscodeError("ffprobe exploded"),
+                    fail=lambda a: a[-1] == str(enc.output) and "srt" not in a)
+    final, retry = [a for a in ran if a[-1] == str(enc.output)]
+    assert retry[retry.index("-c:s") + 1] == "srt"
+
+
+def test_the_retry_copies_the_companions_it_already_converted(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _ass_probe(),
+                    fail=lambda a: a[-1] == str(enc.output) and "-c:s:0" not in a)
+    _, retry = [a for a in ran if a[-1] == str(enc.output)]
+    # the PGS copied, the ASS converted, and the companion left alone
+    assert [retry[retry.index(f"-c:s:{i}") + 1] for i in (0, 1, 2)] == [
+        "copy", "srt", "copy"]
+
+
+@pytest.mark.skipif(any(_REAL_WHICH(t) is None for t in ("ffmpeg", "ffprobe", "mkvmerge")),
+                    reason="needs a real ffmpeg, ffprobe and mkvmerge")
+@pytest.mark.parametrize("muxer", ["mkvmerge", "ffmpeg"])
+def test_an_empty_subtitle_track_is_dropped_against_real_tools(
+        settings, plan, tmp_path, monkeypatch, muxer):
+    """The whole mux for real, on a file that really does carry a 0-cue track.
+
+    This is the only test that can catch a renumbering mistake: every stub
+    here agrees with the code about which stream is which, and a real file
+    does not. The empty track is the MIDDLE one, so a wrong number survives
+    as the wrong language rather than as a missing track.
+    """
+    import subprocess as sp
+    real = _REAL_WHICH
+    monkeypatch.setattr(shutil, "which", real if muxer == "mkvmerge" else
+                        (lambda n, *a, **k: None if "mkvmerge" in n else real(n, *a, **k)))
+    ffmpeg, ffprobe, mkvmerge = real("ffmpeg"), real("ffprobe"), real("mkvmerge")
+
+    def ff(*args):
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, args)],
+               check=True, cwd=tmp_path)
+
+    shot = tmp_path / "enc_00000.ivf"
+    try:
+        ff("-f", "lavfi", "-i", "testsrc=size=160x120:rate=5:duration=2",
+           "-c:v", "libsvtav1", "-preset", "12", shot)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with libsvtav1 to build the shot")
+    ff("-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac", "sound.mka")
+    (tmp_path / "a.srt").write_text("1\n00:00:00,200 --> 00:00:01,500\nfirst\n")
+    # its only cue lies beyond the -t below, which is how a genuinely 0-packet
+    # track is made
+    (tmp_path / "b.srt").write_text("1\n00:00:30,000 --> 00:00:31,000\nnever\n")
+    (tmp_path / "c.srt").write_text("1\n00:00:00,300 --> 00:00:01,400\nthird\n")
+    ff("-i", shot, "-i", "sound.mka", "-i", "a.srt", "-i", "b.srt", "-i", "c.srt",
+       "-map", "0:v", "-map", "1:a", "-map", "2", "-map", "3", "-map", "4",
+       "-c", "copy", "-t", "2", "-metadata:s:s:0", "language=eng",
+       "-metadata:s:s:1", "language=fre", "-metadata:s:s:2", "language=spa",
+       "mid.mkv")
+    source = tmp_path / "movie.mkv"
+    # through mkvmerge, which writes the statistics tags ffmpeg does not
+    sp.run([mkvmerge, "-q", "-o", str(source), "mid.mkv"], check=True, cwd=tmp_path)
+
+    def sub_tags(path):
+        out = sp.run([ffprobe, "-v", "error", "-select_streams", "s",
+                      "-show_entries", "stream_tags", "-of", "json", str(path)],
+                     check=True, capture_output=True, text=True).stdout
+        return [{k.lower(): v for k, v in (s.get("tags") or {}).items()}
+                for s in json.loads(out)["streams"]]
+
+    counts = [t.get("number_of_frames") for t in sub_tags(source)]
+    if counts != ["1", "0", "1"]:
+        pytest.skip(f"this mkvmerge did not tag the fixture as expected: {counts}")
+
+    info = MediaInfo(path=source)
+    info.fps, info.duration = 5.0, 2.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc.concat_shots([shot])
+
+    assert enc.subtitles_dropped == 1
+    langs = [t.get("language") for t in sub_tags(enc.output)]
+    assert len(langs) == 2                      # the empty one is gone
+    ident = json.loads(sp.run([mkvmerge, "-J", str(enc.output)], check=True,
+                              capture_output=True, text=True).stdout)
+    subs = [t["properties"].get("language")
+            for t in ident["tracks"] if t["type"] == "subtitles"]
+    assert subs == ["eng", "spa"]               # and in the right order
+
+
+@pytest.mark.skipif(any(_REAL_WHICH(t) is None for t in ("ffmpeg", "ffprobe")),
+                    reason="needs a real ffmpeg and ffprobe")
+def test_an_empty_mp4_track_is_detected_against_real_tools(
+        settings, info, plan, tmp_path, monkeypatch):
+    """No stub can pin the mp4 rule, because the shape it has to read is one
+    no stub would think to write: ffprobe prints nb_frames only when it is
+    non-zero, and the mov muxer gives a cue-less mov_text track a padding
+    sample, so a genuinely empty track reads nb_frames "1" - never "0" - and
+    admits it only through its own duration. A rule written against "0" is a
+    silent no-op on every mp4 in the library, and a stub asserting on it would
+    agree with the code about a value ffprobe cannot produce."""
+    import subprocess as sp
+    monkeypatch.setattr(shutil, "which", _REAL_WHICH)
+    ffmpeg = _REAL_WHICH("ffmpeg")
+
+    def ff(*args):
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, args)],
+               check=True, cwd=tmp_path)
+
+    ff("-f", "lavfi", "-i", "color=c=black:s=64x64:r=10:d=3", "-c:v", "libx264",
+       "-t", "3", "v.mp4")
+    (tmp_path / "a.srt").write_text("1\n00:00:00,200 --> 00:00:00,800\nreal\n")
+    # b.srt's only cue lies beyond the -t below: that is how a genuinely 0-cue
+    # track is made
+    (tmp_path / "b.srt").write_text("1\n00:00:02,500 --> 00:00:02,800\nnever\n")
+    source = tmp_path / "movie.mp4"
+    ff("-i", "v.mp4", "-i", "a.srt", "-i", "b.srt", "-map", "0:v", "-map", "1",
+       "-map", "2", "-c:v", "copy", "-c:s", "mov_text", "-t", "1", source)
+
+    enc = make_encoder(settings, info, plan, tmp_path)
+    got = enc._subtitle_plan(str(source))
+    assert [s.empty for s in got.subs] == [False, True]
+    assert [s.pos for s in got.dropped] == [1]
+    # the one-cue track is vouched for by its sample table, the empty one by a
+    # duration its cue-less samples could not add up to
+    assert got.subs[0].why.startswith("nb_frames=")
+    assert got.subs[1].why == "duration_ts=0"
+
+
+@pytest.mark.skipif(any(_REAL_WHICH(t) is None for t in ("ffmpeg", "ffprobe", "mkvmerge")),
+                    reason="needs a real ffmpeg, ffprobe and mkvmerge")
+@pytest.mark.parametrize("muxer", ["mkvmerge", "ffmpeg"])
+def test_the_srt_companion_against_real_tools(settings, plan, tmp_path,
+                                              monkeypatch, muxer):
+    """srtenc really does write <font> and {\\anN} into the text; no stub can
+    tell whether the sanitiser matches what it actually emits.
+
+    Nor can one tell which command decides the default flag in the finished
+    file: the remux writes audio_subs.mkv, mkvmerge copies that file's flags
+    track for track, and the ffmpeg fallback restates its own over them. Both
+    muxers, on a source whose ASS really is the default track."""
+    import subprocess as sp
+    real = _REAL_WHICH
+    monkeypatch.setattr(shutil, "which", real if muxer == "mkvmerge" else
+                        (lambda n, *a, **k: None if "mkvmerge" in n else real(n, *a, **k)))
+    ffmpeg, mkvmerge = real("ffmpeg"), real("mkvmerge")
+    ffprobe = real("ffprobe")
+
+    def ff(*args):
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *map(str, args)],
+               check=True, cwd=tmp_path)
+
+    shot = tmp_path / "enc_00000.ivf"
+    try:
+        ff("-f", "lavfi", "-i", "testsrc=size=160x120:rate=5:duration=2",
+           "-c:v", "libsvtav1", "-preset", "12", shot)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with libsvtav1 to build the shot")
+    ff("-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac", "sound.mka")
+    # a style that differs from srtenc's defaults, so it wraps every cue in
+    # <font>, and a cue with the alignment override it writes out literally
+    (tmp_path / "a.ass").write_text(
+        "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+        "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Source Han Sans SC Medium,24,&H00EEEEEE,&H000000FF,"
+        "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, "
+        "MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:00.20,0:00:01.50,Default,,0,0,0,,{\\an8}人多力量大\n",
+        encoding="utf-8")
+    source = tmp_path / "movie.mkv"
+    sp.run([mkvmerge, "-q", "-o", str(source), str(shot), "sound.mka",
+            "--language", "0:chi", "--track-name", "0:简体",
+            "--default-track-flag", "0:yes", "a.ass"],
+           check=True, cwd=tmp_path)
+    info = MediaInfo(path=source)
+    info.fps, info.duration = 5.0, 2.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc.concat_shots([shot])
+
+    assert enc.subtitles_added == 1
+    ident = json.loads(sp.run([mkvmerge, "-J", str(enc.output)], check=True,
+                              capture_output=True, text=True).stdout)
+    subs = [(t["properties"]["codec_id"], t["properties"].get("track_name", ""))
+            for t in ident["tracks"] if t["type"] == "subtitles"]
+    # the ASS is still there, untouched, with the plain-text copy beside it
+    assert subs[0][0] in ("S_TEXT/ASS", "S_TEXT/SSA")
+    # the source's own title, marked as the plain-text copy it is
+    assert subs[1] == ("S_TEXT/UTF8", "简体 (SRT)")
+    ff("-i", enc.output, "-map", "0:s:1", "-c", "copy", "out.srt")
+    text = (tmp_path / "out.srt").read_text(encoding="utf-8")
+    assert "人多力量大" in text
+    assert "<font" not in text and "{\\an" not in text
+    # exactly one default subtitle track in the finished file, and it is the
+    # plain-text copy: with two, a player takes the first - the ASS - and the
+    # companion never gets sent, which is the whole reason it exists
+    probed = json.loads(sp.run(
+        [ffprobe, "-v", "error", "-select_streams", "s", "-show_entries",
+         "stream=codec_name:stream_disposition=default", "-of", "json",
+         str(enc.output)], check=True, capture_output=True, text=True).stdout)
+    assert [(s["codec_name"], s["disposition"]["default"])
+            for s in probed["streams"]] == [("ass", 0), ("subrip", 1)]
