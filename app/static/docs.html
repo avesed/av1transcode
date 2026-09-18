@@ -1175,7 +1175,7 @@ python3 -m app.cli status / cancel [job_id] / check</pre>
 <div class="def" id="cli-process">
   <h3 class="def__name"><code>process &lt;file&gt;</code></h3>
   <div class="def__body"><p>提交一个文件；给目录则提交它第一层里扩展名匹配的文件。<code>-p/--preset</code> 选预设，<code>--custom key=value</code> 可重复（见<a href="#sec-custom">自定义参数</a>），<code>-s/--single</code> 在当前进程前台跑完。</p>
-    <p>不带 <code>--single</code> 只把作业写进任务库，等 <code>run</code> 来取；但它会顺带把库里 running / analyzing 的作业当成上次崩溃留下的，改回 pending。<code>run</code> 正在跑时别这样用，改用网页或 API 提交。</p></div>
+    <p>不带 <code>--single</code> 只把作业写进任务库，由正在跑的 <code>run</code> 领走（它每 2 秒看一次库），不碰库里其他作业；同一个文件已在排队或转码时不重复提交。没有 <code>run</code> 在跑时，作业就一直排队。</p></div>
 </div>
 <div class="def" id="cli-scan">
   <h3 class="def__name"><code>scan</code></h3>

@@ -180,11 +180,27 @@ def process(
     manager = TranscodeManager(settings, store)
     overrides = _parse_custom(custom)
     if single:
-        manager._process(manager.enqueue_file(file, preset=preset, overrides=overrides))
-    else:
         jid = manager.enqueue_file(file, preset=preset, overrides=overrides)
-        manager.start()
-        typer.echo(f"Submitted job {jid}. Use: {sys.argv[0]} status")
+        if not jid:
+            typer.echo(f"Nothing submitted: {file} does not exist, or holds no video files.")
+            raise typer.Exit(1)
+        manager._process(jid)
+    else:
+        # Enqueue only. The `run` service's workers poll the shared DB and pick
+        # it up. manager.start() here used to reset every running/analyzing job
+        # of that service to pending (reset_interrupted is for a service that
+        # restarts, not for a second process), and its daemon workers died with
+        # this command - a job one of them had claimed stayed "analyzing".
+        existing = store.find_active(str(Path(file)))
+        if existing:
+            typer.echo(f"Already queued or running as job {existing}; nothing submitted.")
+            return
+        jid = manager.enqueue_file(file, preset=preset, overrides=overrides)
+        if not jid:
+            typer.echo(f"Nothing submitted: {file} does not exist, or holds no video files.")
+            raise typer.Exit(1)
+        typer.echo(f"Submitted job {jid}; the running service picks it up "
+                   f"(start one with: {sys.argv[0]} run). Check with: {sys.argv[0]} status")
 
 
 @app.command()

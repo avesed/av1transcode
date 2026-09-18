@@ -765,3 +765,38 @@ def test_cancel_endpoint_tells_a_finished_job_from_a_missing_one(settings, store
     assert r.status_code == 409 and "done" in r.json()["detail"]
     assert store.get(jid)["status"] == db.DONE
     assert client.post("/api/jobs/no-such-job/cancel").status_code == 404
+
+
+# ------------------------------------------------------------------- cli ----
+
+def test_cli_process_only_enqueues(settings, store, tmp_path, monkeypatch):
+    """`cli process FILE` called manager.start(), whose reset_interrupted()
+    exists for a service restarting after a crash: run as a second process
+    beside the `run` service it put every job that service was encoding back
+    to pending, and its daemon workers died with the command - a job one of
+    them had claimed stayed "analyzing" until the next restart."""
+    import threading
+
+    from typer.testing import CliRunner
+
+    from app import cli
+
+    monkeypatch.setattr(cli, "load_settings", lambda _config=None: settings)
+    busy = store.create(source=str(tmp_path / "busy.mkv"), preset="balanced")
+    store.update(busy, status=db.RUNNING, stage="encoding")
+    src = tmp_path / "new.mkv"
+    src.write_bytes(b"x")
+    workers = {t.name for t in threading.enumerate() if t.name.startswith("worker-")}
+
+    r = CliRunner().invoke(cli.app, ["process", str(src)])
+
+    assert r.exit_code == 0, r.output
+    assert store.get(busy)["status"] == db.RUNNING
+    new = store.find_active(str(src))
+    assert new and store.get(new)["status"] == db.PENDING
+    assert {t.name for t in threading.enumerate() if t.name.startswith("worker-")} == workers
+
+    again = CliRunner().invoke(cli.app, ["process", str(src)])
+    assert again.exit_code == 0 and f"Already queued or running as job {new}" in again.output
+    missing = CliRunner().invoke(cli.app, ["process", str(tmp_path / "gone.mkv")])
+    assert missing.exit_code == 1 and "does not exist" in missing.output
