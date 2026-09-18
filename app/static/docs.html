@@ -2,76 +2,238 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
   <title>说明 - AV1 Transcode Archive</title>
+  <link rel="stylesheet" href="/static/base.css">
   <style>
-    :root {
-      --bg: #14161a; --panel: #1d2128; --border: #2c323c;
-      --text: #dfe3e9; --muted: #8b95a5; --accent: #4f9cf9;
-      --ok: #3ecf6e; --warn: #e3b341; --err: #ef6b6b;
+    /* No script element on this page, on purpose. It is the page that gets
+       read when the queue is wedged or the API refuses writes, so it has to
+       render from this file and base.css alone, and still read as a plain
+       outline (h1, the sections, one heading per parameter) with styles off.
+       Everything below is layout; nothing here is needed to reach a sentence. */
+
+    /* Room under the last section for the fixed "↑ 目录" link, or it sits on
+       top of the API entries' last lines at full scroll. */
+    .docs{ padding-bottom: calc(var(--s7) + var(--touch-main) + var(--s4) + env(safe-area-inset-bottom, 0px)); }
+    .docs__head{ margin-bottom: var(--s4); }
+    .docs__head h1{ margin-bottom: var(--s2); }
+    .legend{ margin: 0; color: var(--dim); font-size: var(--t-meta); line-height: var(--lh-data); }
+
+    /* ---- table of contents ----
+       One list serves both widths. Below 1024px it is a closed details
+       element, so the phone opens on content rather than on a screen of links.
+       At 1024px and up the same closed element is forced visible and becomes
+       the sticky rail: a second copy of the list would render twice with CSS
+       off. Where ::details-content is missing the rail degrades to that one
+       summary, which still opens it. */
+    .toc{ margin-bottom: var(--s5); }
+    .toc__fold > summary{
+      display: flex; align-items: center; gap: var(--s2);
+      min-height: var(--touch-main); padding: 0 var(--s3);
+      background: var(--sheet);
+      border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+      font-weight: 500; cursor: pointer; list-style: none;
     }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-           background: var(--bg); color: var(--text); line-height: 1.65; }
-    header { display: flex; align-items: center; gap: 16px; padding: 14px 22px;
-             background: var(--panel); border-bottom: 1px solid var(--border); }
-    header h1 { font-size: 18px; margin: 0; font-weight: 600; }
-    header nav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-left: 14px; }
-    header nav a:hover { color: var(--text); }
-    main { padding: 20px 22px; max-width: 960px; margin: 0 auto; }
-    main :is(pre, table) { max-width: 100%; overflow-x: auto; }
-    main img { max-width: 100%; height: auto; }
-    @media (max-width: 620px) {
-      header { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
-      header h1 { font-size: 16px; }
-      header nav { margin-left: auto; }
-      header nav a { margin-left: 10px; }
-      main { padding: 14px 12px; }
-      main code { word-break: break-word; }
+    .toc__fold > summary::-webkit-details-marker{ display: none; }
+    .toc__fold > summary::before{
+      content: ""; flex: none; width: 0; height: 0;
+      border-left: 5px solid currentColor;
+      border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+      transition: transform .18s ease-out;
     }
-    h2 { font-size: 17px; margin: 32px 0 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
-    h3 { font-size: 14px; margin: 20px 0 6px; color: var(--accent); }
-    p { font-size: 13.5px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 8px 0 16px; }
-    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
-    th { color: var(--muted); font-weight: 500; background: var(--panel); }
-    td code, p code, li code { background: var(--panel); border: 1px solid var(--border);
-      border-radius: 4px; padding: 1px 6px; font-size: 12px; }
-    pre { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-          padding: 12px 16px; overflow-x: auto; font-size: 12.5px; }
-    .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 99px; margin-left: 6px; }
-    .tag.core { background: rgba(62,207,110,.15); color: var(--ok); }
-    .tag.adv { background: rgba(227,179,65,.15); color: var(--warn); }
-    ul { font-size: 13.5px; }
+    .toc__fold[open] > summary::before{ transform: rotate(90deg); }
+    .toc__list, .toc__list ol{ list-style: none; margin: 0; padding: 0; }
+    .toc__list li{ margin: 0; }
+    .toc__list a{
+      display: flex; align-items: center;
+      padding: var(--s1) var(--s2);
+      color: var(--dim); text-decoration: none;
+      font-size: var(--t-meta); line-height: var(--lh-data);
+    }
+    .toc__list a:hover{ color: var(--type); }
+    /* The fixed "↑ 目录" link targets the list, not the details element:
+       fragment navigation into a closed details element opens it, so the
+       return trip is one tap. The extra margin keeps the summary above the
+       list out from under the bar. */
+    #toc{ scroll-margin-top: calc(var(--anchor-offset) + var(--touch-main)); }
+
+    /* Phone and tablet: full-width rows, because a thumb reaches across a row
+       but not into the far column of a grid, and an indented sub-entry only
+       reads as a child when it sits directly under its parent. Two columns
+       from 561px, flowing top to bottom so the parent stays with its child. */
+    @media (max-width: 1023.98px){
+      .toc__list{ padding-top: var(--s1); column-gap: var(--s5); }
+      .toc__list > li{ break-inside: avoid; }
+      .toc__list a{ min-height: var(--touch); border-bottom: 1px solid var(--rule); }
+      .toc__list ol a{ padding-left: var(--s5); }
+      .toc-return{
+        position: fixed; z-index: var(--z-bar);
+        right: calc(var(--pad) + env(safe-area-inset-right, 0px));
+        bottom: calc(var(--s4) + env(safe-area-inset-bottom, 0px));
+        display: inline-flex; align-items: center;
+        min-height: var(--touch-main); padding: 0 var(--s4);
+        background: var(--sheet-2); border: 1px solid var(--edge); border-radius: var(--r-ctl);
+        color: var(--type); text-decoration: none; font-size: var(--t-meta);
+      }
+    }
+    @media (min-width: 1024px){
+      .docs{
+        display: grid;
+        grid-template-columns: 200px minmax(0, 82ch);
+        grid-template-rows: auto 1fr;
+        column-gap: var(--s6);
+        justify-content: center;
+        max-width: none;
+      }
+      .docs__head{ grid-column: 2; grid-row: 1; }
+      .docs > article{ grid-column: 2; grid-row: 2; min-width: 0; }
+      .toc{
+        grid-column: 1; grid-row: 1 / 3; align-self: start;
+        position: sticky; top: calc(var(--bar-total) + var(--s5));
+        max-height: calc(100vh - var(--bar-total) - 2 * var(--s5));
+        overflow-y: auto; margin: 0;
+      }
+      @supports selector(::details-content){
+        .toc__fold > summary{ display: none; }
+        .toc__fold:not([open])::details-content{ content-visibility: visible; }
+      }
+      .toc__list a{ min-height: 32px; padding: var(--s1) var(--s3); border-left: 2px solid transparent; }
+      @media (pointer: coarse){ .toc__list a{ min-height: var(--touch); } }   /* a landscape iPad is 1180px wide */
+      .toc__list ol a{ padding-left: var(--s5); }
+      .toc-return{ display: none; }
+    }
+    @media (min-width: 561px) and (max-width: 1023.98px){ .toc__list{ columns: 2; } }
+
+    /* Where a jump landed. A deep link from a settings field lands mid-section,
+       out of sight of its heading; the rail item and the entry both say "here".
+       :target rather than a scroll spy, because there is no script to spy with. */
+    .docs:has(#sec-workers:target, #sec-workers :target) .toc a[href="#sec-workers"],
+    .docs:has(#sec-flow:target, #sec-flow :target) .toc a[href="#sec-flow"],
+    .docs:has(#sec-output:target, #sec-output :target) .toc a[href="#sec-output"],
+    .docs:has(#sec-presets:target, #sec-presets :target) .toc a[href="#sec-presets"],
+    .docs:has(#sec-custom:target) .toc a[href="#sec-custom"],
+    .docs:has(#sec-opt:target, #sec-opt :target) .toc a[href="#sec-opt"],
+    .docs:has(#sec-opt-detect:target) .toc a[href="#sec-opt-detect"],
+    .docs:has(#sec-opt-probe:target) .toc a[href="#sec-opt-probe"],
+    .docs:has(#sec-opt-score:target) .toc a[href="#sec-opt-score"],
+    .docs:has(#sec-opt-res:target) .toc a[href="#sec-opt-res"],
+    .docs:has(#sec-gpu:target, #sec-gpu :target) .toc a[href="#sec-gpu"],
+    .docs:has(#sec-subs:target, #sec-subs :target) .toc a[href="#sec-subs"],
+    .docs:has(#sec-dovi:target, #sec-dovi :target) .toc a[href="#sec-dovi"],
+    .docs:has(#sec-verify:target, #sec-verify :target) .toc a[href="#sec-verify"],
+    .docs:has(#sec-glossary:target, #sec-glossary :target) .toc a[href="#sec-glossary"],
+    .docs:has(#sec-config:target, #sec-config :target) .toc a[href="#sec-config"],
+    .docs:has(#sec-env:target, #sec-env :target) .toc a[href="#sec-env"],
+    .docs:has(#sec-cli:target, #sec-cli :target) .toc a[href="#sec-cli"],
+    .docs:has(#sec-api:target, #sec-api :target) .toc a[href="#sec-api"]{
+      color: var(--type); border-left-color: var(--type);
+    }
+    .def:target{
+      background: var(--signal-bg);
+      margin-inline: calc(var(--s3) * -1); padding-inline: var(--s3);
+    }
+
+    /* ---- entries ----
+       The five tables are .def blocks now: table cells ignore overflow, so at
+       390px the old 说明 column was squeezed to a 15-line tower of one or two
+       characters and the page ran 502px wide. .prose h3 would hand every entry
+       name a 24px top margin; the entry's own border-top is its separator. */
+    .prose .def__name{ margin: 0; }
+    /* The h2's own rule already separates it from a first entry; a second rule
+       25px lower reads as an empty entry. */
+    .prose h2 + .def{ border-top: 0; padding-top: 0; }
+    /* Plain-text runs like crf/preset/film_grain/passes/…/tune have no break
+       opportunity; that one sentence alone ran this page to 579px at 390. */
+    .prose{ overflow-wrap: break-word; }
+    .def__dflt{ overflow-wrap: anywhere; }
+    /* Values on the 默认 / 配置段 / 方法 line are machine strings, so they are
+       code elements, but a chip on a 12px dim line outweighs the entry name. */
+    .def__dflt code{ padding: 0; background: none; border: 0; font-size: inherit; }
+    .def__body p{ margin-bottom: 0; }
+    /* base.css spans the body over the name and default rows; without a
+       flexible second row a long body splits its height evenly and pushes
+       "默认 …" halfway down, away from the name it belongs to. */
+    @media (min-width: 1024px){ .def{ grid-template-rows: auto 1fr; } }
+    .def__foot{
+      display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--s4);
+      margin: var(--s2) 0 0; line-height: var(--lh-data);
+    }
+    .def__foot .def__link{ margin-top: 0; }
+    .def__also{ font-size: var(--t-meta); color: var(--dim); text-decoration: none; }
+    .def__also:hover{ color: var(--type); }
+    /* 44px tap height on touch, but the empty half of it hangs into the
+       entry's bottom padding instead of adding a blank band under every entry. */
+    @media (pointer: coarse){
+      .def__foot{ margin: 0 0 calc(var(--s3) * -1); }
+      .def__foot a{ display: inline-flex; align-items: center; min-height: var(--touch); }
+    }
   </style>
 </head>
 <body>
-<header>
-  <h1>AV1 Transcode Archive</h1>
-  <nav>
-    <a href="/">首页</a>
+<header class="bar">
+  <a class="bar__title" href="/"><span class="bar__full">AV1 Transcode Archive</span><span class="bar__short">说明</span></a>
+  <nav class="bar__nav">
+    <a href="/">队列</a>
     <a href="/static/settings.html">设置</a>
-    <a href="/static/docs.html">说明</a>
+    <a href="/static/docs.html" aria-current="page">说明</a>
   </nav>
 </header>
-<main>
+<main class="docs">
 
+<div class="docs__head">
+  <h1>说明</h1>
+  <p class="legend"><span class="tag core">核心</span> = 经常要动的 · <span class="tag adv">进阶</span> = 知道自己在做什么再动</p>
+</div>
+
+<nav class="toc" aria-label="目录">
+  <details class="toc__fold">
+    <summary>目录</summary>
+    <ol class="toc__list" id="toc">
+      <li><a href="#sec-workers">并行处理</a></li>
+      <li><a href="#sec-flow">工作流程</a></li>
+      <li><a href="#sec-output">输出行为</a></li>
+      <li><a href="#sec-presets">预设与编码参数</a>
+        <ol><li><a href="#sec-custom">自定义参数（临时覆盖，不写回预设）</a></li></ol></li>
+      <li><a href="#sec-opt">Shot-based 优化器引擎（engine=optimizer）</a>
+        <ol><li><a href="#sec-opt-detect">分镜</a></li><li><a href="#sec-opt-probe">探测</a></li><li><a href="#sec-opt-score">打分</a></li><li><a href="#sec-opt-res">并发与内存</a></li></ol></li>
+      <li><a href="#sec-gpu">GPU 与硬件</a></li>
+      <li><a href="#sec-subs">字幕处理</a></li>
+      <li><a href="#sec-dovi">Dolby Vision / HDR</a></li>
+      <li><a href="#sec-verify">成品校验</a></li>
+      <li><a href="#sec-glossary">作业阶段与状态词表</a></li>
+      <li><a href="#sec-config">config.yaml 全部配置</a></li>
+      <li><a href="#sec-env">环境变量覆盖</a></li>
+      <li><a href="#sec-cli">CLI 用法</a></li>
+      <li><a href="#sec-api">API</a></li>
+    </ol>
+  </details>
+</nav>
+
+<article class="prose">
+
+<section id="sec-workers">
 <h2>并行处理</h2>
-<p>并行分两层，可在<b>设置</b>页调整（即时生效，持久化到 <code>dirs.settings_file</code>，默认 <code>/data/settings.json</code>）：</p>
+<p>并行分两层，可在<a href="/static/settings.html#sec-workers">设置页</a>调整（即时生效，持久化到 <code>dirs.settings_file</code>，默认 <code>/data/settings.json</code>）：</p>
 <ul>
   <li><code>concurrency</code>（并行任务数，默认 1）：同时转码几个文件。增大后多个任务同时进行，会显著提高 CPU/内存占用。</li>
-  <li><code>av1an_workers</code>（任务内切片并行，默认 0）：每个任务内部 av1an 用多少线程并行编码切片；0 = 自动（av1an 按 CPU 核数分配）。</li>
+  <li><code>av1an_workers</code>（任务内切片并行，默认 0）：每个任务内部 av1an 用多少线程并行编码切片；0 = 自动（av1an 按 CPU 核数分配）。只对 <code>engine=av1an</code> 的任务生效，每个任务开始时读一次；optimizer 引擎不看它，它的并行由 <a href="#p-probe_workers"><code>probe_workers</code></a> / <a href="#p-encode_workers"><code>encode_workers</code></a> 决定（0 都是按容器的 cgroup 预算自动算）。</li>
 </ul>
-<p>各取值对资源占用的影响：<code>concurrency × av1an_workers</code> 约等于峰值同时运行的编码进程数。减小编号即时生效：已排队的任务不受影响，当前任务完成后对应的 worker 会自动退出。</p>
+<p>各取值对资源占用的影响：<code>concurrency × av1an_workers</code> 约等于 av1an 引擎峰值同时运行的编码进程数。减小并发数即时生效：已排队的任务不受影响，当前任务完成后对应的 worker 会自动退出。</p>
+<p>已知问题：同一次运行里减小过并发数、再调大时，新开的 worker 会立刻退出，设置页的「运行中的 worker」停在减小后的数目，日志却照样写 <code>Grew worker pool to N</code>。绕过办法：先按「运行中的 worker」当前的数目保存一次，再保存想要的值；或者等队列空了重启（新值已经存盘）。</p>
+</section>
 
+<section id="sec-flow">
 <h2>工作流程</h2>
-<p><b>默认不会自动入队任何文件</b>（<code>watcher.enabled: false</code>）：只有通过首页表单 / API <code>POST /api/jobs</code> 手动指定的文件或目录才会被转码。如需恢复自动监视，在 config.yaml 中设置 <code>watcher.enabled: true</code>。</p>
-<p>提交的文件会分析（Dolby Vision P5/P7/P8 → HDR10（保留/附带 RPU），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
+<p><b>默认不会自动入队任何文件</b>（<code>watcher.enabled: false</code>）：只有通过首页表单 / API <code>POST /api/jobs</code> / CLI（<code>process</code>、<code>scan</code>）手动指定的文件或目录才会被转码。如需恢复自动监视，在 config.yaml 中设置 <code>watcher.enabled: true</code>。</p>
+<p>提交的文件会分析（Dolby Vision P5/P7/P8 → HDR10（RPU 默认另存为 <code>.rpu.bin</code>，成品本身不带 DV），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
 <ul>
   <li>已是 AV1 的源默认跳过（<code>skip_existing_av1</code>）。</li>
-  <li>成功后源文件<b>默认保留</b>在原位置。可选：在设置页开启「删除源文件」（需要二次确认，危险操作）。</li>
+  <li>成功后源文件<b>默认保留</b>在原位置。可选：在<a href="/static/settings.html#sec-safety">设置页</a>开启「转码成功后删除源文件」（需要二次确认，危险操作）。</li>
 </ul>
+</section>
 
+<section id="sec-output">
 <h2>输出行为</h2>
 <p>默认（<code>dirs.output</code>/<code>dirs.rpu</code> 为 null）转码输出到<b>源文件所在目录下的 <code>av1/</code> 子目录</b>：</p>
 <pre>movies/
@@ -82,141 +244,1111 @@
         └── Big Buck Bunny.rpu.bin   # 抽取的 Dolby Vision RPU（仅 DV 源且 save_rpu=true）
 </pre>
 <p>若在 <code>config.yaml</code> 中配置了固定的 <code>dirs.output</code>/<code>dirs.rpu</code>，则所有输出集中到这些目录。监视器（watcher）会排除 <code>av1</code>/<code>work</code>/<code>rpu</code> 目录，避免把转码输出再次入队。</p>
+</section>
 
+<section id="sec-presets">
 <h2>预设与编码参数</h2>
-<p>预设可在<b>设置</b>页添加/编辑/删除并持久化（存于 <code>dirs.presets_file</code>，默认 <code>/data/presets.json</code>）。自定义预设可覆盖内置同名预设，内置预设删除后自动恢复 config.yaml 中的定义。</p>
-<table>
-  <tr><th>参数</th><th>默认</th><th>说明</th></tr>
-  <tr><td><code>engine</code></td><td>av1an</td><td><code>av1an</code>（默认，串行质量探测）或 <code>optimizer</code>（Netflix 式 Shot-based 并行探测）。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>target_metric</code></td><td>vmaf</td><td>optimizer 引擎的探测指标：<code>vmaf</code> 或 <code>ssimulacra2</code>（均 0-100，越高越好）。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>crf</code></td><td>28</td><td>恒定码率因子：越低质量越高、文件越大。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>preset</code></td><td>4</td><td>SVT-AV1 速度档 0-13：0 最慢最好，6 快；4-6 是常见区间。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>passes</code></td><td>1</td><td>编码遍数；2 = 两遍（先探测再编码）。</td></tr>
-  <tr><td><code>film_grain</code></td><td>0</td><td>胶片颗粒合成 0-50；0 关闭，8-10 适合有颗粒的电影源（能显著省码率）。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>film_grain_denoise</code></td><td>false</td><td>合成颗粒前先对源去噪，配合 film_grain 使用。</td></tr>
-  <tr><td><code>keyint</code></td><td>240</td><td>关键帧间隔（帧数）。</td></tr>
-  <tr><td><code>extra_split_sec</code></td><td>60</td><td>长场景按秒数再切分，便于多 worker 并行；0 = 不切。</td></tr>
-  <tr><td><code>min_scene_len</code></td><td>24</td><td>场景检测最小长度（帧），防止过碎分段。</td></tr>
-  <tr><td><code>tune</code></td><td>0</td><td>0=VQ（视觉质量）、1=PSNR、2=SSIM。</td></tr>
-  <tr><td><code>pixel_format</code></td><td>yuv420p10le</td><td>10-bit 保色阶；HDR 源请保持 10bit。</td></tr>
-  <tr><td><code>target_quality</code></td><td>空</td><td>分场景质量目标。av1an 引擎：VMAF 区间如 <code>75-85</code>，每个场景用串行二分探测调 CRF。optimizer 引擎：并行探测 + 插值，取区间下限为目标。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>probes</code></td><td>0</td><td>分场景探测次数上限（0 = av1an 默认 4）。越多越准越慢。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>probing_rate</code></td><td>0</td><td>探测时每隔 n 帧取一帧算 VMAF（1 = 全部帧）；n&gt;4 通常不可用。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>probe_res</code></td><td>空</td><td>探测用分辨率，覆盖 <code>probe_scale</code>。<b>建议留空</b>：探测分辨率与正式编码不同，等于用另一条 RD 曲线挑 CRF，选出来的值不成立。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>probing_vmaf_features</code></td><td>空</td><td>探测用 VMAF 特征组合，如 <code>default motionless</code>、<code>weighted neg</code>。<b>仅 av1an 引擎</b>生效；optimizer 引擎忽略该值（ffmpeg libvmaf 无法解析 av1an 语法，默认 VMAF 特征已够用）。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>vmaf_threads</code></td><td>0</td><td>探测阶段 VMAF 计算线程数（0 = 自动 = 核数/probe_workers）。ffmpeg libvmaf 自身默认是单线程，4K 下比它要测的探测编码还慢。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>probe_video_params</code></td><td>空</td><td>探测阶段编码参数，建议更快 preset 如 <code>preset=10</code>；<code>copy</code> = 与正式编码相同。<span class="tag adv">进阶</span></td></tr>
-  <tr><td><code>additional_video_params</code></td><td>空</td><td>原样透传给 SVT-AV1 的额外参数，空格分隔，如 <code>--sharpness 1</code>。<span class="tag adv">进阶</span></td></tr>
-</table>
+<p>预设可在<a href="/static/settings.html#sec-presets">设置页</a>添加/编辑/删除并持久化（存于 <code>dirs.presets_file</code>，默认 <code>/data/presets.json</code>）。自定义预设可覆盖内置同名预设，内置预设删除后自动恢复 config.yaml 中的定义。</p>
+<div class="def" id="p-codec">
+  <h3 class="def__name"><code>codec</code></h3>
+  <p class="def__dflt">默认 <code>svt-av1</code></p>
+  <div class="def__body"><p>编码器，唯一合法值是 <code>svt-av1</code>：写别的值，保存预设会返回 422，写进 config.yaml 则启动时校验失败；作为自定义参数传进来不报错，也不起作用。两个引擎其实都不读它，编码器是写死的（av1an 引擎传 <code>--encoder svt-av1</code>，optimizer 引擎的正式编码用 ffmpeg 的 <code>libsvtav1</code>），所以设置页的预设编辑器里没有这一项。</p></div>
+</div>
+<div class="def" id="p-engine">
+  <h3 class="def__name"><code>engine</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 <code>av1an</code></p>
+  <div class="def__body"><p><code>av1an</code>（默认，串行质量探测）或 <code>optimizer</code>（Netflix 式 Shot-based 并行探测）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-target_metric">
+  <h3 class="def__name"><code>target_metric</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 <code>vmaf</code></p>
+  <div class="def__body"><p>optimizer 引擎的探测指标：<code>vmaf</code>、<code>ssimulacra2</code>（均 0-100，越高越好）或 <code>xpsnr</code>。<code>xpsnr</code> 是 dB 标度（约 42 ≈ 视觉无损，随内容变），不是 0-100，换用它必须重设 <code>target_quality</code>；<code>ssimulacra2</code> 虽然也是 0-100，刻度和 VMAF 不同，换用它同样要重设。av1an 引擎不读这一项，它的命令行只给了 VMAF 模型。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-crf">
+  <h3 class="def__name"><code>crf</code> <span class="tag core">核心</span></h3>
+  <p class="def__dflt">默认 28</p>
+  <div class="def__body"><p>恒定码率因子：越低质量越高、文件越大。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-preset">
+  <h3 class="def__name"><code>preset</code> <span class="tag core">核心</span></h3>
+  <p class="def__dflt">默认 4</p>
+  <div class="def__body"><p>SVT-AV1 速度档 0-13：0 最慢最好，6 快；4-6 是常见区间。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-passes">
+  <h3 class="def__name"><code>passes</code></h3>
+  <p class="def__dflt">默认 1</p>
+  <div class="def__body"><p>编码遍数；2 = 两遍（先探测再编码）。只对 av1an 引擎生效，optimizer 引擎不读它。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-film_grain">
+  <h3 class="def__name"><code>film_grain</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>胶片颗粒合成 0-50；0 关闭，8-10 适合有颗粒的电影源（能显著省码率）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-film_grain_denoise">
+  <h3 class="def__name"><code>film_grain_denoise</code></h3>
+  <p class="def__dflt">默认 <code>false</code></p>
+  <div class="def__body"><p>合成颗粒前先对源去噪，配合 film_grain 使用。注意目前设成 <code>true</code> 不起作用：程序只在 <code>false</code> 时显式传 <code>film-grain-denoise=0</code>，<code>true</code> 时什么都不传、交给 SVT-AV1 自己的默认值，而镜像里的 SVT-AV1 v4.2.0 默认就是 0（不去噪）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-luminance_qp_bias">
+  <h3 class="def__name"><code>luminance_qp_bias</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>SVT-AV1 的 <code>--luminance-qp-bias</code>：按帧平均亮度降 QP，给暗帧更多比特；0 关，1-100。实测 50 时体积 +9~10%，换来更少够不到目标的镜头（完整数据见设置页这一项的实测说明）。亮场也会涨，不只作用于暗帧；值不值得是对片库的判断，所以它是按预设开的开关，不是全局默认。只对 optimizer 引擎生效：av1an 引擎的命令行不带它。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-keyint">
+  <h3 class="def__name"><code>keyint</code></h3>
+  <p class="def__dflt">默认 240</p>
+  <div class="def__body"><p>关键帧间隔（帧数）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-extra_split_sec">
+  <h3 class="def__name"><code>extra_split_sec</code></h3>
+  <p class="def__dflt">默认 60</p>
+  <div class="def__body"><p>长场景按秒数再切分，便于多 worker 并行；0 = 不切。只对 av1an 引擎生效。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-min_scene_len">
+  <h3 class="def__name"><code>min_scene_len</code>（预设）</h3>
+  <p class="def__dflt">默认 24</p>
+  <div class="def__body"><p>场景检测最小长度（帧），防止过碎分段。只对 av1an 引擎生效；optimizer 引擎用优化器设置里的同名参数。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a> <a class="def__also" href="#p-opt-min_scene_len">↔ 优化器里的同名参数</a></p></div>
+</div>
+<div class="def" id="p-tune">
+  <h3 class="def__name"><code>tune</code></h3>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>0=VQ（视觉质量）、1=PSNR、2=SSIM。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-pixel_format">
+  <h3 class="def__name"><code>pixel_format</code></h3>
+  <p class="def__dflt">默认 <code>yuv420p10le</code></p>
+  <div class="def__body"><p>10-bit 保色阶；HDR 源请保持 10bit。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-target_quality">
+  <h3 class="def__name"><code>target_quality</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 空</p>
+  <div class="def__body"><p>分场景质量目标。av1an 引擎：VMAF 区间如 <code>75-85</code>，每个场景用串行二分探测调 CRF。optimizer 引擎：并行探测 + 插值，取区间下限为目标。留空 = 固定 CRF 编码；optimizer 引擎必须填，留空的作业会被直接标为已跳过。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probes">
+  <h3 class="def__name"><code>probes</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>分场景探测次数上限（0 = av1an 默认 4）。越多越准越慢。optimizer 引擎里它从 <a href="#p-probe_crfs"><code>probe_crfs</code></a> 里均匀挑这么多个点（保留两端），0 = 用整个网格。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probing_rate">
+  <h3 class="def__name"><code>probing_rate</code>（预设） <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>探测时每隔 n 帧取一帧算 VMAF（1 = 全部帧）；n&gt;4 通常不可用。0 = 不设：optimizer 引擎用优化器设置里的值，av1an 引擎不传这个参数。optimizer 引擎里抽掉的是探测编码的输入帧，&gt;1 会低估质量。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a> <a class="def__also" href="#p-opt-probing_rate">↔ 优化器里的同名参数</a></p></div>
+</div>
+<div class="def" id="p-probe_res">
+  <h3 class="def__name"><code>probe_res</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 空</p>
+  <div class="def__body"><p>探测用分辨率，覆盖 <code>probe_scale</code>。<b>建议留空</b>：探测分辨率与正式编码不同，等于用另一条 RD 曲线挑 CRF，选出来的值不成立。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probing_vmaf_features">
+  <h3 class="def__name"><code>probing_vmaf_features</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 空</p>
+  <div class="def__body"><p>探测用 VMAF 特征组合，如 <code>default motionless</code>、<code>weighted neg</code>。av1an 引擎按空格拆开传给 <code>--probing-vmaf-features</code>。av1an 语法（如 <code>default motionless</code>）optimizer 会忽略并打一次告警；含 <code>=</code> 或 <code>|</code> 的合法 ffmpeg libvmaf 配置会原样透传给 <code>feature=</code>。填了任何值，这个作业都不走零拷贝打分（<code>vmaf_zero_copy</code>）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vmaf_threads">
+  <h3 class="def__name"><code>vmaf_threads</code>（预设） <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>探测阶段 VMAF 计算线程数（0 = 自动 = 核数/probe_workers）。ffmpeg libvmaf 自身默认是单线程，4K 下比它要测的探测编码还慢。写了会盖过优化器设置里的值，包括校验阶段。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a> <a class="def__also" href="#p-opt-vmaf_threads">↔ 优化器里的同名参数</a></p></div>
+</div>
+<div class="def" id="p-probe_video_params">
+  <h3 class="def__name"><code>probe_video_params</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 空</p>
+  <div class="def__body"><p>探测阶段编码参数，建议更快 preset 如 <code>preset=10</code>；<code>copy</code> = 与正式编码相同。optimizer 引擎只从里面取 preset：留空 = 优化器设置里的 <a href="#p-probe_preset"><code>probe_preset</code></a>，<code>copy</code> = 正式编码的 preset，其余参数不用——探测的其它编码参数一律和正式编码相同。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-additional_video_params">
+  <h3 class="def__name"><code>additional_video_params</code> <span class="tag adv">进阶</span></h3>
+  <p class="def__dflt">默认 空</p>
+  <div class="def__body"><p>原样透传给 SVT-AV1 的额外参数，空格分隔，如 <code>--sharpness 1</code>。<code>--key value</code> 和 <code>key=value</code> 两种写法都接受。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
 
-<h3>自定义参数（临时覆盖，不落盘）</h3>
-<p>首页表单的“自定义参数”框，或 CLI <code>--custom key=value</code>（可重复），按 <code>key=value</code> 逗号/分号分隔。值会覆盖所选预设的同名字段：</p>
+<h3 id="sec-custom">自定义参数（临时覆盖，不写回预设）</h3>
+<p>首页表单的“自定义参数”框按逗号/分号分隔多个 <code>key=value</code>；CLI 用 <code>--custom key=value</code>，一次一个、可重复。两边都只在第一个 <code>=</code> 处切开，所以值里还能带 <code>=</code>，如 <code>probe_video_params=preset=10</code>。值会覆盖所选预设的同名字段：</p>
 <pre>crf=24,preset=3,target_quality=75-85,film_grain_denoise=true</pre>
-<p>数字字段自动转 int（crf/preset/film_grain/passes/keyint/extra_split_sec/min_scene_len/tune），布尔字段接受 <code>true/false/1/0</code>（film_grain_denoise），其余按字符串（target_quality、additional_video_params、pixel_format）。预设选 <code>custom</code> 时以默认视频参数为基准，全部由自定义参数决定。</p>
+<p>CLI 会转类型：数字字段转 int（crf/preset/film_grain/luminance_qp_bias/passes/keyint/extra_split_sec/min_scene_len/tune/probes/probing_rate/vmaf_threads），布尔字段接受 <code>true/false/1/0</code>（film_grain_denoise），其余按字符串（target_quality、additional_video_params、pixel_format）。首页表单目前不转：每个值都按输入的字符串提交，服务端也不再转换，所以要跟数字比大小的字段从首页填会让作业失败，已知的有 <code>passes</code>（av1an 引擎）、<code>probes</code> 和 <code>probing_rate</code>（optimizer 引擎）；这几项请写进预设，或用 CLI / API（<code>overrides</code> 里直接给数字）。</p>
+<p>不认识的键和空值服务端直接忽略（首页会提示不认识的键）。覆盖值随作业存进任务库，重试时照样生效，但不会写回预设。预设选 <code>custom</code> 时以默认预设（<code>transcode.default_preset</code>，默认 <code>balanced</code>）当前的值为基准，只改自定义参数里写到的项。</p>
+</section>
 
+<section id="sec-opt">
 <h2>Shot-based 优化器引擎（engine=optimizer）</h2>
 <p>Netflix 风格的逐镜头（shot-based）编码。av1an 的 <code>--target-quality</code> 是<b>串行</b>探测：先完整探测完一个 chunk 再探测下一个。optimizer 引擎改为<b>所有镜头并行探测</b>，并用插值获得比 av1an 4 次二分更精细的每镜头 CRF：</p>
 <ol>
-  <li><b>分镜</b>：默认用 ffmpeg 的 <code>scdet</code> 滤镜单趟扫描源，不落任何中间文件（<code>scenedetect_engine: scdet</code>）。实测对三个 4K 源，切点与旧的 PySceneDetect 路径一处完全一致、另两处各多一个；整个阶段从 44.7s / 255s CPU 降到 12.2s / 8s。<code>scenedetect_engine: pyscenedetect</code> 可切回旧路径（写一份降采样副本再用 OpenCV 逐帧读）。</li>
-  <li><b>并行探测</b>：用 <code>probe_workers</code> 个 worker 同时探测每个镜头的一串 CRF（<code>probe_crfs</code>），每个探测点按<b>源分辨率、源位深、与正式编码相同的编码参数</b>（仅 preset 更快）编码，再算 VMAF/SSIMULACRA2。送进 libvmaf 前两路统一缩到 <code>vmaf_width</code>（默认 1920，只缩不放、保持比例），因为 vmaf_v0.6.1 是按 1080p 训练的。镜头过长时按 <code>probe_max_frames</code> 取中间一段<b>连续</b>帧。</li>
-  <li><b>选 CRF</b>：对每个镜头在 (CRF, 分数) 曲线上插值，取命中 <code>target_quality</code> 下限的 CRF（区间超出探测范围时钳制到边界）。</li>
+  <li><b>分镜</b>：默认用 ffmpeg 的 <code>scdet</code> 滤镜单趟扫描源，不落任何中间文件（<code>scenedetect_engine: scdet</code>）。实测对三个 4K 源，切点与旧的 PySceneDetect 路径一处完全一致、另两处各多一个；整个阶段从 44.7s / 255s CPU 降到 12.2s / 8s。<code>scenedetect_engine: pyscenedetect</code> 可切回旧路径（写一份降采样副本再用 OpenCV 逐帧读）。切出来的镜头再按 <code>min_shot_frames</code>、<code>max_shots</code> 合并。</li>
+  <li><b>并行探测</b>：所有镜头按内存和 CPU 预算尽量多地同时探测（<code>probe_workers</code> 只是可选的硬上限，见<a href="#sec-opt-res">并发与内存</a>）。每个镜头先探 <code>probe_crfs</code> 网格的两端和中间点，再在夹住目标的区间里二分，区间窄到 <code>probe_bracket_width</code> 就停（设 0 则整张网格全探）。每个探测点按<b>源分辨率、与正式编码相同的像素格式和编码参数</b>（仅 preset 更快）编码，再按 <code>target_metric</code> 打分（VMAF、SSIMULACRA2 或 XPSNR）。用 VMAF 时，源宽低于 <code>vmaf_4k_min_width</code>（默认 2560）的，送进 libvmaf 前两路统一缩到 <code>vmaf_width</code>（默认 1920，只缩不放、保持比例），因为 vmaf_v0.6.1 是按 1080p 训练的；达到这个宽度的改用 <code>vmaf_model_4k</code> 按原生分辨率打分。镜头过长时按 <code>probe_max_frames</code> 取中间一段<b>连续</b>帧。<code>probe_encoder</code> 选 <code>qsv</code> 或 <code>qsv+svt</code> 时显卡也参与探测。</li>
+  <li><b>选 CRF</b>：对每个镜头在 (CRF, 分数) 曲线上插值，取命中 <code>target_quality</code> 下限的 CRF（区间超出探测范围时钳制到边界）。然后加上 <code>probe_crf_offset</code>，按 <code>min_crf</code> / <code>max_crf</code> 钳制，再用 <code>max_crf_delta</code> 平滑相邻镜头。</li>
   <li><b>并行编码</b>：所有镜头按各自 CRF 并行正式编码，最后拼接并重新复用源音频/字幕。</li>
+  <li><b>校验</b>：按 <code>verify_shots</code> 从成品里抽几个镜头重新打分，对账探测预测和实际交付（见<a href="#sec-verify">成品校验</a>）。</li>
 </ol>
 <p>启用方式：预设（设置页或 CLI <code>--custom engine=optimizer</code>）里设 <code>engine=optimizer</code>，并配合 <code>target_quality</code>（必填，如 <code>75</code> 或 <code>75-85</code>）。自定义参数同样适用：<code>--custom engine=optimizer --custom target_quality=80 --custom target_metric=ssimulacra2</code>。</p>
-<table>
-  <tr><th>配置</th><th>默认</th><th>说明</th></tr>
-  <tr><td><code>probe_crfs</code></td><td>[20,26,32,38,44]</td><td>每个镜头采样的 CRF 网格；越密越准、探测越多。探测按源分辨率跑，每多一个点就多一遍全片探测。</td></tr>
-  <tr><td><code>probe_preset</code></td><td>10</td><td>探测编码的 SVT-AV1 速度档。注意 SVT-AV1 在 4K 及以上（RA 模式）最高只到 M9，填 10+ 实际按 9 跑。比正式 preset 快必然低估成品质量，用 <code>probe_crf_offset</code> 补。</td></tr>
-  <tr><td><code>probe_scale</code></td><td>空</td><td>探测分辨率；<b>空 = 源分辨率（推荐）</b>。填了就是在另一个分辨率上测 RD 曲线：4K HDR 实测 960x540 会把 CRF 20..44 压成 5 个 VMAF 点、整条曲线封顶在 91 以下，于是任何 &gt;91 的目标都会让每个镜头掉到网格最低 CRF，成品反而比源更大。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>probing_rate</code></td><td>1</td><td>探测每隔 n 帧取一帧。&gt;1 会拉大相邻帧间距、让帧间预测变难，从而低估质量；控制探测开销请优先用 <code>probe_max_frames</code>。</td></tr>
-  <tr><td><code>probe_max_frames</code></td><td>120</td><td>每镜头探测帧数上限。探测按源分辨率编码，数分钟的长镜头会让每个 CRF 都花上几分钟的 4K 编码；超过上限时取镜头<b>中间一段连续帧</b>（不抽帧，抽帧会歪曲结果）。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>probe_workers</code></td><td>0</td><td>跨镜头的并行探测数。探测已改为按源分辨率编码，单实例 4K 实测峰值 3.5GB，所以按内存限而不是按核数：0 = 自动（总内存/8）。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>encode_workers</code></td><td>0</td><td>并行<b>正式编码</b>实例数。每个 4K 实例持有独立帧池（实测 preset6/lp6 约 8GB，与线程数无关），所以实例数必须按内存限：0 = 自动（总内存/8，总编码内存压在半数以下）。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>encode_threads</code></td><td>0</td><td>每个编码实例分配的 CPU 核数，用 taskset 绑定互不重叠的核心区间，防止多实例线程超订互抢。SVT-AV1 在 4K 下会自发 80+ 线程且无视 <code>-threads</code>，此值<b>不降低单实例内存</b>，只控制并发。0 = 自动（核数/实例数）。</td></tr>
-  <tr><td><code>scenedetect_threshold</code></td><td>27.0</td><td>ContentDetector 灵敏度；越高分镜越少、片段越长。</td></tr>
-  <tr><td><code>min_scene_len</code></td><td>24</td><td>最小镜头长度（帧），更短的会合并。</td></tr>
-  <tr><td><code>max_shots</code></td><td>3000</td><td>镜头数量上限；超过时合并最短的相邻镜头。</td></tr>
-  <tr><td><code>max_crf_delta</code></td><td>4.0</td><td>相邻镜头 CRF 差上限（0=关闭）。每个镜头独立命中目标可能导致相邻镜头 CRF 跳变（如 22→31）造成观感不连续；平滑后限制差值。代价是部分镜头可能略低于目标。</td></tr>
-  <tr><td><code>min_crf</code></td><td>0</td><td>CRF 硬下限（0 = 用 <code>probe_crfs</code> 最小值）。目标质量不可达时每个镜头都会回落到网格最低 CRF——这正是文件反而变大的机制；设一个下限可以兜底。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>probe_crf_offset</code></td><td>0.0</td><td>加在插值出的 CRF 上。探测用的 preset 比正式编码快，会低估成品质量；正值把这部分偏差换回体积。</td></tr>
-  <tr><td><code>vmaf_width</code></td><td>1920</td><td>送进 libvmaf 前把<b>两路</b>都缩到的宽度（只缩不放、保持比例，非 16:9 源不会被压扁）。vmaf_v0.6.1 按 1080p、3H 视距训练，直接拿 4K 或 540p 去测都在模型适用范围之外。0 = 按原分辨率比。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>vmaf_model_4k</code></td><td>vmaf_4k_v0.6.1.json</td><td>源宽 ≥ <code>vmaf_4k_min_width</code> 时改用它，并按<b>原生分辨率</b>打分（不再缩到 <code>vmaf_width</code>）。0.6.1 是 1080p/3H 训练的、4k 模型是 4K/1.5H；实测缩到 1080p 打分偏乐观（CRF32 +0.80、CRF38 +1.63），代价是成品变糊。<span class="tag core">核心</span></td></tr>
-  <tr><td><code>vmaf_4k_min_width</code></td><td>2560</td><td>低于此宽度仍用 1080p 模型 + 降采样。</td></tr>
-  <tr><td><code>ssimulacra2_frame_step</code></td><td>4</td><td>仅 <code>target_metric=ssimulacra2</code>：打分侧每 n 帧取 1。SSIMULACRA2 是逐帧静态图像度量，抽帧在统计上成立——这和 <code>probing_rate</code> 完全不同，后者抽的是<b>编码</b>输入、会歪曲 RD 曲线。4K 实测 2.51fps（libvmaf 约 23fps），不抽帧一集要多花 8.3 小时，每 4 帧取 1 约 2.1 小时。</td></tr>
-  <tr><td><code>vszip_plugin</code> / <code>bestsource_plugin</code></td><td>/usr/local/lib/vapoursynth/…</td><td>支撑 SSIMULACRA2 的 VapourSynth 插件路径（镜像内已预置）。</td></tr>
-  <tr><td><code>vmaf_threads</code></td><td>0</td><td>VMAF 计算线程数；0 = 自动（核数/probe_workers）。ffmpeg libvmaf 自身默认单线程，4K 下实测 7.0s vs 8 线程 2.1s（分数一致）。</td></tr>
-  <tr><td><code>vmaf_model</code></td><td>/usr/share/model/vmaf_v0.6.1.json</td><td>VMAF 模型。也接受 <code>version=…</code>。</td></tr>
-  <tr><td><code>ssimulacra2_model</code></td><td>version=ssimulacra2</td><td>SSIMULACRA2 模型。注意：官方 libvmaf 2.3.1 <b>不含</b> ssimulacra2，需自备兼容模型（<code>path=/x/ssimulacra2.json</code>）或带 ssimulacra2 的 libvmaf。</td></tr>
-  <tr><td><code>fractional_crf</code></td><td>false</td><td>把小数 CRF 传给 SVT-AV1（更精细；需编码器支持）。</td></tr>
-  <tr><td><code>keep_probes</code></td><td>false</td><td>保留探测临时文件（调试用）。</td></tr>
-</table>
-<p>资源占用：探测/编码阶段会并行启动 <code>probe_workers</code> 个 SVT-AV1 实例；为防线程爆炸，每个实例的 SVT 线程数（<code>lp</code>）会自动按 <code>核心数 / workers</code> 分配，总线程≈核心数。若机器内存紧张请降低 <code>probe_workers</code>。临时文件在 <code>dirs.work</code>（成功/失败后清理，除非 <code>keep_temp</code>/<code>keep_probes</code>）。</p>
-<p>预设置的 <code>probing_rate</code>、<code>probe_res</code>、<code>probe_video_params</code>（如 <code>preset=10</code> 或 <code>copy</code>）、<code>vmaf_threads</code>、<code>probing_vmaf_features</code>（原样透传给 libvmaf 的 <code>feature=</code>）会覆盖上面的全局默认值。</p>
+<p>预设里的几项会盖过下面的全局值：<code>probing_rate</code>、<code>vmaf_threads</code> 非 0 时分别盖过同名项，<code>probe_res</code> 非空时盖过 <code>probe_scale</code>；<code>probe_video_params</code> 里 optimizer 只认 <code>preset=N</code>（<code>copy</code> = 与正式编码同一个 preset），用来盖过 <code>probe_preset</code>，其余参数不看，探测总是沿用正式编码的参数；<code>probes</code> 非 0 且少于网格点数时，只取 <code>probe_crfs</code> 里均匀分布、保留两端的 <code>probes</code> 个点。<code>probing_vmaf_features</code> 没有对应的全局值：av1an 语法（如 <code>default motionless</code>）optimizer 会忽略并打一次告警；含 <code>=</code> 或 <code>|</code> 的合法 ffmpeg libvmaf 配置会原样透传给 <code>feature=</code>。填了任何值（包括被忽略的 av1an 语法），这个作业都不走零拷贝打分。预设里的 <code>min_scene_len</code> 只给 av1an 用。</p>
 
+<h3 class="group" id="sec-opt-detect">分镜 <span>先把源切成镜头，后面所有探测和编码都按镜头进行</span></h3>
+<div class="def" id="p-scenedetect_engine">
+  <h4 class="def__name"><code>scenedetect_engine</code></h4>
+  <p class="def__dflt">默认 <code>scdet</code></p>
+  <div class="def__body"><p>分镜用哪个检测器。<code>scdet</code> = ffmpeg 的场景变化滤镜，单趟读源、不落盘，门限看 <code>scdet_threshold</code>；<code>pyscenedetect</code> = 旧路径，先写一份降采样副本再用 OpenCV 逐帧读，门限看 <code>scenedetect_threshold</code>。两条路都先按 <code>scenedetect_scale</code> 缩小、都用 <code>min_scene_len</code>，实测对比见本章第 1 步。只有 scdet 那一趟会记下每帧的时间戳：恒定帧率检查和时间线空洞的处理都靠它，pyscenedetect 路径两样都没有。留着旧路径是为了能在真实片源上对照。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scenedetect_engine">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-scdet_threshold">
+  <h4 class="def__name"><code>scdet_threshold</code></h4>
+  <p class="def__dflt">默认 2.0</p>
+  <div class="def__body"><p>仅 <code>scenedetect_engine=scdet</code> 时生效。一帧的 scdet 分数（0-100）达到它才算切点，越低越敏感。ffmpeg 自己的默认 10 对电影电视太高：在一段 4K 样片上只找到 21 个切点中的 1 个。2.0 与旧检测器的结果很接近，0.8-1.5 还会抓到较软的转场；低于约 0.5 多出来的多半是镜头运动或光线变化，而且会挤掉正确的切点。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scdet_threshold">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-scenedetect_threshold">
+  <h4 class="def__name"><code>scenedetect_threshold</code></h4>
+  <p class="def__dflt">默认 27.0</p>
+  <div class="def__body"><p>仅 <code>scenedetect_engine=pyscenedetect</code> 时生效。ContentDetector 灵敏度；越高分镜越少、片段越长。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scenedetect_threshold">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-scenedetect_scale">
+  <h4 class="def__name"><code>scenedetect_scale</code></h4>
+  <p class="def__dflt">默认 <code>-2:540</code></p>
+  <div class="def__body"><p>分镜前先把画面缩到这个尺寸（ffmpeg <code>scale</code> 的写法），只为提速；空 = 原生分辨率。scdet 下实测 540p 和原生选出的切点一样。pyscenedetect 下它决定那份降采样副本的尺寸，留空就让 OpenCV 直接逐帧解源，4K HEVC 会慢到不可用。写成 <code>W:H</code>（一边可用 <code>-1</code>/<code>-2</code> 按比例算）时，分镜这一趟的解码和缩放才能交给显卡（见 <a href="#p-scenedetect_hwaccel">scenedetect_hwaccel</a>）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scenedetect_scale">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-opt-min_scene_len">
+  <h4 class="def__name"><code>min_scene_len</code>（优化器）</h4>
+  <p class="def__dflt">默认 24</p>
+  <div class="def__body"><p>最小镜头长度（帧），更短的会合并。它管的是切点：scdet 下离上一个切点不足这么多帧的候选切点直接不切，取先到的、不取最强的；pyscenedetect 下原样交给 ContentDetector。切完之后再合并短镜头用 <code>min_shot_frames</code>。预设里的同名参数只给 av1an 用。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-min_scene_len">去设置页 ›</a> <a class="def__also" href="#p-min_scene_len">↔ 预设里的同名参数</a></p></div>
+</div>
+<div class="def" id="p-min_shot_frames">
+  <h4 class="def__name"><code>min_shot_frames</code></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>短于这么多帧的镜头并入相邻镜头（每次挑最短的，并进两边较短的那个邻居），0 = 不合并。默认关：本引擎只在真实切点处切，那里的关键帧编码器本来就要花，合并省不出体积；它省的是探测次数，代价是逐镜头 CRF 更粗。探测是瓶颈时再开，96 帧及以上实测会多花体积。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-min_shot_frames">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-max_shots">
+  <h4 class="def__name"><code>max_shots</code></h4>
+  <p class="def__dflt">默认 3000</p>
+  <div class="def__body"><p>镜头数量上限；超过时合并最短的相邻镜头。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-max_shots">去设置页 ›</a></p></div>
+</div>
+
+<h3 class="group" id="sec-opt-probe">探测 <span>每个镜头在源分辨率下用快速 preset 编几个 CRF，量出它自己的质量曲线</span></h3>
+<div class="def" id="p-probe_crfs">
+  <h4 class="def__name"><code>probe_crfs</code></h4>
+  <p class="def__dflt">默认 <code>[20,26,32,38,44]</code></p>
+  <div class="def__body"><p>每个镜头采样的 CRF 网格。默认的自适应探测（<code>probe_bracket_width</code> 大于 0）从网格两端和中间点起步，再在夹住目标的区间里二分，所以网格决定去哪里看，点数就是每个镜头最多探几次。<code>probe_bracket_width</code> 为 0 时整张网格全探，越密越准、探测越多：探测按源分辨率跑，每多一个点就多一遍全片探测。能交付的范围另由 <code>min_crf</code> / <code>max_crf</code> 管。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_crfs">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probe_encoder">
+  <h4 class="def__name"><code>probe_encoder</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 <code>svt</code></p>
+  <div class="def__body"><p>探测编码用哪个编码器。<code>svt</code> = 原有路径。<code>qsv</code> = 在显卡上探测，再用逐作业标定把质量索引映射回 SVT 的 CRF，映射出的 CRF 直接交付；标定不可靠时整个作业退回 SVT，质量索引超出锚点范围或两端夹不住目标的镜头逐个退回 SVT。<code>qsv+svt</code> = 同样的显卡工作换一种用法：映射出来的 CRF 只决定 SVT 从哪里开始探，交付的 CRF 仍然来自 SVT 探测，所以映射错了只多花一次探测。两种显卡模式都要容器里有 <code>/dev/dri</code> 渲染节点，没有就按 <code>svt</code> 跑并打一条告警；显卡探测编码现在走 VA-API 的 <code>av1_vaapi</code>，模式名里的 qsv 是沿用下来的叫法，它和 GPU 打分共用一份显存预算（见 <a href="#sec-gpu">GPU</a>）。实测 qsv+svt 的探测阶段比 svt 合计快 27%（三段 4K 杜比视界片段共 912 个镜头），选出的 CRF 与 svt 相差不超过 1 的镜头占 96–100%。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_encoder">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_probe_qs">
+  <h4 class="def__name"><code>gpu_probe_qs</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 <code>[14,18,22,26,30,34,38]</code></p>
+  <div class="def__body"><p>显卡探测的质量索引网格（<code>av1_vaapi</code> 的 <code>global_quality</code>），作用同 <code>probe_crfs</code>，至少要两个点。每个镜头只编网格的最小和最大两个点，取两点连线与目标的交点；两端夹不住目标的镜头没有交点，改走普通 SVT 探测。只在 <code>probe_encoder</code> 为 <code>qsv</code> 或 <code>qsv+svt</code> 时生效。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_probe_qs">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_probe_anchors">
+  <h4 class="def__name"><code>gpu_probe_anchors</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 16</p>
+  <div class="def__body"><p>按镜头长度分层挑出这么多个镜头（至少 4 个，镜头不够就全挑），显卡和 SVT 两条路都完整探测。<code>qsv</code> 模式先跑它们，用它们拟合映射；它们自己的 CRF 仍来自 SVT 探测，不是白跑的。<code>qsv+svt</code> 模式里它们不按预测起探、照常做完整的 SVT 二分，给那条线起个头，之后每个核验过的镜头都会继续加进拟合。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_probe_anchors">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_probe_max_residual">
+  <h4 class="def__name"><code>gpu_probe_max_residual</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 2.0</p>
+  <div class="def__body"><p>仅 <code>qsv</code> 模式：标定的留一残差超过这么多 CRF，就放弃映射，作业剩下的镜头全用 SVT 探测（锚点凑不够 4 对时同样放弃）。按 0.24 VMAF/CRF，默认约合 0.5 VMAF。<code>qsv+svt</code> 没有这道门：映射只决定从哪里开始探，残差大时只是改回从网格起探。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_probe_max_residual">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_probe_max_q_margin">
+  <h4 class="def__name"><code>gpu_probe_max_q_margin</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 1.5</p>
+  <div class="def__body"><p>仅 <code>qsv</code> 模式：一个镜头的质量索引落在锚点范围之外超过这么多，就不信外推的映射，改用 SVT 探测，用来兜住外推失效的容易镜头。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_probe_max_q_margin">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_probe_preset">
+  <h4 class="def__name"><code>gpu_probe_preset</code></h4>
+  <p class="def__dflt">默认 4</p>
+  <div class="def__body"><p>目前不生效。它是当初 <code>av1_qsv</code> 编码器的 preset（0-7，越小越慢越好，映射就是在 4 上标定的）；显卡探测改走 <code>av1_vaapi</code> 之后，命令里不再传 preset，这个键只是还留在配置里。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_probe_preset">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probe_bracket_width">
+  <h4 class="def__name"><code>probe_bracket_width</code></h4>
+  <p class="def__dflt">默认 6</p>
+  <div class="def__body"><p>自适应探测的停止宽度（CRF）：夹住目标的两个已探 CRF 相距不超过它就停，然后插值；0 = 整张 <code>probe_crfs</code> 网格全探（旧行为）。目标够不着、或最高 CRF 也超过目标的镜头，探完起步的三个点就停。它和 <code>probe_crfs</code> 的间距会互相抵消：间距 6 时种子给出宽 12 的区间，二分一次到 6 就退出，所以自适应比固定网格每个镜头只省约一次探测。想让它真正起作用，要么调窄这个值，要么把 <code>probe_crfs</code> 铺得更疏。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_bracket_width">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probe_preset">
+  <h4 class="def__name"><code>probe_preset</code></h4>
+  <p class="def__dflt">默认 10</p>
+  <div class="def__body"><p>探测编码的 SVT-AV1 速度档。注意 SVT-AV1 在 4K 及以上（RA 模式）最高只到 M9，填 10+ 实际按 9 跑。比正式 preset 快会带来偏差，但方向不固定：同一 CRF 下 preset 4 反而比 preset 9 低 0.80 VMAF（sd 0.76），端到端的偏差正负随片源走（五个片源从 −0.29 到 +1.52）。要补就用 <code>probe_crf_offset</code>，先看校验报出的实际偏差。预设的 <code>probe_video_params</code> 写了 <code>preset=N</code>（或 <code>copy</code>）时以它为准。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_preset">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probe_max_frames">
+  <h4 class="def__name"><code>probe_max_frames</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 120</p>
+  <div class="def__body"><p>每镜头探测帧数上限。探测按源分辨率编码，数分钟的长镜头会让每个 CRF 都花上几分钟的 4K 编码；超过上限时取镜头<b>中间一段连续帧</b>（不抽帧，抽帧会歪曲结果）。这不是保守默认值，是承重的：实测降到 64，探测阶段确实快 1.55x，但选出的 CRF 平均偏高 +2.2（最大 +12.2），“预测 vs 交付”的偏差从 -0.38 恶化到 -2.28；往上调才是降低预测误差的主要手段。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_max_frames">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-opt-probing_rate">
+  <h4 class="def__name"><code>probing_rate</code>（优化器）</h4>
+  <p class="def__dflt">默认 1</p>
+  <div class="def__body"><p>探测每隔 n 帧取一帧。&gt;1 会拉大相邻帧间距、让帧间预测变难，从而低估质量；控制探测开销请优先用 <code>probe_max_frames</code>。预设的 <code>probing_rate</code> 非 0 时以预设为准。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probing_rate">去设置页 ›</a> <a class="def__also" href="#p-probing_rate">↔ 预设里的同名参数</a></p></div>
+</div>
+<div class="def" id="p-probe_scale">
+  <h4 class="def__name"><code>probe_scale</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 空</p>
+  <div class="def__body"><p>探测分辨率；<b>空 = 源分辨率（推荐）</b>。填了就是在另一个分辨率上测 RD 曲线：4K HDR 实测 960x540 会把 CRF 20..44 压成 5 个 VMAF 点、整条曲线封顶在 91 以下，于是任何 &gt;91 的目标都会让每个镜头掉到网格最低 CRF，成品反而比源更大。预设的 <code>probe_res</code> 优先于它；填 <code>0</code>、<code>none</code>、<code>off</code> 都视同留空；填了的作业会在日志里打一条告警。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_scale">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probe_crf_offset">
+  <h4 class="def__name"><code>probe_crf_offset</code></h4>
+  <p class="def__dflt">默认 0.0</p>
+  <div class="def__body"><p>加在插值出的 CRF 上（在 <code>min_crf</code> / <code>max_crf</code> 钳制之前）。正值把探测的偏差换回体积。但偏差方向随内容走（见 <a href="#p-probe_preset">probe_preset</a>），一个常数只会帮到一部分片源；先看校验阶段报出的“预测 vs 交付”平均偏差再定。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_crf_offset">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-min_crf">
+  <h4 class="def__name"><code>min_crf</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>CRF 硬下限（0 = 用 <code>probe_crfs</code> 最小值）。目标质量不可达时每个镜头都会回落到网格最低 CRF——这正是文件反而变大的机制；设一个下限可以兜底。它只能往上抬：低于 <code>probe_crfs</code> 最小值时不起作用。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-min_crf">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-max_crf">
+  <h4 class="def__name"><code>max_crf</code></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>交付 CRF 的硬上限，0 = <code>probe_crfs</code> 的顶端；<code>min_crf</code> 的镜像。它让“探测范围”和“交付范围”成为两件事：<code>probe_crfs</code> 管去哪看，<code>min_crf</code>/<code>max_crf</code> 管能发什么，探到极端值不等于会用极端值。它只能往下压：高于 <code>probe_crfs</code> 顶端时不起作用。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-max_crf">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-max_crf_delta">
+  <h4 class="def__name"><code>max_crf_delta</code></h4>
+  <p class="def__dflt">默认 4.0</p>
+  <div class="def__body"><p>相邻镜头 CRF 差上限（0=关闭）。每个镜头独立命中目标可能导致相邻镜头 CRF 跳变（如 22→31）造成观感不连续；平滑后限制差值。代价是部分镜头可能略低于目标。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-max_crf_delta">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-fractional_crf">
+  <h4 class="def__name"><code>fractional_crf</code></h4>
+  <p class="def__dflt">默认 <code>false</code></p>
+  <div class="def__body"><p>把小数 CRF 传给 SVT-AV1（更精细；需编码器支持）。开了之后经 <code>-svtav1-params</code> 的 <code>crf=</code> 传进去：ffmpeg 的 <code>-crf</code> 对 libsvtav1 是整数选项，小数会被截掉。关着时取最近的整数。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-fractional_crf">去设置页 ›</a></p></div>
+</div>
+
+<h3 class="group" id="sec-opt-score">打分 <span>用什么模型、在什么分辨率上比较探测编码和源</span></h3>
+<div class="def" id="p-vmaf_model">
+  <h4 class="def__name"><code>vmaf_model</code></h4>
+  <p class="def__dflt">默认 <code>/usr/share/model/vmaf_v0.6.1.json</code></p>
+  <div class="def__body"><p>VMAF 模型。也接受 <code>version=…</code>。源宽低于 <code>vmaf_4k_min_width</code> 时用它；写裸路径会自动包成 <code>path=…</code>，留空 = <code>version=vmaf_v0.6.1</code>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_model">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vmaf_model_4k">
+  <h4 class="def__name"><code>vmaf_model_4k</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 <code>/usr/share/model/vmaf_4k_v0.6.1.json</code></p>
+  <div class="def__body"><p>源宽 ≥ <code>vmaf_4k_min_width</code> 时改用它，并按<b>原生分辨率</b>打分（不再缩到 <code>vmaf_width</code>）。0.6.1 是 1080p/3H 训练的、4k 模型是 4K/1.5H；实测缩到 1080p 打分偏乐观（CRF32 +0.80、CRF38 +1.63），代价是成品变糊。只对 <code>target_metric=vmaf</code> 生效；留空就一律用 <code>vmaf_model</code>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_model_4k">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vmaf_4k_min_width">
+  <h4 class="def__name"><code>vmaf_4k_min_width</code></h4>
+  <p class="def__dflt">默认 2560</p>
+  <div class="def__body"><p>低于此宽度仍用 1080p 模型 + 降采样。0 = 不用 4K 模型。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_4k_min_width">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vmaf_width">
+  <h4 class="def__name"><code>vmaf_width</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 1920</p>
+  <div class="def__body"><p>送进 libvmaf 前把<b>两路</b>都缩到的宽度（只缩不放、保持比例，非 16:9 源不会被压扁）。vmaf_v0.6.1 按 1080p、3H 视距训练，直接拿 4K 或 540p 去测都在模型适用范围之外。0 = 按原分辨率比。只在用 1080p 模型时生效：用上 4K 模型的源按原生分辨率打分，不看这个值。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_width">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-opt-vmaf_threads">
+  <h4 class="def__name"><code>vmaf_threads</code>（优化器）</h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>VMAF 计算线程数。0 = 自动：探测时按每个探测分到的核（可用核数 ÷ 预计同时在跑的探测数；后者是 <code>probe_workers</code>，没设就按内存预算估一个，最多核数的 1/4），校验时按可用核数的一半；在 GPU（SYCL）上打分时不传线程数。填了就探测和校验都用它，预设里的 <code>vmaf_threads</code> 非 0 时又以预设为准；SSIMULACRA2 打分的线程数也按它算。ffmpeg libvmaf 自身默认单线程，4K 下实测 7.0s vs 8 线程 2.1s（分数一致）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_threads">去设置页 ›</a> <a class="def__also" href="#p-vmaf_threads">↔ 预设里的同名参数</a></p></div>
+</div>
+<div class="def" id="p-ssimulacra2_model">
+  <h4 class="def__name"><code>ssimulacra2_model</code></h4>
+  <p class="def__dflt">默认 <code>version=ssimulacra2</code></p>
+  <div class="def__body"><p>SSIMULACRA2 模型。注意：官方 libvmaf 2.3.1 <b>不含</b> ssimulacra2，所以 <code>target_metric=ssimulacra2</code> 现在不经 libvmaf，而是经 VapourSynth 的 vszip 插件打分（见本组最后一条）；这个键只为兼容旧配置保留，打分时不读它。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-ssimulacra2_model">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-ssimulacra2_frame_step">
+  <h4 class="def__name"><code>ssimulacra2_frame_step</code></h4>
+  <p class="def__dflt">默认 4</p>
+  <div class="def__body"><p>仅 <code>target_metric=ssimulacra2</code>：打分侧每 n 帧取 1。SSIMULACRA2 是逐帧静态图像度量，抽帧在统计上成立——这和 <code>probing_rate</code> 完全不同，后者抽的是<b>编码</b>输入、会歪曲 RD 曲线。4K 实测 2.51fps（libvmaf 约 23fps），不抽帧一集要多花 8.3 小时，每 4 帧取 1 约 2.1 小时。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-ssimulacra2_frame_step">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vszip_plugin">
+  <h4 class="def__name"><code>vszip_plugin</code> / <code>bestsource_plugin</code></h4>
+  <p class="def__dflt">默认 <code>/usr/local/lib/vapoursynth/…</code></p>
+  <div class="def__body"><p>支撑 SSIMULACRA2 的 VapourSynth 插件路径（镜像内已预置）。只在 <code>target_metric=ssimulacra2</code> 时用：vszip 算分，bestsource 读帧。设置页没有这两项，要改就改 config.yaml 的 <code>transcode.optimizer</code> 段。</p></div>
+</div>
+
+<h3 class="group" id="sec-opt-res">并发与内存 <span>0 都是按容器的 cgroup 预算自动算</span></h3>
+<p>资源占用：探测和正式编码都不是固定大小的 worker 池，而是逐个镜头按预算准入，放得下就启动一个 SVT-AV1 实例；每个实例的内存按镜头（探测窗口）长度和分辨率估算，作业进行中再按实测峰值校正。为防线程爆炸，每个实例的 <code>lp</code> 取剩余 CPU 预算里放得下的最大一档（4、3、2、1），同时在跑的实例 <code>lp</code> 之和不超过可用核数（探测按 <code>probe_cpu_charge</code> 折算），总 lp≈核心数；探测读源时的解码线程数也设成这个 lp。可用核数是本容器的 cgroup CPU 配额与亲和掩码取小，不是机器的核数。内存只决定放不放行：预算是本容器可用内存的 85%（有 cgroup 限额时是限额减去不可回收的占用，否则是 MemAvailable），每次准入前还会再看一眼实时余量、取小的那个；只有什么都没在跑、这个镜头仍装不下时，才为了内存往下降 lp。lp 只决定帧池大小，不改变码流。若仍然吃紧（例如编码被 OOM 杀掉），用 <code>probe_workers</code> / <code>encode_workers</code> 设硬上限。</p>
+<p>临时文件在 <a href="#c-dirs-work"><code>dirs.work</code></a> 下，每个作业一个目录，成功或失败后整个删掉，除非开了 <a href="#c-transcode-keep_temp"><code>keep_temp</code></a>；<a href="#p-keep_probes"><code>keep_probes</code></a> 只让探测文件在作业进行中不被逐个删掉，作业结束后还要看就得同时开 <code>keep_temp</code>。Dolby Vision P5 和 SSIMULACRA2 按镜头暂存的参考分片优先放在 <code>transcode.dovi.p5_cache_dir</code>（默认 <code>/dev/shm</code>），放不下才落到作业目录，用完即删。</p>
+<div class="def" id="p-probe_workers">
+  <h4 class="def__name"><code>probe_workers</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>跨镜头同时在跑的探测数上限。探测按源分辨率编码，单实例 4K 实测峰值 3.5GB。0 = 不设固定上限：和正式编码一样逐个镜头按内存 + CPU 预算准入，内存按本容器 cgroup 可用内存算，不是机器总内存；实际多半先被 CPU 卡住（可用核数 ÷ 每个探测的 lp）。填了就是硬上限，也是自动 VMAF 线程数的分母。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_workers">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-encode_workers">
+  <h4 class="def__name"><code>encode_workers</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>并行<b>正式编码</b>实例数的硬上限。0（推荐）= 不设上限：按内存 + CPU 预算准入。每实例峰值随镜头长度走（4K 实测 24 帧 3.41GB vs 1152 帧 10.46GB），任何固定值同时太多又太少。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-encode_workers">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-encode_threads">
+  <h4 class="def__name"><code>encode_threads</code></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>每个正式编码实例用 taskset 钉住的核数（只管正式编码，不管探测）。0（推荐）= 不钉核。按 N 个实例切死的核段在实例更少时会闲置核（实测慢 5%）；只有容器不许碰没分给它的核时才钉。SVT-AV1 在 4K 下会自发 80+ 线程且无视 <code>-threads</code>，所以只能用 taskset 钉；此值<b>不降低单实例内存</b>，也不决定并发数，并发仍由预算准入决定。钉的时候按槽位依次切核段，实例数 × N 超过可用核数时会绕回、和别的实例重叠；N 不小于可用核数时不钉。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-encode_threads">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probe_cpu_charge">
+  <h4 class="def__name"><code>probe_cpu_charge</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 1.0</p>
+  <div class="def__body"><p>一次探测按 lp 的几成计入 CPU 预算，只作用于探测阶段；1.0 = 按满 lp 记账。探测并非全程在编码（还要读源解码、再打分），所以调低确实能放更多探测，但没有变快：实测 0.5 让探测并发从 10 涨到 18，同片段 313.1s(1.0) 对 342.4s(0.5)，并发多 80% 吞吐反而少 9%。保留它是给别的机器形状（核多内存少，或度量更便宜）用的，别指望在这里白捡吞吐。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_cpu_charge">去设置页 ›</a></p></div>
+</div>
+</section>
+
+<section id="sec-gpu">
+<h2>GPU 与硬件</h2>
+<p>GPU 在这里只做加速：每一步都有 CPU / 软解的路径，GPU 让其中几步更快、更省 CPU。除 Dolby Vision P5 转换外，用到 GPU 的都在 optimizer 引擎（<code>engine=optimizer</code>）里。开关在<a href="/static/settings.html#sec-gpu">设置 → GPU</a>，共八项：七项是优化器参数（<code>transcode.optimizer</code>），每个作业开工时读一次，所以保存不影响正在跑的作业；<code>vulkan_device</code> 属于 <code>transcode.dovi</code>，每次 P5 转换时现读。</p>
+<ol>
+  <li id="gpu-scenedetect"><b>分镜解码</b>（<code>scenedetect_hwaccel</code>）：分镜那一趟用 QSV 解码，并在显卡上缩到 <code>scenedetect_scale</code> 的尺寸，再下载回内存做检测。QSV 打不开、卡解不了这种编码（B580 解 AV1 会正常退出却一帧不出）、或 <code>scenedetect_scale</code> 为空或不是纯 <code>W:H</code> 时，自动改用软解。</li>
+  <li id="gpu-sycl"><b>VMAF 打分</b>（<code>vmaf_sycl_device</code>、<code>vmaf_sycl_min_width</code>）：探测打分和成品校验的 libvmaf 改走它的 SYCL 后端（滤镜参数 <code>sycl_device=N</code>），需要镜像里带 SYCL 的 libvmaf 和一块 Level Zero 设备（Intel Arc）。只对 <code>target_metric=vmaf</code> 且源宽不小于 <code>vmaf_sycl_min_width</code> 的作业生效；SSIMULACRA2 和 XPSNR 始终在 CPU 上算。作业第一次打分前先自检：同一对测试画面在 GPU 和 CPU 上各打一次，后端必须自报 SYCL、两边相差不超过 1e-3，不过就整个作业在 CPU 上打分，不再重试。之后单次 GPU 打分出错或超时（60 秒加每帧 1 秒；探测编码也在显卡上跑时翻倍），这个窗口改在 CPU 上重打；连续 3 次，本作业改用 CPU，300 秒后再自检一次，过了回到 GPU，再不过就一直用 CPU。</li>
+  <li id="gpu-vram"><b>显存与并发</b>（<code>vmaf_sycl_workers</code>、<code>gpu_vram_budget_mb</code>）：显卡只有一块显存，GPU 打分、零拷贝打分和显卡上的探测编码从同一份预算里放行：同时进行的不超过 <code>vmaf_sycl_workers</code> 个，新操作的显存估算要放得进 <code>gpu_vram_budget_mb</code> 减去当前占用（占用取估算总和与 DRM fdinfo 实测中较大的那个）。GPU 打分等 120 秒还放不进，就改在 CPU 上打。</li>
+  <li id="gpu-zero-copy"><b>零拷贝打分</b>（<code>vmaf_zero_copy</code>）：探测打分时源窗口和探测文件两路都在 VA-API 上解码，帧直接交给 libvmaf 的 SYCL 后端，不回传内存。前提：SYCL 打分已生效；按原生分辨率打分（4K 模型，不缩放）；没设 <code>probe_scale</code>；没设 <code>probing_vmaf_features</code>（只导入亮度）；源位深与探测编码一致；镜像里的 libvmaf 带 libva、ffmpeg 带配套补丁。每个作业先预检：定位后的 VA-API 读取要和软解逐帧一致（与 <code>reference_hwaccel</code> 同一个预检），再用一个窗口两种方式各打一次分，libvmaf 必须报告是在显卡上原地导入的、两个分数相差不超过 1e-3，否则整个作业走常规读取。单个窗口失败就用常规读取重打并记住它，连续 8 次失败本作业关掉零拷贝。Dolby Vision P5 作业的参考是逐镜头预先转好的分片，不走零拷贝；成品校验也不走。</li>
+  <li id="gpu-reference"><b>打分参考读取</b>（<code>reference_hwaccel</code>）：探测打分和成品校验里读源片的那一路用 VA-API 解码（第一个 <code>/dev/dri/renderD*</code>），下载回内存后交给打分。用 VA-API 不用 QSV 不是偏好：QSV 是独立的解码器、自己处理时间戳，定位之后在带时间轴空洞的 mkv、DV P5 mp4、8-bit H.264 WEB-DL 上保留的帧和软解不同——像素一致、帧全错；VA-API 只是给 ffmpeg 自带的解码器加速，选帧和软解一样，九种情况九次分数完全一致。<code>auto</code> 时每个作业先在定位后各解 8 帧，软解和硬解逐帧 md5 对比，不一致整个作业软解；某个窗口硬解失败就在 CPU 上重打并记住它，连续 8 次失败本作业改回软解。只放这一路上 GPU：4K 帧从显存回传约 130 帧/秒封顶，而探测文件和成品的 AV1 用 dav1d 软解更快。</li>
+  <li id="gpu-probe"><b>探测编码</b>（<code>probe_encoder</code>）：设成 <code>qsv</code> 或 <code>qsv+svt</code> 时，显卡的硬件 AV1 编码器也参与探测（VA-API 解码直接进编码器），机制、退回和实测见 <a href="#p-probe_encoder"><code>probe_encoder</code></a>。容器里没有 <code>/dev/dri</code> 渲染节点时自动退回 <code>svt</code> 并告警。</li>
+  <li id="gpu-p5"><b>Dolby Vision P5 转换</b>（<code>vulkan_device</code>）：P5 的基底层是 ICtCp，要由 libplacebo 应用 RPU 才能变成 HDR10，而 libplacebo 跑在 Vulkan 上（ffmpeg 的 <code>-init_hw_device vulkan</code>）。optimizer 引擎逐镜头转换，av1an 引擎整片转换。没指定设备时让 ffmpeg 挑：容器里有 GPU 就用 GPU，没有就用 Mesa 的 llvmpipe 软件渲染，照样能转，只是在 CPU 上跑。</li>
+</ol>
+<p>始终留在 CPU 上的：SVT-AV1 编码（SVT 探测和全部正式编码）、正式编码读源、探测文件和成品的 AV1 解码、SSIMULACRA2 与 XPSNR 打分。GPU 解码值不值，看旁边那个编码有多贵：分镜只有解码，收益最大；正式编码 preset 4 只有 3% 花在解码上，挪到 VA-API 峰值内存反而 +8.7%。</p>
+
+<h3 id="sec-gpu-detect">设置页的检测与自检</h3>
+<p>设置页的 GPU 区不读 sysfs，而是像流水线自己那样通过 ffmpeg 去探：有哪些 <code>/dev/dri/renderD*</code> 渲染节点，libvmaf 编没编进 SYCL 后端，SYCL 设备叫什么（按已保存的 <code>vmaf_sycl_device</code> 序号去问，关闭时问 0 号）、一共几个，ffmpeg 列出哪些 Vulkan 设备，QSV 和 VA-API 能不能打开，以及找不找得到 ffmpeg。数据来自 <code>GET /api/gpu</code>（开放读取，结果缓存 5 分钟）；「重新检测」发的是 <code>GET /api/gpu?refresh=true</code>，跳过缓存重探一次。</p>
+<p>「自检打分」发 <code>POST /api/gpu/selfcheck</code>（需 api_key），用的是表单里<b>当前选中</b>的设备，不必先保存，所以可以先试再存。它和优化器开工前的自检是同一个测试：同一对测试画面在该 SYCL 设备和 CPU 上各打一次，后端必须自报 SYCL、两边相差不超过 1e-3 才算通过；不通过，用这个设备的作业会自动退回 CPU 打分。端点的完整列表见 <a href="#sec-api">API</a>。</p>
+<p>上面这些退回都不让作业失败：作业照常完成，只是更慢、更吃 CPU。整个作业退回 CPU 或软解时，说明原因的那一行只写进程序日志（<code>dirs.logs</code> 下的 <code>av1transcode.log</code>），队列页能看的作业日志里没有。所以「现在的设置会怎么用」按已保存的设置和刚探到的硬件解析出四条路径，会退回的标成琥珀色：</p>
+<ul>
+  <li>VMAF 打分：「设置为设备 N，但现在不可用 → 作业会退回 CPU」。</li>
+  <li>分镜解码：「auto，但 QSV 不可用 → 软解」。</li>
+  <li>打分参考解码：「auto，但 VA-API 不可用 → 软解」。</li>
+  <li>P5 转换：「自动，但没有设备」。这一条不是退回：P5 没有 Vulkan 以外的路，建不了 Vulkan 设备时 P5 转换直接失败。</li>
+</ul>
+<p>「这台机器有什么」的设备卡上，琥珀点同样是降级但能用：SYCL 后端看得到设备，配置的那个序号却不可用；Vulkan 只有 llvmpipe 这类软件渲染器；QSV 和 VA-API 都打不开。红点是缺了东西：没有渲染节点，libvmaf 没有 SYCL 后端或一个 SYCL 设备都看不到，一个 Vulkan 设备都没有，找不到 ffmpeg。</p>
+
+<h3 id="sec-gpu-params">参数</h3>
+<div class="def" id="p-vmaf_sycl_device">
+  <h4 class="def__name"><code>vmaf_sycl_device</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 -1（关闭）</p>
+  <div class="def__body"><p>VMAF 打分用的 SYCL 设备：<code>-1</code> = 关闭，在 CPU 上打分；0 起是设备序号，作为 <code>sycl_device=N</code> 传给 libvmaf。B580 上单次 120 帧原生 4K 打分实测：CPU（40 线程）5.6s / 10.7 核 / 7.6GB，SYCL 1.7s / 1 核 / 0.25GB，分数一致。开之前先点「自检打分」；开工自检不过的作业整个在 CPU 上打分，见本章的 <a href="#gpu-sycl">VMAF 打分</a>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_sycl_device">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vmaf_sycl_min_width">
+  <h4 class="def__name"><code>vmaf_sycl_min_width</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 2560</p>
+  <div class="def__body"><p>源宽小于这个值时，开了 <code>vmaf_sycl_device</code> 也在 CPU 上打分。GPU 的收益随帧大小增长，每次调用的固定开销却不变：1080p 上 CPU 打分本来就只要约 1.8s，而 GPU 在 1080p 上还没实测过，要往下调先实测。默认和 <a href="#p-vmaf_4k_min_width"><code>vmaf_4k_min_width</code></a> 一样是 2560，所以默认只有按 4K 模型打分的源才上 GPU。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_sycl_min_width">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-scenedetect_hwaccel">
+  <h4 class="def__name"><code>scenedetect_hwaccel</code></h4>
+  <p class="def__dflt">默认 <code>auto</code></p>
+  <div class="def__body"><p>分镜那一趟是否用 GPU 解码：<code>auto</code> = 有 QSV 就用，用不了自动软解；<code>off</code> = 一律软解。默认的 <a href="#p-scenedetect_engine">scdet 引擎</a>下，硬解和软解切出的镜头列表完全一致（三个 4K 源实测）；旧的 pyscenedetect 路径用的 GPU 缩放器不是 swscale，边界上的切点可能挪动，低于 2160p 时墙钟反而变慢。用 pyscenedetect 又要切点和软解完全一样时，设 <code>off</code>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scenedetect_hwaccel">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_vram_budget_mb">
+  <h4 class="def__name"><code>gpu_vram_budget_mb</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>本作业的 GPU 操作可以占用多少显存（MB），0 = 自动（6000）。<code>vmaf_sycl_workers</code> 数的是个数，这个数的是字节——显卡耗尽的是后者。占用用 DRM fdinfo 实测，但只看得见本容器里的进程，容器外共用这张卡的程序那份看不到，所以默认给 12GB 的卡留了一半。它是放行门限，不是硬上限：新操作要等估算放得下才开始，估算偏低时整卡照样会超，B580 上日志记过探测阶段峰值 7.1-7.2GB 对 6000MB 的预算。只有这张卡没有别人用时才调高。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_vram_budget_mb">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vmaf_sycl_workers">
+  <h4 class="def__name"><code>vmaf_sycl_workers</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 0</p>
+  <div class="def__body"><p>同时在 GPU 上进行的操作个数上限，0 = 自动（6）；打分、零拷贝打分和显卡上的探测编码各算一个。它不是探测池的宽度。加宽没用，实测吞吐 4 个就到顶；太宽会撑爆显存——各 10 个 SYCL 上下文 + VA-API 解码会话曾把 B580 撑爆并弄坏设备，之后要重启宿主机才恢复。要收紧显存占用时往下调。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_sycl_workers">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vmaf_zero_copy">
+  <h4 class="def__name"><code>vmaf_zero_copy</code> <span class="tag core">核心</span></h4>
+  <p class="def__dflt">默认 <code>off</code></p>
+  <div class="def__body"><p>探测打分时让帧留在显卡上：两路都用 VA-API 解码，直接交给 libvmaf 的 SYCL 后端。<code>auto</code> = 作业预检通过就用，<code>off</code> = 常规读取。B580 4K 实测每次打分 5.4s / 23 CPU 秒 → 1.18s / 1.36 CPU 秒，代价是每次打分约 1.55GB 显存。要先开 <code>vmaf_sycl_device</code>；其余前提、预检和退回见本章的 <a href="#gpu-zero-copy">零拷贝打分</a>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vmaf_zero_copy">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-reference_hwaccel">
+  <h4 class="def__name"><code>reference_hwaccel</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 <code>off</code></p>
+  <div class="def__body"><p>探测打分和成品校验里读源片的那一路是否用 VA-API 解码：<code>auto</code> = 作业预检通过就用，<code>off</code> = 一律软解。它省 CPU 却费墙钟：40 核实测反而更慢（探测 401s→448s），只有 CPU 是瓶颈的机器才值得开（20 核上 826s→592s）。开了之后每次 GPU 打分多一个 VA-API 解码会话，显存按两倍估算。为什么是 VA-API 不是 QSV，见本章的 <a href="#gpu-reference">打分参考读取</a>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-reference_hwaccel">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-vulkan_device">
+  <h4 class="def__name"><code>vulkan_device</code></h4>
+  <p class="def__dflt">默认 空</p>
+  <div class="def__body"><p>Dolby Vision P5 转换时 libplacebo 用的 Vulkan 设备，写法是 ffmpeg <code>-init_hw_device</code> 的选择器：序号，或设备名里的一段。它是 config.yaml 的 <code>transcode.dovi.vulkan_device</code>，不是优化器参数：设置页把它单独存进 settings.json 的 <code>dovi</code> 段，「恢复 config.yaml 默认值」不会动它。空（推荐）= 让 ffmpeg 挑，容器里有 GPU 就用 GPU，没有就用 Mesa 的 llvmpipe 软件渲染；写 <code>llvmpipe</code> 强制软件渲染。选择器匹配不到任何设备时 ffmpeg 建不了设备（<code>Device creation failed</code>），P5 转换直接失败，不会退回软件渲染。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vulkan_device">去设置页 ›</a></p></div>
+</div>
+</section>
+
+<section id="sec-subs">
+<h2>字幕处理</h2>
+<p>只在 optimizer 引擎里发生。所有镜头编完、拼好之后，最后一步把源的音轨和字幕复用进成品；字幕在这一步按下面三个开关处理，三个默认都开，在设置页「优化器引擎 → 字幕」里改。av1an 引擎不做这三件事。</p>
+<div class="def" id="p-drop_empty_subtitles">
+  <h3 class="def__name"><code>drop_empty_subtitles</code></h3>
+  <p class="def__dflt">默认 <code>true</code></p>
+  <div class="def__body"><p>源里一条字幕都没有的轨不再复制进成品。起因是 Plex 自动选中一条空的 PGS 轨烧进画面，为一条什么都没有的轨把整集重编码。判定只读文件头：mkv 看 <code>NUMBER_OF_FRAMES</code> 统计 tag，没有 tag 再问 <code>mkvmerge -J</code>，mp4 看轨道自己的时长；读不到、读不懂、两个工具对不上一律保留——丢错一条就是毁掉那份字幕的唯一副本。<code>false</code> = 和以前一样全部复制。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-drop_empty_subtitles">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-ass_srt_companion">
+  <h3 class="def__name"><code>ass_srt_companion</code></h3>
+  <p class="def__dflt">默认 <code>true</code></p>
+  <div class="def__body"><p>每条保留下来的 ASS/SSA 字幕旁边再挂一条纯文本 srt，ASS 轨本身原样保留、绝不转换。它给不渲染 ASS、只会烧字幕的播放器一个软字幕选择；Plex 给网页端的软字幕格式本来就是 ASS，那里用不上它。搭在本来就要跑的那次 demux 上，每条约 35KB。代价：源里是 default 的那条 ASS 会把 default 让给它的 srt，按 default 自动选字幕的播放器拿到的是没有样式的纯文本，而特效/排版字幕转出来一定是坏的。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-ass_srt_companion">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-pgs_ocr_srt">
+  <h3 class="def__name"><code>pgs_ocr_srt</code></h3>
+  <p class="def__dflt">默认 <code>true</code></p>
+  <div class="def__body"><p>把每条英文 PGS 图形字幕 OCR 成一条纯文本 srt 挂在旁边，图形轨本身原样保留、绝不删除。Plex 对图形字幕没有软字幕目标格式，选中了就只能烧进画面、整集重编码；有了这条 srt，它就有东西可以直接发。只做英文、只做 PGS：镜像里只装了 eng 一个 tesseract 模型，别的文字喂进去不会报错、只会吐出像模像样的乱码；DVD VobSub 这个解析器读不了，同样原样不动。实测忽略大小写的字符错误率 0.1276%。失败只降级成“这条轨没有 srt”，不会让编码失败。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-pgs_ocr_srt">去设置页 ›</a></p></div>
+</div>
+
+<h3 id="sec-subs-new">新增的 srt 轨</h3>
+<ul>
+  <li><b>哪些轨会有</b>：复用保留下来的 ASS/SSA 轨；语言 tag 是 <code>eng</code>、<code>en</code>、<code>english</code>、<code>en-us</code>、<code>en-gb</code>、<code>eng-us</code> 之一（不分大小写）的 PGS 轨，没有语言 tag 不算英文。判定为空的轨一律不做，即使 <code>drop_empty_subtitles</code> 关着、它被留在了成品里。文件里已经有英文文本字幕，英文 PGS 照样 OCR：SDH 图形轨和普通字幕是两份不同的字幕。</li>
+  <li><b>排在哪</b>：源的字幕之后，先 ASS 的，再 OCR 的。</li>
+  <li><b>语言与标题</b>：语言照原轨。标题是原轨标题后加 <code>(SRT)</code> 或 <code>(OCR)</code>，如 <code>English SDH (OCR)</code>；原轨没有标题时是 <code>SRT (plain text)</code> 或 <code>OCR (plain text)</code>。</li>
+  <li><b>标记</b>：原轨是 default 时，default <b>移</b>到新的 srt 上，原轨写成非 default——两条都是 default 时播放器取第一条，也就是原轨，是图形轨的话 Plex 照样选它烧进画面。<code>forced</code> 两边都有。<code>hearing_impaired</code>：OCR 出来的 srt 照抄，因为从 SDH 图形轨读出来的文字仍是 SDH，图形轨自己也保留；ASS 旁的 srt 不带，这个标记只留在 ASS 上。</li>
+  <li><b>做不成时</b>：内容为空、OCR 失败或门限没过的 srt 不放进成品，借走的 default 还给原轨。字幕复用第一次失败时，重试一律不带新增的 srt，只保住源自己的轨。</li>
+</ul>
+
+<h3 id="sec-subs-ocr">OCR 的开销与失败</h3>
+<p>图形轨的码流（<code>.sup</code>）是那次 demux 多出的一个输出，不额外读一遍源。demux 结束后才 OCR：tesseract 同时最多识别 16 条字幕，且不超过本容器的 CPU 预算。</p>
+<p>读出来的文字要过一组结构门限（空条比例、时间轴、相邻条重叠、非 ASCII 字符、生词率等）。生产里没有标准答案可比，所以门限只查自洽，不声称准确度。下面任何一种都只降级成“这条轨没有 srt”并记一条告警，编码照常交付：没装 tesseract、<code>.sup</code> 解析不了、某条字幕的 tesseract 超过 60 秒、整条轨超过 900 秒、每条都读成空、门限没过，或任何意外异常。</p>
+
+<h3 id="sec-subs-always">不管开关怎么设，复用都会做的事</h3>
+<ul>
+  <li>音轨原样复制。字幕除 mp4 的 <code>mov_text</code> 外一律原样复制：<code>mov_text</code> 只存在于 mp4，Matroska 装不下，转成 srt；PGS、VobSub 这类图形字幕和 ASS 从不转换。</li>
+  <li>每条音轨和保留下来的字幕都按源写上自己的 disposition 标记（<code>default</code>、<code>forced</code>、<code>hearing_impaired</code> 等），不让 ffmpeg 自己推断。它的推断是：同类的流不止一条、又都不是 default 时，把第一条标成 default。17 个 Stranger Things 输出就这样把一条空 PGS 轨标成了 default，Plex 选中它烧进画面。</li>
+  <li>音轨和字幕的语言 tag 原样带过去。</li>
+  <li>附件一起带过去，主要是 ASS 字幕排版用的字体；少了它，播放器会换用自己的字体，中日韩文字可能显示成方块。Matroska 源的附件由 mkvmerge 直接从源里整份拷贝，图片附件和 UID 都保留。带附件的那一步失败就去掉附件重试：丢一个字体只坏一条有样式的字幕，丢了复用就丢了整个编码。</li>
+  <li>读不出源有哪些流时，保留全部字幕，只清掉字幕的 default 标记，其余标记照源复制；这种情况下不丢轨、不加 srt。</li>
+  <li>最终封装用 mkvmerge，它不可用或失败时退回 ffmpeg；两条路写出的字幕标记一致，但 ffmpeg 这条路保不住图片附件和附件的 UID。</li>
+</ul>
+
+<h3 id="sec-subs-log">在哪看结果</h3>
+<p>这几件事记在应用日志里（进程的标准错误输出；<code>logging.file</code> 为 <code>true</code> 时也写进 <code>dirs.logs</code> 下的 <code>av1transcode.log</code>），不在队列页的作业日志里：丢了哪些空轨是一行 <code>optimizer: dropping … empty subtitle stream(s)</code>；每条 OCR 成功的轨一行 <code>optimizer: OCR'd s:…</code>，带条数、用时和门限用到的数字；没做成的是 <code>no text copy of s:…</code> 加原因，没装 tesseract 时是 <code>pgs_ocr_srt is on but tesseract is not installed</code>。成品的结构检查按源的字幕轨数减去丢掉的空轨、加上新增的 srt 来核对字幕数，所以丢轨、加轨都不会让它报错（见<a href="#sec-verify-output">结构检查</a>）。</p>
+</section>
+
+<section id="sec-dovi">
 <h2>Dolby Vision / HDR</h2>
-<table>
-  <tr><th>来源</th><th>处理</th></tr>
-  <tr><td>P5（ICtCp）</td><td>libplacebo（Vulkan）转 HDR10 BT.2020+PQ。它是 ffmpeg 里唯一能<b>应用</b> RPU 的滤镜，没有备用方案（旧的 zscale 已退役）。</td></tr>
-  <tr><td>P7 / P8</td><td>剥离 RPU/EL 后编码基底层；RPU 单独保存为 <code>.rpu.bin</code>。</td></tr>
-  <tr><td>HDR10 / HLG</td><td>保留 mastering display / CLL 元数据（hdr.preserve）原样编码。</td></tr>
-  <tr><td>SDR</td><td>BT.709 直接编码。</td></tr>
-</table>
+<div class="def" id="dv-p5">
+  <h3 class="def__name">P5（ICtCp）</h3>
+  <div class="def__body"><p>libplacebo（Vulkan）转 HDR10 BT.2020+PQ。它是 ffmpeg 里唯一能<b>应用</b> RPU 的滤镜，没有备用方案（旧的 zscale 已退役）。</p>
+    <p>优化器引擎逐镜头转换，无损分片放进 <code>p5_cache_dir</code>（默认 tmpfs，不落盘）；av1an 引擎要先把整片转成无损 FFV1 中间文件放进 <code>dirs.work</code>，45 分钟的 4K 一集约 100GB。用哪块 Vulkan 设备见 GPU 章的 <a href="#gpu-p5">Dolby Vision P5 转换</a>。</p></div>
+</div>
+<div class="def" id="dv-p7-p8">
+  <h3 class="def__name">P7 / P8</h3>
+  <div class="def__body"><p>解码器直接返回基底层、自行忽略 EL/RPU，和旧的 <code>dovi_split=bl</code> remux 逐帧一致；那一步已删除（每集 4K 省约三分钟和一次 27GB 写）。RPU 单独保存为 <code>.rpu.bin</code>。</p></div>
+</div>
+<div class="def" id="dv-hdr10-hlg">
+  <h3 class="def__name">HDR10 / HLG</h3>
+  <div class="def__body"><p>编码完用 mkvpropedit 在 mkv 视频轨上写色彩标签（AV1 码流头默认按 BT.709，不写播放器会显示错色）。HDR10 另写 mastering display / CLL：取源里的，源里没有就用 <a href="#c-transcode-hdr-default_master_display"><code>default_master_display</code> / <code>default_max_cll</code></a>。HLG 只写 BT.2020 + HLG 标签，不写 mastering display / CLL。Dolby Vision 源的输出一律按 HDR10 标。整步由 <code>hdr.preserve</code> 控制。</p></div>
+</div>
+<div class="def" id="dv-sdr">
+  <h3 class="def__name">SDR</h3>
+  <div class="def__body"><p>BT.709 直接编码。</p></div>
+</div>
+</section>
 
+<section id="sec-verify">
+<h2>成品校验</h2>
+<p>编码完成后成品要过两道检查，性质不同：<a href="#sec-verify-output">结构检查</a>两种引擎都做、不能关，不过就判作业失败；<a href="#sec-verify-shots">抽验镜头</a>只有 optimizer 引擎做，只报告，不会让作业失败。顺序是拼接复用 → 抽验镜头 → 结构检查 → 作业标记完成；开了 <code>delete_source</code> 的话，源文件在标记完成之后才删。</p>
+<div class="def" id="p-verify_shots">
+  <h3 class="def__name"><code>verify_shots</code></h3>
+  <p class="def__dflt">默认 10</p>
+  <div class="def__body"><p>编码后抽验多少个镜头的实际交付质量；0 = 不验。这是全流程唯一的对账机制：它把“探测预测”和“实际交付”的偏差报出来，偏差大通常意味着窗口没对齐而不是编码器问题。代价是每个抽中的镜头再打一次分，逐个串行跑：生产机上一段 150 秒的 DV P8 片段（22 个镜头、GPU 打分）实测抽验 10 个镜头 43.6s，整个作业 398.5s。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-verify_shots">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-keep_probes">
+  <h3 class="def__name"><code>keep_probes</code></h3>
+  <p class="def__dflt">默认 <code>false</code></p>
+  <div class="def__body"><p>保留探测临时文件（调试用）。开了之后，每次探测编码出的 ivf 和打分结果 json 不再用完即删，而是在本作业的临时目录（<code>dirs.work</code> 下的 <code>av1an_…/probes/</code>）里一直攒到作业结束；作业结束时这个目录照样整个清掉，要事后还能看到，得同时开 <code>transcode.keep_temp</code>（见<a href="#sec-opt-res">临时文件</a>）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-keep_probes">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-probe_dataset">
+  <h3 class="def__name"><code>probe_dataset</code></h3>
+  <p class="def__dflt">默认 <code>true</code></p>
+  <div class="def__body"><p>把每个作业的探测结果逐行追加到 <code>dirs.logs</code> 下的 <code>probe_dataset.jsonl</code>，攒着给以后改进 QSV→SVT 那条映射线用（<a href="#sec-verify-dataset">里面有什么</a>）。一集约 160 行，不记录就永久损失。这个文件不在日志清理范围里（<code>logging.retention_days</code> 和「清除历史记录」只删 <code>job_*.log</code>），会一直追加；写不进去只告警一次，不影响转码。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-probe_dataset">去设置页 ›</a></p></div>
+</div>
+
+<h3 id="sec-verify-dataset"><code>probe_dataset.jsonl</code> 里有什么</h3>
+<ul>
+  <li>作业开始一行 <code>"type":"job"</code>：文件名、分辨率、帧率、时长、目标、探测网格、探测编码器等。</li>
+  <li>每探测完一个镜头一行 <code>"type":"shot"</code>：镜头位置与长度、探测窗口、探到的 (crf, 分数) 点，显卡也探过时的 (q, 分数) 点，以及交点。<a href="#p-probe_encoder"><code>probe_encoder</code></a> 为 <code>qsv</code> 时，只有标定被拒、整个作业退回 SVT 探测，才会写这种行。</li>
+  <li>CRF 选定后一行 <code>"type":"crfs"</code>：平滑后每个镜头实际用的 CRF。</li>
+  <li>每行都带作业日志名 <code>job</code>（<code>job_&lt;id&gt;</code>，id 就是队列页的作业 id）和写入时间 <code>t</code>。</li>
+</ul>
+
+<h3 id="sec-verify-shots">抽验镜头做了什么</h3>
+<p>CRF 是从快速 preset、最多 <a href="#p-probe_max_frames"><code>probe_max_frames</code></a> 帧的探测编码里挑出来、再套到正式编码上的，此前没有任何一步核对成品是否真落在探测说的位置。抽验补的就是这一步：</p>
+<ul>
+  <li><b>抽哪些</b>：沿时间轴均匀铺开抽 <code>verify_shots</code> 个镜头，含第一个和最后一个；只抽 1 个时取中间那个。不随机抽，是因为值得抓的毛病是位置性的：定位从某处开始错、镜头表提前用完，都会让那一点之后的镜头全部偏低，均匀抽样看得出这道断崖。</li>
+  <li><b>比什么</b>：每个镜头取它探测时的那段窗口，把成品里这一段和源的同一段帧用 <a href="#p-target_metric"><code>target_metric</code></a> 打分，再和探测曲线在所选 CRF 处预测的分数比。两边直接读、不落中间文件；SSIMULACRA2 和 Dolby Vision P5 源例外，要先把两边窗口各抽成一个 FFV1 无损文件。打分线程：预设或优化器设置里写了 <code>vmaf_threads</code> 就用它，否则取本容器可用核数的一半（见 <a href="#p-opt-vmaf_threads"><code>vmaf_threads</code></a>）。</li>
+  <li><b>在哪看</b>：队列页显示「成品质量校验中」，进度是「校验 已完成/总数 段」。作业日志（队列页「日志」）里每个镜头一行 <code>verify shot … crf … predicted=… delivered=…</code>，最后汇总交付分数的最低、中位、最高和目标，以及（有预测值时）“探测预测 vs 实际交付”的平均偏差。有镜头低于目标、交付平均比预测低 5 以上（差这么多通常是两边窗口装的不是同一批帧，而不是编码器差异）、或平均偏差达到 0.5（这时提示可以用 <a href="#p-probe_crf_offset"><code>probe_crf_offset</code></a> 把偏差换回体积）时，应用日志里另有一条。作业日志超过 <code>logging.retention_days</code>（默认 7 天）会被删掉。</li>
+  <li><b>不会让作业失败</b>：某个镜头打不了分就跳过并记告警；一个都打不了，只记一条 <code>no shot could be verified</code>。</li>
+  <li><b>看不见什么</b>：两边窗口用同一套定位去找，定位本身错了，两边会一起错开，分数照样对得上。</li>
+</ul>
+<p>什么时候看它：动了 <a href="#p-probe_max_frames"><code>probe_max_frames</code></a> 就得连着看这个偏差，只看快了多少会亏掉画质；<a href="#p-probe_crf_offset"><code>probe_crf_offset</code></a> 该填多少，看的也是它。</p>
+
+<h3 id="sec-verify-output">结构检查</h3>
+<p>两种引擎都做，不能关。只读成品的容器头（一次 ffprobe，不扫整个文件），和源比三样：时长相差不超过 1 秒或源时长的 0.5%（取大者）；音轨数相同；字幕轨数等于源的字幕轨数减去丢掉的空轨、加上新增的 srt（见<a href="#sec-subs">字幕处理</a>）。成品不存在或为空、读不出来、没有视频流，也算不过。不过就删掉成品，作业报错失败（结构不符时错误以 <code>output verification failed for</code> 开头），按 <code>workers.max_retries</code> 重试。开了 <code>delete_source</code> 时，这是删源之前的最后一道关：截断的编码、丢了音轨的复用都在这里拦下。</p>
+</section>
+
+<section id="sec-glossary">
+<h2>作业阶段与状态词表</h2>
+<p>队列页上每个作业都有两个词：<b>状态</b>（<code>status</code>，作业在队列里处于哪一步）和<b>阶段</b>（<code>stage</code>，引擎正在做什么）。下面每条先写界面上的字，后面的英文是 API、数据库和日志用的键；展开作业后「原始键」一行显示的就是这两个英文键。</p>
+<p id="g-progress"><b><code>progress</code> 是每阶段重置的，不是整个作业的。</b>每换一个阶段，百分比都从 0 重新算：优化器作业依次走分镜、探测、编码，开了抽验再走一遍校验，百分比会涨满、归零好几次。整个作业走到哪了，看<a href="#g-ladder">阶段条</a>。</p>
+
+<h3 id="g-statuses">状态</h3>
+<div class="def" id="g-status-pending">
+  <h4 class="def__name"><span class="mark" data-state="pending"><i></i>排队</span> <code>pending</code></h4>
+  <div class="def__body"><p>等空闲的 worker。worker 按提交时间从早到晚取，最早提交的先跑。刚提交的作业、失败后等<a href="#g-retry">重试</a>的作业（阶段是准备重试）、服务重启时被打断的作业，都在这个状态。</p>
+    <p>排队中的作业一取消就变成已取消，不会再被取走。</p></div>
+</div>
+<div class="def" id="g-status-analyzing">
+  <h4 class="def__name"><span class="mark" data-state="analyzing"><i></i>分析中</span> <code>analyzing</code></h4>
+  <div class="def__body"><p>worker 已经领走这个作业，正在用 ffprobe 读源文件（分辨率、编码、HDR、杜比视界、音轨和字幕），然后决定跳过还是开始转码。</p>
+    <p><b>这个状态下目前取消不掉。</b>点「取消」或「取消全部排队」会先把它标成已取消，但 worker 收不到通知：分析一结束照样往下跑，状态被改回转码中，最后照常完成。要停它，等它变成转码中再取消一次。</p></div>
+</div>
+<div class="def" id="g-status-running">
+  <h4 class="def__name"><span class="mark" data-state="running"><i></i>转码中</span> <code>running</code></h4>
+  <div class="def__body"><p>分析通过，引擎在跑。进入这个状态的那一刻记下开始时间（<code>started_at</code>）和源文件大小（<code>size_before</code>）；阶段先是一段<a href="#g-preparing">准备中</a>，然后是分镜、探测、编码，优化器开了抽验还有校验。</p>
+    <p>取消转码中的作业：阶段先变成取消中，引擎在下一次检查时停下，然后才变成已取消；成品如果已经写出，会被删除。</p></div>
+</div>
+<div class="def" id="g-status-done">
+  <h4 class="def__name"><span class="mark" data-state="done"><i></i>已完成</span> <code>done</code></h4>
+  <div class="def__body"><p>成品已写出并通过了结构检查（见<a href="#sec-verify">成品校验</a>），<code>output_path</code>、<code>size_after</code> 在这时写入，<code>progress</code> 记为 100。开了「删除源文件」的话，源文件在这之后才删。</p>
+    <p>重试后才成功的作业，错误里还留着上一次失败的原因：后端标记完成时不清空 <code>error</code>。队列页把它显示成灰色小字，不是红字。</p></div>
+</div>
+<div class="def" id="g-status-failed">
+  <h4 class="def__name"><span class="mark" data-state="failed"><i></i>失败</span> <code>failed</code></h4>
+  <div class="def__body"><p>重试次数用完了：失败后会自动重试，最多 <code>workers.max_retries</code> 次（默认 2），之后再失败才停在这里。<code>error</code> 是最后一次的原因，经过见作业日志。成品没通过结构检查时，那个文件已经被删掉，不会留在源文件旁边。</p></div>
+</div>
+<div class="def" id="g-status-cancelled">
+  <h4 class="def__name"><span class="mark" data-state="cancelled"><i></i>已取消</span> <code>cancelled</code></h4>
+  <div class="def__body"><p>被手动取消。排队中的作业立刻变成这个状态；转码中的作业要等引擎停下，期间阶段是取消中。成品如果已经写出，会被删除。</p></div>
+</div>
+<div class="def" id="g-status-skipped">
+  <h4 class="def__name"><span class="mark" data-state="skipped"><i></i>已跳过</span> <code>skipped</code></h4>
+  <div class="def__body"><p>分析后决定不转码。原因写在 <code>error</code> 里，队列页展开后显示为「跳过原因」，只有三种：</p>
+    <ul>
+      <li><code>no video stream</code>：源里没有视频流。</li>
+      <li><code>already AV1 (宽x高)</code>：源已经是 AV1，开着 <code>skip_existing_av1</code>，并且高度不低于 <code>transcode.min_height_to_transcode</code>。</li>
+      <li><code>engine=optimizer requires target_quality (e.g. 75 or 75-85)</code>：选了优化器引擎，却没有 <code>target_quality</code>。</li>
+    </ul></div>
+</div>
+
+<h3 id="g-stages">阶段</h3>
+<p>阶段词有全称和简称两种写法。全称用在表格的「阶段与进度」列和「正在转码」区块；简称用在阶段条每一段的名字和手机卡片上。</p>
+<div class="def" id="g-stage-scenedetect">
+  <h4 class="def__name">场景检测 <code>scenedetect</code></h4>
+  <p class="def__dflt">简称「分镜」</p>
+  <div class="def__body"><p>找切点。计数是已扫描帧数 / 总帧数，显示为「场景检测 N/M 帧」。av1an 引擎在它自己打出 Scene detection 时进入这一步，计数取自它的进度条。</p></div>
+</div>
+<div class="def" id="g-stage-probing">
+  <h4 class="def__name">质量探测中 <code>probing</code></h4>
+  <p class="def__dflt">简称「探测」</p>
+  <div class="def__body"><p>用不同 CRF 试编码、打分，给每一段挑 CRF。优化器上计数是已探测镜头数 / 镜头总数，显示为「探测 N/M 段」。av1an 只有设了 <code>target_quality</code> 才真的探测，计数是已探测的分块数，这一步的百分比最多到 99。</p></div>
+</div>
+<div class="def" id="g-stage-encoding">
+  <h4 class="def__name">转码中 <code>encoding</code></h4>
+  <p class="def__dflt">简称「编码」</p>
+  <div class="def__body"><p>正式编码。全称和转码中状态是同一个词。优化器上计数是已编完镜头的帧数 / 总帧数，fps 是这一阶段开始以来的平均速度；到 100% 之后还要把镜头拼起来、封装音轨和字幕，这段时间百分比停在 100。av1an 上帧数和 fps 取自它自己的进度条。</p>
+    <p>作业一变成转码中，后端就先把阶段写成 <code>encoding</code>，引擎真正开始前的那一段界面显示为<a href="#g-preparing">准备中</a>。</p></div>
+</div>
+<div class="def" id="g-stage-verifying">
+  <h4 class="def__name">成品质量校验中 <code>verifying</code></h4>
+  <p class="def__dflt">简称「校验」</p>
+  <div class="def__body"><p>仅优化器：从写好的成品里沿时间轴均匀抽 <a href="#p-verify_shots"><code>verify_shots</code></a> 个镜头（默认 10）重新打分，和探测时的预测对账，结果写进作业日志，显示为「校验 N/M 段」。它只报告，不会让作业失败。<code>verify_shots</code> 为 0 时没有这一步，阶段条上的「校验」一直不亮。详见<a href="#sec-verify">成品校验</a>。</p></div>
+</div>
+<div class="def" id="g-stage-analyzing">
+  <h4 class="def__name">分析中 <code>analyzing</code></h4>
+  <p class="def__dflt">简称「分析」</p>
+  <div class="def__body"><p>与<a href="#g-status-analyzing">分析中</a>状态同时出现。它不是阶段条上的一段：两种引擎的阶段条都从分镜开始，分析时一段都不亮，状态标记已经写着分析中。</p></div>
+</div>
+<div class="def" id="g-stage-cancelling">
+  <h4 class="def__name">取消中… <code>cancelling</code></h4>
+  <p class="def__dflt">简称「取消」</p>
+  <div class="def__body"><p>已经请求取消一个转码中的作业，等引擎在下一次检查时停下。这时「取消」按钮不再显示，阶段条上不亮任何一段。</p></div>
+</div>
+<div class="def" id="g-stage-retry">
+  <h4 class="def__name">准备重试 <code>retry</code></h4>
+  <div class="def__body"><p>上一次尝试失败，作业回到排队，等再跑一次。队列页写成「准备重试（第 N 次）」，N 是 <code>retries</code>。见<a href="#g-retry">重试 N 次</a>。</p></div>
+</div>
+<div class="def" id="g-stage-final">
+  <h4 class="def__name"><code>done</code> / <code>failed</code> / <code>skipped</code> / <code>cancelled</code></h4>
+  <div class="def__body"><p>作业结束时和同名状态一起写入，队列页只显示状态。原始键里两者对不上是正常的：转码中的作业被取消、而引擎恰好正常结束时，阶段停在 <code>cancelling</code>；「取消全部排队」只改状态，阶段保持原来的空、<code>analyzing</code> 或 <code>retry</code>。</p></div>
+</div>
+<div class="def" id="g-stage-empty">
+  <h4 class="def__name">空 <code>""</code></h4>
+  <div class="def__body"><p>worker 刚领走作业、分析还没开始的一瞬间，以及服务重启后被放回排队的作业。界面这时显示状态词。</p></div>
+</div>
+
+<h3 id="g-queue-words">队列页上的其他词</h3>
+<div class="def" id="g-ladder">
+  <h4 class="def__name">阶段条</h4>
+  <div class="def__body"><p>「正在转码」区块和每一行里的分段条。段数由引擎决定：</p>
+    <ul>
+      <li>优化器（<code>engine=optimizer</code>）：分镜 · 探测 · 编码 · 校验</li>
+      <li>av1an，设了 <code>target_quality</code>：分镜 · 探测 · 编码</li>
+      <li>av1an，没设 <code>target_quality</code>：分镜 · 编码</li>
+    </ul>
+    <p>每段的长短只是大致比例，不是时间预测。走完的段保持填满，正在走的段按本阶段的百分比填，还没走到的只有一条细线。分析中和取消中都不是其中一段，这时不亮任何一段。表格行和手机卡片里的是不带段名的小号阶段条。</p></div>
+</div>
+<div class="def" id="g-preparing">
+  <h4 class="def__name">准备中</h4>
+  <div class="def__body"><p>作业刚变成转码中、引擎还没报出第一个阶段时显示。后端在作业转为转码中的那一刻就把阶段写成 <code>encoding</code>，而引擎开始之前还有准备工作：杜比视界源开了 <code>save_rpu</code> 时要先把 RPU 从整个源文件里抽出来；av1an 引擎处理 P5 源时要先把整片转成 HDR10。大文件这一步可能要几分钟。</p>
+    <p>页面的判断：阶段是 <code>encoding</code>，百分比和帧数计数都是 0，并且这个页面没见过它经过更早的阶段。这时要是照字面点亮「编码」，会把分镜和探测画成已完成，接着又跳回分镜。</p></div>
+</div>
+<div class="def" id="g-queue-pos">
+  <h4 class="def__name">队列第 N 位</h4>
+  <div class="def__body"><p>排队中的作业还要等几个：第 1 位就是下一个开始的。顺序就是后端取作业的顺序，提交时间最早的先跑。只有所有排队中的作业都已载入列表时才显示；列表被截断时显示「–」，因为这时算出来的数不可信。手机卡片上写成「第 N 位」。</p>
+    <p>重试的作业保留原来的提交时间，所以重新排队后通常排在最前面。</p></div>
+</div>
+<div class="def" id="g-retry">
+  <h4 class="def__name">重试 N 次</h4>
+  <div class="def__body"><p>一次尝试失败后，作业回到排队，阶段是准备重试，<code>retries</code> 加 1，<code>error</code> 记下这次的原因（队列页用红字显示）。<code>workers.max_retries</code>（默认 2）是自动重试的上限，所以一个作业最多跑 1 + <code>max_retries</code> 次；<code>retries</code> 已经等于 <code>max_retries</code> 的作业正在最后一次尝试，再失败就停在失败。</p>
+    <p>界面只写「重试 N 次」，不写「N/2」：<code>max_retries</code> 不在任何 API 返回里，照抄 config.yaml 的默认值，哪天改了配置就会说错。</p>
+    <p>每次重试都从头开始：新的工作目录，分镜、探测全部重跑，没有断点续跑。服务重启时正在跑的作业也回到排队、从头开始，但不算一次重试（<code>retries</code> 不变）。</p></div>
+</div>
+<div class="def" id="g-times">
+  <h4 class="def__name">等待 / 已跑 / 用时</h4>
+  <div class="def__body"><p>展开作业后的几个时长。等待（排队中写作「已等待」）是从提交到开始转码，分析也算在里面；已跑（进行中）和用时（已结束）是从开始转码到现在或到结束。</p>
+    <p>「开始转码」指分析通过、状态变成转码中的那一刻（<code>started_at</code>）。它在每次重试和服务重启时清空重记，所以已跑、用时只算最后一次尝试，前面失败的尝试都落进了等待。</p></div>
+</div>
+<div class="def" id="g-eta">
+  <h4 class="def__name">剩余</h4>
+  <div class="def__body"><p>「正在转码」区块里百分比旁边的剩余时间。只在编码阶段、并且已有帧数和 fps 时显示，算法是（总帧数 − 已编帧数）÷ fps。它是<b>编码这一阶段</b>还剩多久，不是整个作业：优化器编完之后的拼接封装和校验都不算在内；分镜、探测、校验阶段不显示剩余。</p>
+    <p>优化器的帧数只在一个镜头整段编完时才增加，所以第一个镜头编完之前没有剩余时间。超过一小时显示为 时:分:秒。</p></div>
+</div>
+<div class="def" id="g-size">
+  <h4 class="def__name">源 → 成品</h4>
+  <div class="def__body"><p>源文件大小 → 成品大小，后面的百分比是成品比源小了多少：<code>↘N%</code> 是小了 N%，<code>↗N%</code> 是成品反而比源大了 N%，<code>±0%</code> 是差不多一样大。转码开始前源的大小取自分析结果。成品比源还大时，先看 <a href="#p-min_crf"><code>min_crf</code></a> 那一条讲的机制。</p></div>
+</div>
+<div class="def" id="g-pulse">
+  <h4 class="def__name">顶栏状态行</h4>
+  <div class="def__body"><p>队列页顶栏的一行字，页面每 4 秒问一次后端：</p>
+    <ul>
+      <li>「转码中 N · 分析中 N · 排队 N」：各状态的作业数，分析中为 0 时不写；没有转码中的作业时开头是「worker 运行中」。桌面上后面还跟着上次刷新成功的时间，手机上省掉。</li>
+      <li>「worker 停止」：<code>/api/status</code> 的 <code>workers_running</code> 为 false，队列没有在运行，排队的作业不会开始。</li>
+      <li>「与服务端失去联系，N 秒后重试」：刷新失败。页面颜色变淡，同时弹出一条不会自动消失的提示，写明原因和数据停在几点；重试间隔按 4、8、16、32 秒拉长，连上后提示「已恢复连接」。</li>
+    </ul>
+    <p>标签页在后台时页面不刷新，切回来立即刷新一次。</p></div>
+</div>
+</section>
+
+<section id="sec-config">
 <h2>config.yaml 全部配置</h2>
-<table>
-  <tr><th>配置段</th><th>键</th><th>说明</th></tr>
-  <tr><td><code>dirs</code></td><td><code>input</code></td><td>监视目录（挂载卷）。</td></tr>
-  <tr><td><code>dirs</code></td><td><code>output / rpu</code></td><td>固定输出目录；<code>null</code> = 源目录下 <code>av1/</code>（RPU 在 <code>av1/rpu/</code>）。</td></tr>
-  <tr><td><code>dirs</code></td><td><code>work</code></td><td>av1an 临时分段目录。</td></tr>
-  <tr><td><code>dirs</code></td><td><code>db / logs</code></td><td>SQLite 任务库 / 任务日志目录。</td></tr>
-  <tr><td><code>dirs</code></td><td><code>presets_file / settings_file</code></td><td>网页端预设 / 并行设置持久化文件。</td></tr>
-  <tr><td><code>workers</code></td><td><code>concurrency</code></td><td>并行转码任务数（每个任务内部 av1an 还可多 worker）。</td></tr>
-  <tr><td><code>workers</code></td><td><code>av1an_workers</code></td><td>av1an 内部 chunk 并行数，0 = 自动。</td></tr>
-  <tr><td><code>workers</code></td><td><code>max_retries</code></td><td>失败重试次数。</td></tr>
-  <tr><td><code>watcher</code></td><td><code>enabled / recursive</code></td><td>自动监视开关（默认 <code>false</code>，仅手动提交）/ 递归扫描子目录。</td></tr>
-  <tr><td><code>watcher</code></td><td><code>stable_seconds</code></td><td>文件大小稳定秒数后才入队（防复制中文件）。</td></tr>
-  <tr><td><code>watcher</code></td><td><code>min_size_mb</code></td><td>最小文件大小（MB），过滤小文件/侧车文件。</td></tr>
-  <tr><td><code>watcher</code></td><td><code>extensions</code></td><td>识别的扩展名列表。</td></tr>
-  <tr><td><code>transcode</code></td><td><code>default_preset</code></td><td>未指定预设时的默认值。</td></tr>
-  <tr><td><code>transcode</code></td><td><code>skip_existing_av1 / min_height_to_transcode</code></td><td>已是 AV1 且分辨率 ≥ 阈值时跳过；阈值 0 = 永不跳过。</td></tr>
-  <tr><td><code>transcode</code></td><td><code>keep_temp / delete_source</code></td><td>保留 av1an 临时文件 / 成功后删除源文件。</td></tr>
-  <tr><td><code>transcode.dovi</code></td><td><code>enabled / save_rpu</code></td><td>DV 转换开关 / 是否把 RPU 另存为 <code>.rpu.bin</code>。P7·P8 送进编码器前一律剥掉 DV 层，没有开关。</td></tr>
-  <tr><td><code>transcode.dovi</code></td><td><code>p5_method</code></td><td>只有 <code>libplacebo</code>（它是 ffmpeg 里唯一能<b>应用</b> DV RPU 的滤镜，需 Vulkan）。旧的 <code>zscale</code> 已退役——那条链路把 bt2020/PQ 转成 bt2020/PQ，等于只给 ICtCp 信号换了个标签而没做转换，而且 zscale 也没编进本镜像的 ffmpeg。配置里写 zscale 仍会被接受，但会记一条警告并按 libplacebo 处理。</td></tr>
-  <tr><td><code>transcode.hdr</code></td><td><code>preserve</code></td><td>输出保留 mastering display / CLL 元数据。</td></tr>
-  <tr><td><code>transcode.optimizer</code></td><td>—</td><td>Shot-based 优化器引擎的管线参数（见上节），设置页可改并持久化。</td></tr>
-  <tr><td><code>web</code></td><td><code>enabled / host / port</code></td><td>Web UI 与 API 服务。</td></tr>
-  <tr><td><code>web</code></td><td><code>api_key</code></td><td>API 密钥，空 = 全部开放。设了之后，<b>所有写操作</b>（提交/取消任务、改预设与设置）<b>以及 <code>/api/browse</code></b> 都要求请求头 <code>X-API-Key</code>；browse 之所以也算在内，是因为它读的是宿主机文件系统而不是本程序自己的状态。网页端需在「设置 → API 密钥」里填一次，存在浏览器本地。</td></tr>
-  <tr><td><code>tools</code></td><td><code>ffmpeg / ffprobe / av1an / …</code></td><td>各外部工具的可执行路径。</td></tr>
-</table>
+<p>下面的「默认」是 config.yaml 没写这一项时程序用的值。镜像随附的 config.yaml（<code>/app/config.yaml</code>）和它不同的地方在括号里注明；优化器参数的默认见<a href="#sec-opt">优化器那一章</a>。相对路径按程序根目录（镜像里是 <code>/app</code>）解析。不认识的键直接忽略。</p>
+<div class="def" id="c-dirs-input">
+  <h3 class="def__name"><code>input</code></h3>
+  <p class="def__dflt">配置段 <code>dirs</code> · 默认 <code>media/input</code>（随附 config.yaml：<code>/media/input</code>）</p>
+  <div class="def__body"><p>监视目录（挂载卷）。<code>scan</code> 命令也扫这里。</p></div>
+</div>
+<div class="def" id="c-dirs-output">
+  <h3 class="def__name"><code>output / rpu</code></h3>
+  <p class="def__dflt">配置段 <code>dirs</code> · 默认 <code>null</code> / <code>null</code></p>
+  <div class="def__body"><p>固定输出目录；<code>null</code> = 源目录下 <code>av1/</code>（RPU 在 <code>av1/rpu/</code>）。只设 <code>output</code> 时 RPU 在 <code>&lt;output&gt;/rpu/</code>。见<a href="#sec-output">输出行为</a>。</p></div>
+</div>
+<div class="def" id="c-dirs-work">
+  <h3 class="def__name"><code>work</code></h3>
+  <p class="def__dflt">配置段 <code>dirs</code> · 默认 <code>media/work</code>（随附 config.yaml：<code>/media/work</code>）</p>
+  <div class="def__body"><p>作业临时目录。每个作业在这里建一个 <code>av1an_&lt;时间戳&gt;</code>，两种引擎都用：av1an 引擎的分段，优化器引擎的探测文件、逐镜头成品、字幕和封装中间文件。av1an 引擎的 P5 整片中间文件 <code>&lt;文件名&gt;.dv_p5.mkv</code>，以及放不进 <code>p5_cache_dir</code> 的 P5 分片，也在这里。</p>
+    <p>作业结束（失败也算）就删，<code>keep_temp</code> 开着时保留。<code>run</code> 启动时会删掉上次被强杀的作业留下的 <code>av1an_*</code>、<code>*.dv_p5.mkv</code>、<code>*.dv_bl.mkv</code>，所以不要让两个在跑的实例共用一个 work 目录。</p></div>
+</div>
+<div class="def" id="c-dirs-db">
+  <h3 class="def__name"><code>db / logs</code></h3>
+  <p class="def__dflt">配置段 <code>dirs</code> · 默认 <code>data/av1transcode.db</code> / <code>data/logs</code>（随附 config.yaml：<code>/data/av1transcode.db</code> / <code>/data/logs</code>）</p>
+  <div class="def__body"><p>SQLite 任务库 / 任务日志目录。日志目录里有每个作业的 <code>job_&lt;id&gt;.log</code>（队列页「日志」打开的就是它，按 <a href="#c-logging-retention_days"><code>retention_days</code></a> 清理）、程序日志 <code>av1transcode.log</code>（<code>logging.file</code>），以及优化器 <code>probe_dataset</code> 开着时的 <code>probe_dataset.jsonl</code>。</p></div>
+</div>
+<div class="def" id="c-dirs-presets_file">
+  <h3 class="def__name"><code>presets_file / settings_file</code></h3>
+  <p class="def__dflt">配置段 <code>dirs</code> · 默认 <code>data/presets.json</code> / <code>data/settings.json</code>（随附 config.yaml：<code>/data/presets.json</code> / <code>/data/settings.json</code>）</p>
+  <div class="def__body"><p>网页端保存的预设 / 设置的持久化文件。<code>settings_file</code> 里存并行数（<code>concurrency</code>、<code>av1an_workers</code>）、<code>delete_source</code>、与 config.yaml 不同的优化器参数和 <code>vulkan_device</code>；启动时这些值盖在 config.yaml 和环境变量之上。</p></div>
+</div>
+<div class="def" id="c-workers-concurrency">
+  <h3 class="def__name"><code>concurrency</code></h3>
+  <p class="def__dflt">配置段 <code>workers</code> · 默认 1</p>
+  <div class="def__body"><p>并行转码任务数（每个任务内部 av1an 还可多 worker）。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-workers">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-workers-av1an_workers">
+  <h3 class="def__name"><code>av1an_workers</code></h3>
+  <p class="def__dflt">配置段 <code>workers</code> · 默认 0</p>
+  <div class="def__body"><p>av1an 内部 chunk 并行数，0 = 自动。只对 <code>engine=av1an</code> 的作业有用。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-workers">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-workers-max_retries">
+  <h3 class="def__name"><code>max_retries</code></h3>
+  <p class="def__dflt">配置段 <code>workers</code> · 默认 2</p>
+  <div class="def__body"><p>失败重试次数。作业失败后重新排队，最多这么多次，用完才标成失败：默认 2 就是一个文件最多跑 3 遍。</p></div>
+</div>
+<div class="def" id="c-watcher-enabled">
+  <h3 class="def__name"><code>enabled / recursive</code></h3>
+  <p class="def__dflt">配置段 <code>watcher</code> · 默认 <code>true</code> / <code>true</code>（随附 config.yaml：<code>false</code> / <code>true</code>）</p>
+  <div class="def__body"><p>自动监视开关 / 递归扫描子目录。随附的 config.yaml 把监视关了，仅手动提交；<code>run --no-watch</code> 也能关。</p>
+    <p>开着时每隔 5 秒扫一遍 <code>dirs.input</code>，跳过 <code>av1</code>、<code>work</code>、<code>rpu</code> 子目录。任务库里有过记录的文件（包括失败、跳过、取消的）不会再被自动提交；「清除历史」会忘掉这些记录。</p></div>
+</div>
+<div class="def" id="c-watcher-stable_seconds">
+  <h3 class="def__name"><code>stable_seconds</code></h3>
+  <p class="def__dflt">配置段 <code>watcher</code> · 默认 30</p>
+  <div class="def__body"><p>文件最后修改超过这么多秒、并且相邻两次扫描看到的大小和修改时间都没变，才入队（防复制中文件）。</p></div>
+</div>
+<div class="def" id="c-watcher-min_size_mb">
+  <h3 class="def__name"><code>min_size_mb</code></h3>
+  <p class="def__dflt">配置段 <code>watcher</code> · 默认 20</p>
+  <div class="def__body"><p>最小文件大小（MB），过滤小文件/侧车文件。只管监视器，<code>scan</code> 和手动提交不看它。</p></div>
+</div>
+<div class="def" id="c-watcher-extensions">
+  <h3 class="def__name"><code>extensions</code></h3>
+  <p class="def__dflt">配置段 <code>watcher</code> · 默认 <code>[mkv, mp4, mov, m2ts, ts, avi]</code></p>
+  <div class="def__body"><p>识别的扩展名列表，不分大小写。监视器、<code>scan</code> 和提交整个目录时都按它筛。</p></div>
+</div>
+<div class="def" id="c-transcode-default_preset">
+  <h3 class="def__name"><code>default_preset</code></h3>
+  <p class="def__dflt">配置段 <code>transcode</code> · 默认 <code>balanced</code></p>
+  <div class="def__body"><p>未指定预设时的默认值。指定了不存在的预设名，也退回它。</p></div>
+</div>
+<div class="def" id="c-transcode-skip_existing_av1">
+  <h3 class="def__name"><code>skip_existing_av1 / min_height_to_transcode</code></h3>
+  <p class="def__dflt">配置段 <code>transcode</code> · 默认 <code>true</code> / 0</p>
+  <div class="def__body"><p>已是 AV1 的源：高度 ≥ 阈值就跳过，低于阈值照样重编；阈值 0 = 所有 AV1 源都跳过。<code>skip_existing_av1</code> 关掉则 AV1 源也照常转码。</p></div>
+</div>
+<div class="def" id="c-transcode-keep_temp">
+  <h3 class="def__name"><code>keep_temp / delete_source</code></h3>
+  <p class="def__dflt">配置段 <code>transcode</code> · 默认 <code>false</code> / <code>false</code></p>
+  <div class="def__body"><p>保留作业临时文件（<a href="#c-dirs-work"><code>dirs.work</code></a> 下，两种引擎都算；开着时启动清理也跳过）/ 成功后删除源文件。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-safety">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-transcode-video">
+  <h3 class="def__name"><code>video</code></h3>
+  <p class="def__dflt">配置段 <code>transcode</code></p>
+  <div class="def__body"><p>没有预设提供参数时作业用的那组编码参数，最常见的是预设选 <code>custom</code>（<a href="#sec-custom">自定义参数</a>）：从它出发，再叠加覆盖。字段见<a href="#sec-presets">预设与编码参数</a>。</p>
+    <p>启动时（以及网页端改、删预设之后）它被换成默认预设（<code>default_preset</code>）当前的值。所以只要默认预设存在（随附 config.yaml 就是这样），config.yaml 里这一段只用来补齐缺的内置预设名，不直接影响作业；要改 CRF 就改预设。</p></div>
+</div>
+<div class="def" id="c-transcode-presets">
+  <h3 class="def__name"><code>presets</code></h3>
+  <p class="def__dflt">配置段 <code>transcode</code></p>
+  <div class="def__body"><p>命名的编码参数组，CLI 用 <code>-p/--preset</code> 选。随附 config.yaml 定义了三个内置预设：<code>quality</code> crf 22 / preset 2，<code>balanced</code> crf 28 / preset 4，<code>compact</code> crf 34 / preset 6，三个都是 film_grain 0、passes 1、<code>yuv420p10le</code>。预设里没写的字段取程序内置默认值，<b>不</b>继承 <code>transcode.video</code>。这三个名字 config.yaml 里缺哪个，启动时就用 <code>transcode.video</code> 补一个。</p>
+    <p>网页端保存的预设存在 <code>presets_file</code>，同名的覆盖内置预设；删掉同名的自定义预设就恢复 config.yaml 里的定义，内置预设本身删不掉。config.yaml 里写的其他预设名也算内置。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-transcode-dovi-enabled">
+  <h3 class="def__name"><code>enabled / save_rpu</code></h3>
+  <p class="def__dflt">配置段 <code>transcode.dovi</code> · 默认 <code>true</code> / <code>true</code></p>
+  <div class="def__body"><p>DV 转换开关 / 是否把 RPU 另存为 <code>.rpu.bin</code>。P7·P8 一律只编基底层（解码器自己忽略 EL 和 RPU），没有开关。关掉 <code>enabled</code> 后 P5 不再应用 RPU（ICtCp 基底层原样编码），RPU 也不存。</p></div>
+</div>
+<div class="def" id="c-transcode-dovi-p5_method">
+  <h3 class="def__name"><code>p5_method</code></h3>
+  <p class="def__dflt">配置段 <code>transcode.dovi</code> · 默认 <code>libplacebo</code></p>
+  <div class="def__body"><p>只有 <code>libplacebo</code>（它是 ffmpeg 里唯一能<b>应用</b> DV RPU 的滤镜，需 Vulkan）。旧的 <code>zscale</code> 已退役——那条链路把 bt2020/PQ 转成 bt2020/PQ，等于只给 ICtCp 信号换了个标签而没做转换，而且 zscale 也没编进本镜像的 ffmpeg。配置里写 zscale 仍会被接受，但会记一条警告并按 libplacebo 处理。</p></div>
+</div>
+<div class="def" id="c-transcode-dovi-p5_cache_dir">
+  <h3 class="def__name"><code>p5_cache_dir</code></h3>
+  <p class="def__dflt">配置段 <code>transcode.dovi</code> · 默认 <code>/dev/shm</code></p>
+  <div class="def__body"><p>优化器引擎逐镜头转换 P5 时，无损分片放这里（默认 tmpfs，不落盘）。可用空间不到分片估算大小的两倍时，这个分片改放作业临时目录（<a href="#c-dirs-work"><code>dirs.work</code></a> 下）。av1an 引擎不用它。</p></div>
+</div>
+<div class="def" id="c-transcode-dovi-vulkan_device">
+  <h3 class="def__name"><code>vulkan_device</code></h3>
+  <p class="def__dflt">配置段 <code>transcode.dovi</code> · 默认 空</p>
+  <div class="def__body"><p>P5 转换用的 Vulkan 设备，见 GPU 章的 <a href="#p-vulkan_device"><code>vulkan_device</code></a>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-vulkan_device">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-transcode-hdr-preserve">
+  <h3 class="def__name"><code>preserve</code></h3>
+  <p class="def__dflt">配置段 <code>transcode.hdr</code> · 默认 <code>true</code></p>
+  <div class="def__body"><p>输出保留 mastering display / CLL 元数据。做法是编码完用 mkvpropedit 写到 mkv 视频轨上（HDR10、HLG、DV 源），色彩标签也是这一步写的；关掉就整步不做。见 <a href="#dv-hdr10-hlg">HDR10 / HLG</a>。</p></div>
+</div>
+<div class="def" id="c-transcode-hdr-default_master_display">
+  <h3 class="def__name"><code>default_master_display / default_max_cll</code></h3>
+  <p class="def__dflt">配置段 <code>transcode.hdr</code> · 默认 <code>G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)</code> / <code>1000,400</code></p>
+  <div class="def__body"><p>HDR10 源（和传输特性是 PQ 的 DV 源）自己没带 mastering display / CLL 时补上的值；源里的 mastering display 解析不了时也改用它。<code>default_max_cll</code> 写成 <code>MaxCLL,MaxFALL</code>。HLG 不用，<code>preserve</code> 关着时也不用。</p></div>
+</div>
+<div class="def" id="c-transcode-optimizer">
+  <h3 class="def__name"><code>transcode.optimizer</code></h3>
+  <div class="def__body"><p>Shot-based 优化器引擎的管线参数（见<a href="#sec-opt">优化器那一章</a>），设置页可改并持久化。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-opt">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-web-enabled">
+  <h3 class="def__name"><code>enabled / host / port</code></h3>
+  <p class="def__dflt">配置段 <code>web</code> · 默认 <code>true</code> / <code>0.0.0.0</code> / 8080</p>
+  <div class="def__body"><p>Web UI 与 API 服务。<code>run --no-web</code> 也能关。</p></div>
+</div>
+<div class="def" id="c-web-api_key">
+  <h3 class="def__name"><code>api_key</code></h3>
+  <p class="def__dflt">配置段 <code>web</code> · 默认 空</p>
+  <div class="def__body"><p>API 密钥，空 = 全部开放。设了之后，<b>所有写操作</b>（提交/取消任务、清除历史、改预设与设置，包括恢复优化器默认值的 <code>DELETE /api/settings/optimizer</code>）、<b>GPU 自检</b>（<code>POST /api/gpu/selfcheck</code>）<b>以及 <code>/api/browse</code></b> 都要求请求头 <code>X-API-Key</code>；browse 之所以也算在内，是因为它读的是宿主机文件系统而不是本程序自己的状态。网页端需在「设置 → API 密钥」里填一次，存在浏览器本地。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-key">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-logging-level">
+  <h3 class="def__name"><code>level</code></h3>
+  <p class="def__dflt">配置段 <code>logging</code> · 默认 <code>INFO</code></p>
+  <div class="def__body"><p>程序日志（控制台和 <code>av1transcode.log</code>）的级别：<code>DEBUG</code> / <code>INFO</code> / <code>WARNING</code> / <code>ERROR</code>。</p></div>
+</div>
+<div class="def" id="c-logging-file">
+  <h3 class="def__name"><code>file</code></h3>
+  <p class="def__dflt">配置段 <code>logging</code> · 默认 <code>true</code></p>
+  <div class="def__body"><p>程序日志另写一份到 <code>&lt;logs&gt;/av1transcode.log</code>（满 100 MB 轮换，轮换出的旧文件留 30 天）。作业日志 <code>job_&lt;id&gt;.log</code> 不受它控制，总是写。</p></div>
+</div>
+<div class="def" id="c-logging-retention_days">
+  <h3 class="def__name"><code>retention_days</code></h3>
+  <p class="def__dflt">配置段 <code>logging</code> · 默认 7</p>
+  <div class="def__body"><p>作业日志 <code>job_*.log</code> 的保留天数，按文件修改时间算；<code>run</code> 启动时和之后每 6 小时清一次，0 = 不清理。队列页的「日志」打开的就是这些文件，所以老作业的「日志」会打不开（新标签页里是 <code>{"detail":"no log"}</code>），作业记录还在。「清除历史」也会删掉被清除作业的日志。</p></div>
+</div>
+<div class="def" id="c-tools-ffmpeg">
+  <h3 class="def__name"><code>ffmpeg / ffprobe</code></h3>
+  <p class="def__dflt">配置段 <code>tools</code> · 默认 <code>ffmpeg</code> / <code>ffprobe</code></p>
+  <div class="def__body"><p>各外部工具的可执行路径：写命令名就在 <code>PATH</code> 里找，也可以写绝对路径；<code>check</code> 命令逐个检查。<code>ffmpeg</code> 管解码、打分和封装，<code>ffprobe</code> 分析文件。</p></div>
+</div>
+<div class="def" id="c-tools-av1an">
+  <h3 class="def__name"><code>av1an</code></h3>
+  <p class="def__dflt">配置段 <code>tools</code> · 默认 <code>av1an</code></p>
+  <div class="def__body"><p><code>engine=av1an</code> 的编码。</p></div>
+</div>
+<div class="def" id="c-tools-dovi_tool">
+  <h3 class="def__name"><code>dovi_tool</code></h3>
+  <p class="def__dflt">配置段 <code>tools</code> · 默认 <code>dovi_tool</code></p>
+  <div class="def__body"><p>提取 RPU 存成 <code>.rpu.bin</code>（<code>save_rpu</code>）。</p></div>
+</div>
+<div class="def" id="c-tools-mkvmerge">
+  <h3 class="def__name"><code>mkvmerge / mkvpropedit</code></h3>
+  <p class="def__dflt">配置段 <code>tools</code> · 默认 <code>mkvmerge</code> / <code>mkvpropedit</code></p>
+  <div class="def__body"><p>优化器引擎的最终封装（找不到或失败就退回 ffmpeg 封装；ffmpeg 封装的 4K AV1 在 Plex 转码时会卡住）/ 编码完写色彩标签和 HDR 元数据（<code>hdr.preserve</code>）。</p></div>
+</div>
+<div class="def" id="c-tools-mediainfo">
+  <h3 class="def__name"><code>mediainfo / mkvextract</code></h3>
+  <p class="def__dflt">配置段 <code>tools</code> · 默认 <code>mediainfo</code> / <code>mkvextract</code></p>
+  <div class="def__body"><p>现在没有代码调用，只有 <code>check</code> 检查它们：缺了 <code>check</code> 照样报 <code>[MISSING]</code>。</p></div>
+</div>
+</section>
 
+<section id="sec-env">
 <h2>环境变量覆盖</h2>
-<p>任何配置均可通过环境变量覆盖（容器内优先于 config.yaml）：<code>AV1TC_&lt;段&gt;_&lt;键&gt;</code>，例如：</p>
-<pre>AV1TC_TRANSCODE_VIDEO_CRF=26
+<p>config.yaml 里写出来的每一项都可通过环境变量覆盖（容器内优先于 config.yaml）：<code>AV1TC_&lt;段&gt;_&lt;键&gt;</code>，嵌套的段依次接上，例如：</p>
+<pre>AV1TC_TRANSCODE_PRESETS_BALANCED_CRF=26
 AV1TC_WEB_PORT=9090
 AV1TC_WATCHER_MIN_SIZE_MB=5</pre>
-<p>布尔值接受 <code>1/true/yes/on</code>，数字自动转换。</p>
+<p>布尔值接受 <code>1/true/yes/on</code>，数字自动转换。别的写法的布尔值一律当 <code>false</code>；整数字段写的不是整数就忽略，保留 config.yaml 的值。列表写成逗号分隔，如 <code>AV1TC_WATCHER_EXTENSIONS=mkv,mp4</code>。键名本身带下划线没关系（如 <code>AV1TC_DIRS_SETTINGS_FILE</code>）：每一层取能对上的最长一段。</p>
+<p>只认 config.yaml 里已经写出来的键：没写的（比如预设里没列的字段，或 <code>transcode.video</code> 的 <code>target_quality</code>）用环境变量设不上，也不报错；挂自己的 config.yaml 时同理。<code>AV1TC_TRANSCODE_VIDEO_CRF</code> 虽然对得上键，但 <code>transcode.video</code> 启动时会被默认预设的值替换，<a href="#c-transcode-video">见上</a>，所以改 CRF 要改预设。网页端存进 <code>settings_file</code> 的那几项（并行数、<code>delete_source</code>、优化器参数、<code>vulkan_device</code>）启动时再盖在环境变量之上。</p>
+</section>
 
+<section id="sec-cli">
 <h2>CLI 用法</h2>
-<pre>python3 -m app.cli run                    # 完整运行（监视+队列+Web）
+<pre>python3 -m app.cli run                    # 队列 + Web；watcher.enabled 时再加监视
+python3 -m app.cli run --no-watch --no-web
 python3 -m app.cli process &lt;file&gt; --single --custom crf=24 --custom preset=3
 python3 -m app.cli process &lt;file&gt; -p compact
 python3 -m app.cli scan                    # 把输入目录现有文件全部入队
+python3 -m app.cli scan --preset compact
 python3 -m app.cli presets                 # 查看当前预设
-python3 -m app.cli status / cancel / check</pre>
+python3 -m app.cli status / cancel [job_id] / check</pre>
+<p>每个命令都接受 <code>-c/--config &lt;路径&gt;</code>，不给就用程序根目录下的 config.yaml。镜像的入口就是 <code>python3 -m app.cli</code>，默认命令是 <code>run</code>；在容器里跑其他命令：<code>docker exec av1transcode python3 -m app.cli status</code>。</p>
+<div class="def" id="cli-run">
+  <h3 class="def__name"><code>run</code></h3>
+  <div class="def__body"><p>完整运行：队列 worker，加 Web（<code>web.enabled</code>）和监视（<code>watcher.enabled</code>）。<code>--no-watch</code> / <code>--no-web</code> 分别关掉监视和 Web，没有 Web 时前台常驻，Ctrl-C 退出。启动时先删掉上次被强杀的作业留在 <code>dirs.work</code> 的临时文件，再按 <code>retention_days</code> 清旧作业日志，并把库里停在 running / analyzing 的作业改回 pending 重新排队。</p></div>
+</div>
+<div class="def" id="cli-process">
+  <h3 class="def__name"><code>process &lt;file&gt;</code></h3>
+  <div class="def__body"><p>提交一个文件；给目录则提交它第一层里扩展名匹配的文件。<code>-p/--preset</code> 选预设，<code>--custom key=value</code> 可重复（见<a href="#sec-custom">自定义参数</a>），<code>-s/--single</code> 在当前进程前台跑完。</p>
+    <p>不带 <code>--single</code> 只把作业写进任务库，等 <code>run</code> 来取；但它会顺带把库里 running / analyzing 的作业当成上次崩溃留下的，改回 pending。<code>run</code> 正在跑时别这样用，改用网页或 API 提交。</p></div>
+</div>
+<div class="def" id="cli-scan">
+  <h3 class="def__name"><code>scan</code></h3>
+  <div class="def__body"><p>把 <code>dirs.input</code> 下（总是递归）扩展名匹配的文件全部入队，<code>--preset</code> 选预设。只写任务库，由 <code>run</code> 处理。不看 <code>min_size_mb</code>、不等文件稳定、不排除 <code>av1/</code> 子目录；已经转过的源也会再入队，只排除正在排队或进行中的同一文件。</p></div>
+</div>
+<div class="def" id="cli-status">
+  <h3 class="def__name"><code>status</code></h3>
+  <div class="def__body"><p>各状态的作业数，加最近 15 个作业（id 前 8 位、状态、进度、文件名）。</p></div>
+</div>
+<div class="def" id="cli-cancel">
+  <h3 class="def__name"><code>cancel [job_id]</code></h3>
+  <div class="def__body"><p>不给 id 就取消所有排队中的作业。给 id 时排队中的直接取消；正在编码的作业在命令行里取消不了：库里只会标成 cancelling，编码照跑，要在网页或 API 上取消。</p></div>
+</div>
+<div class="def" id="cli-presets">
+  <h3 class="def__name"><code>presets</code></h3>
+  <div class="def__body"><p>列出当前生效的预设（config.yaml 加 <code>presets_file</code>）：crf、preset、film_grain、passes，有 <code>additional_video_params</code> 的也列出。</p></div>
+</div>
+<div class="def" id="cli-check">
+  <h3 class="def__name"><code>check</code></h3>
+  <div class="def__body"><p>逐个检查 <code>tools</code> 段的可执行文件在不在，缺一个就以退出码 1 结束。</p></div>
+</div>
+</section>
 
+<section id="sec-api">
 <h2>API</h2>
-<table>
-  <tr><th>方法</th><th>路径</th><th>说明</th></tr>
-  <tr><td>GET</td><td><code>/api/health /status /jobs /presets /workers</code></td><td>状态、任务、预设、并行设置（开放读取）。</td></tr>
-  <tr><td>GET</td><td><code>/api/browse</code></td><td>目录浏览。<b>需 api_key</b>——它遍历的是宿主机文件系统。</td></tr>
-  <tr><td>POST</td><td><code>/api/jobs</code></td><td>入队：<code>{"path": "...", "preset": "balanced", "overrides": {"crf": 24}}</code>。</td></tr>
-  <tr><td>POST</td><td><code>/api/jobs/{id}/cancel</code></td><td>取消任务（需 api_key）。会中断在编的任务并删除其输出文件。</td></tr>
-  <tr><td>PUT/DELETE</td><td><code>/api/presets/{name}</code></td><td>新增/修改 / 删除预设（写操作需 api_key）。</td></tr>
-  <tr><td>PUT</td><td><code>/api/settings/workers</code></td><td>并行设置：<code>{"concurrency": 2, "av1an_workers": 4}</code>，即时生效并持久化。</td></tr>
-  <tr><td>GET/PUT</td><td><code>/api/settings/optimizer</code></td><td>优化器引擎管线参数读写（持久化到 settings_file）。</td></tr>
-  <tr><td>GET</td><td><code>/api/jobs/{id}/log</code></td><td>任务日志。</td></tr>
-</table>
+<p>所有接口都在 <code>/api/</code> 下，收发 JSON（日志除外，是纯文本）；出错时返回 HTTP 错误码和 <code>{"detail": …}</code>。服务默认监听 <code>0.0.0.0:8080</code>（<code>web.host</code> / <code>web.port</code>）。默认那一行写着「需密钥」的接口，在设了 <code>web.api_key</code> 之后要带请求头 <code>X-API-Key</code>，见<a href="#api-auth">密钥</a>。</p>
+<div class="def" id="api-auth">
+  <h3 class="def__name">密钥 <code>X-API-Key</code></h3>
+  <p class="def__dflt">配置 <code>web.api_key</code> · 默认 空</p>
+  <div class="def__body"><p><code>web.api_key</code> 为空时所有接口都开放。设了之后，下面这些接口要求请求头 <code>X-API-Key</code> 与它完全一致，缺了或不对都返回 401 <code>{"detail": "invalid api key"}</code>：所有写操作（提交、取消、清除历史、改预设，改并行、优化器（包括 <code>DELETE /api/settings/optimizer</code>）、GPU、删除源文件设置），GPU 自检（<code>POST /api/gpu/selfcheck</code>），以及 <code>GET /api/browse</code>。</p>
+    <p>其余的读接口不需要密钥：<code>/api/health</code>、<code>/api/status</code>、<code>/api/jobs</code>（含单个作业和日志）、<code>/api/presets</code>、<code>/api/workers</code>、<code>/api/settings/optimizer</code>（含 <code>/defaults</code>）、<code>/api/gpu</code>、<code>/api/settings/safety</code>，以及页面本身。</p>
+<pre>curl -H 'X-API-Key: 你的密钥' -X POST http://主机:8080/api/cancel</pre>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-key">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="api-read">
+  <h3 class="def__name"><code>/api/health /status /jobs /presets /workers</code></h3>
+  <p class="def__dflt">方法 <code>GET</code></p>
+  <div class="def__body"><p>状态、任务、预设、并行设置（开放读取）。</p>
+    <ul>
+      <li><code>/api/health</code>：<code>{"status": "ok", "time": …}</code>，只说明服务活着。</li>
+      <li><code>/api/status</code>：<code>jobs</code>（七个状态各有几个作业）、<code>queue_len</code>（排队数）、<code>workers_running</code>（队列 worker 是否在跑）、<code>dirs</code>（全部目录配置，没配的目录是字符串 <code>"None"</code>），以及重复其中三个目录的 <code>system</code>。</li>
+      <li><code>/api/jobs?status=…&amp;limit=…</code>：按提交时间从新到旧。<code>status</code> 取<a href="#g-statuses">七个状态</a>之一，不给就是全部；<code>limit</code> 默认 100，最大 500，超过返回 422。每个作业的字段见<a href="#api-job">单个作业</a>。</li>
+      <li><code>/api/presets</code>：每个预设的全部参数，外加 <code>_builtin</code>：是不是内置预设（config.yaml 里定义的，加上总会存在的 <code>balanced</code>、<code>quality</code>、<code>compact</code>），删掉自定义版本后会恢复成内置的值。</li>
+      <li><code>/api/workers</code>：<code>concurrency</code>、<code>av1an_workers</code>，以及 <code>active_worker_count</code>（当前实际的 worker 线程数；调小 <code>concurrency</code> 后，多出的 worker 做完手上的作业才退出）。</li>
+    </ul></div>
+</div>
+<div class="def" id="api-job">
+  <h3 class="def__name"><code>/api/jobs/{id}</code></h3>
+  <p class="def__dflt">方法 <code>GET</code></p>
+  <div class="def__body"><p>单个作业，字段和列表里的一样；id 不存在返回 404。</p>
+    <p>字段：<code>id</code>、<code>source</code>、<code>status</code>、<code>stage</code>、<code>progress</code>（本阶段的百分比，见<a href="#g-progress">词表</a>）、<code>progress_done</code> / <code>progress_total</code> / <code>progress_fps</code>（本阶段的计数和速度）、<code>error</code>、<code>meta</code>（分析结果：分辨率、帧率、编码、时长、音轨数、HDR、杜比视界）、<code>params</code>（提交时的 <code>{source, preset, overrides}</code>）、<code>output_path</code>、<code>rpu_path</code>、<code>size_before</code> / <code>size_after</code>（字节）、<code>retries</code>、<code>created_at</code> / <code>started_at</code> / <code>finished_at</code>（Unix 时间戳，秒）。</p>
+    <p>API 不返回逐镜头的数据（每个镜头选的 CRF、抽验分数），这些只在作业日志里。</p></div>
+</div>
+<div class="def" id="api-log">
+  <h3 class="def__name"><code>/api/jobs/{id}/log</code></h3>
+  <p class="def__dflt">方法 <code>GET</code></p>
+  <div class="def__body"><p>任务日志。</p>
+    <p>纯文本，就是 <code>dirs.logs</code> 下的 <code>job_&lt;id&gt;.log</code>。文件不存在时返回 404 <code>{"detail": "no log"}</code>：作业还没进入编码引擎；日志已超过 <code>logging.retention_days</code>（默认 7 天，按修改时间算，启动时和之后每 6 小时清一次）；或者被「清除历史记录」删掉了。重试时优化器接着往同一份日志里追加，av1an 引擎则从头重写。</p></div>
+</div>
+<div class="def" id="api-jobs">
+  <h3 class="def__name"><code>/api/jobs</code></h3>
+  <p class="def__dflt">方法 <code>POST</code> · 需密钥</p>
+  <div class="def__body"><p>入队：<code>{"path": "...", "preset": "balanced", "overrides": {"crf": 24}}</code>。</p>
+    <p>返回 <code>{"job_id": "…"}</code>。<code>path</code> 必填，填容器里看得到的绝对路径。给目录时，目录里（不含子目录）每个扩展名在 <code>watcher.extensions</code> 里的文件各排一个作业，返回第一个的 id；给单个文件时不查扩展名。同一个源已经有排队中、分析中或转码中的作业时不新建，直接返回那个作业的 id。缺 <code>path</code>、路径不存在、目录里没有可识别的文件、<code>overrides</code> 不是对象，都返回 400。</p>
+    <p><code>preset</code> 不填就用 <code>transcode.default_preset</code>（默认 <code>balanced</code>）；<code>custom</code> 以默认视频参数为基准（见<a href="#sec-custom">自定义参数</a>）；不存在的预设名在作业开始时回退到默认预设，日志里记一条警告。<code>overrides</code> 的键是预设参数名，不认识的键、值为 <code>null</code> 或空字符串的键都被忽略。</p>
+    <p>作业只记下预设的<b>名字</b>和 <code>overrides</code>，预设的具体参数到作业开始分析时才读：排队期间改了预设，还没开始的作业会用改后的值，重试时也会重新读。</p></div>
+</div>
+<div class="def" id="api-cancel">
+  <h3 class="def__name"><code>/api/jobs/{id}/cancel</code></h3>
+  <p class="def__dflt">方法 <code>POST</code> · 需密钥</p>
+  <div class="def__body"><p>取消任务（需 api_key）。会中断在编的任务并删除其输出文件。</p>
+    <p>返回 <code>{"cancelled": "&lt;id&gt;"}</code>，id 不存在返回 404。排队中的作业立刻变成已取消；转码中的作业先变成取消中，引擎在下一次检查时停下，然后才是已取消。</p>
+    <p>两个例外：分析中的作业目前取消不掉，会先显示已取消，分析完又被 worker 改回转码中（见<a href="#g-status-analyzing">分析中</a>）；对已结束的作业（已完成、失败、已跳过）调用，也会把状态改成已取消，但成品不删。队列页只给排队中、分析中、转码中的作业显示「取消」。</p></div>
+</div>
+<div class="def" id="api-cancel-all">
+  <h3 class="def__name"><code>/api/cancel</code></h3>
+  <p class="def__dflt">方法 <code>POST</code> · 需密钥</p>
+  <div class="def__body"><p>把所有排队中和分析中的作业标成已取消，返回 <code>{"cancelled": 数量}</code>。转码中的作业不受影响，要停它用上面的单个取消。队列页的「取消全部排队」就是它。</p>
+    <p>它只改状态，阶段保持原样，也不写结束时间。和单个取消一样，分析中的那几个分析完会被改回转码中，所以实际效果是只取消了排队中的。</p></div>
+</div>
+<div class="def" id="api-prune">
+  <h3 class="def__name"><code>/api/jobs/prune</code></h3>
+  <p class="def__dflt">方法 <code>POST</code> · 需密钥</p>
+  <div class="def__body"><p>删除已结束作业的记录，返回 <code>{"pruned": 删掉的记录数, "logs_removed": 删掉的日志数}</code>。请求体可选，<code>{"statuses": ["failed", "cancelled"]}</code> 表示只删这几种；只认 <code>done</code>、<code>failed</code>、<code>skipped</code>、<code>cancelled</code>，其他值被忽略，不给就四种全删。排队中、分析中、转码中的作业不会被删。</p>
+    <p>删完记录，<code>dirs.logs</code> 里所有对不上现存作业的 <code>job_*.log</code> 都会被删掉，包括早就没有记录的孤儿日志；就算这次一条记录也没删，照样清。队列页的「清除历史记录」就是不带 <code>statuses</code> 的这个调用。</p>
+    <p>开着 watcher 时注意：watcher 靠作业记录判断一个文件处理过没有。记录被删掉的文件如果还在输入目录里，服务重启后会被当成新文件再排一次。</p></div>
+</div>
+<div class="def" id="api-presets">
+  <h3 class="def__name"><code>/api/presets/{name}</code></h3>
+  <p class="def__dflt">方法 <code>PUT/DELETE</code> · 需密钥</p>
+  <div class="def__body"><p>新增/修改 / 删除预设（写操作需 api_key）。</p>
+    <p>PUT 的请求体是<b>完整</b>的预设参数：没给的字段取程序内置的默认值，而不是这个预设原来的值（比如只给 <code>quality</code> PUT <code>{"crf": 20}</code>，它的 <code>preset</code> 会从 2 变回 4）。参数不合法返回 422。成功返回 <code>{"name", "params", "_builtin"}</code>，写进 <code>dirs.presets_file</code>。</p>
+    <p>DELETE 删掉自定义版本，返回 <code>{"deleted": name}</code>；有同名内置预设的，恢复成 config.yaml 的值。改的或删的是默认预设（<code>transcode.default_preset</code>）时，<code>custom</code> 的基准参数也跟着变。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="api-workers">
+  <h3 class="def__name"><code>/api/settings/workers</code></h3>
+  <p class="def__dflt">方法 <code>PUT</code> · 需密钥</p>
+  <div class="def__body"><p>并行设置：<code>{"concurrency": 2, "av1an_workers": 4}</code>，即时生效并持久化。</p>
+    <p>两个字段都可以省，省了保持当前值；<code>concurrency</code> 至少 1，<code>av1an_workers</code> 至少 0，否则返回 422。返回 <code>{"ok": true, "workers": {…}}</code>，写进 <code>dirs.settings_file</code> 的 <code>workers</code>。调大 <code>concurrency</code> 立刻多开 worker；调小时，多出的 worker 做完手上的作业才退出。<code>av1an_workers</code> 对之后开始编码的作业生效。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-workers">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="api-optimizer">
+  <h3 class="def__name"><code>/api/settings/optimizer</code></h3>
+  <p class="def__dflt">方法 <code>GET/PUT</code> · PUT 需密钥</p>
+  <div class="def__body"><p>优化器引擎管线参数读写（持久化到 settings_file）。</p>
+    <p>GET 返回当前生效的全部参数，即 config.yaml 与已保存改动合并后的结果。</p>
+    <p>PUT 是<b>合并</b>，不是替换：请求体只放要改的键，其余保持当前值；合并后的整组参数再校验，不合法返回 422，不认识的键被静默忽略。落盘时<b>只写与 config.yaml 不同的键</b>，写进 <code>dirs.settings_file</code> 的 <code>optimizer</code> 块，一个都不同时整块删掉。返回 <code>{"ok", "optimizer", "overrides"}</code>，<code>overrides</code> 就是落盘的那些键。这里的 config.yaml 指启动时读到的值，含 <code>AV1TC_</code> 环境变量的覆盖。</p>
+    <p>以前每次保存都把整块写回去，等于把当时的每个默认值都钉死：生产机曾因此在 config.yaml 早已改过之后，还按 360p 探测、隔帧取样、1200 帧窗口、40 个 VMAF 线程跑了几周。旧的整块文件照样能读，合并出来的值和原来一样。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-opt">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="api-optimizer-defaults">
+  <h3 class="def__name"><code>/api/settings/optimizer/defaults</code></h3>
+  <p class="def__dflt">方法 <code>GET</code></p>
+  <div class="def__body"><p>返回 <code>{"defaults": {…}, "overrides": {…}}</code>：config.yaml 里的值，以及当前哪些键被改离了它。设置页靠它标出改过的字段，并提供「恢复 config.yaml 的值」。</p></div>
+</div>
+<div class="def" id="api-optimizer-reset">
+  <h3 class="def__name"><code>/api/settings/optimizer</code></h3>
+  <p class="def__dflt">方法 <code>DELETE</code> · 需密钥</p>
+  <div class="def__body"><p>全部回到 config.yaml：丢掉所有改动，并从 <code>dirs.settings_file</code> 删掉 <code>optimizer</code> 块，返回 <code>{"ok": true, "optimizer": {…}}</code>。GPU 那几个键也是优化器参数，会一起恢复；<code>vulkan_device</code> 存在 <code>dovi</code> 块里，不受影响。</p></div>
+</div>
+<div class="def" id="api-gpu">
+  <h3 class="def__name"><code>/api/gpu</code></h3>
+  <p class="def__dflt">方法 <code>GET</code> · 可加 <code>?refresh=true</code></p>
+  <div class="def__body"><p>容器实际看得到的 GPU，以及当前设置怎么用它。返回 <code>{"status": {…}, "settings": {…}}</code>。<code>status</code> 通过 ffmpeg 探测得来：渲染节点 <code>render_nodes</code>、有没有 ffmpeg、libvmaf 带不带 SYCL（<code>sycl_built</code>）和它报出的设备名与设备数、ffmpeg 列出的 Vulkan 设备、QSV 和 VA-API 能不能打开、探测时间 <code>checked_at</code>。<code>settings</code> 是 7 个 GPU 相关的优化器键加 <code>vulkan_device</code>。各项含义见<a href="#sec-gpu">GPU 与硬件</a>。</p>
+    <p>结果缓存 5 分钟；<code>?refresh=true</code> 立即重新探测。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-gpu">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="api-gpu-selfcheck">
+  <h3 class="def__name"><code>/api/gpu/selfcheck</code></h3>
+  <p class="def__dflt">方法 <code>POST</code> · 需密钥</p>
+  <div class="def__body"><p>优化器自己的 SYCL 预检：同一对测试画面在 GPU 上和 CPU 上各打一次 VMAF，再比较。请求体可选 <code>{"device": N}</code>，默认用 <code>vmaf_sycl_device</code>，负数按 0。</p>
+    <p>返回 <code>device_index</code>、<code>elapsed</code>（秒）、<code>announced</code>（SYCL 后端有没有自报身份）、<code>device</code>、<code>error</code>、<code>gpu</code>、<code>cpu</code>、<code>delta</code> 和 <code>ok</code>。<code>ok</code> 要求后端自报了身份、两个分数相差不超过 1e-3、并且没有错误：后端不自报，就可能是 <code>sycl_device</code> 被忽略、实际在 CPU 上算，这时两个分数照样一致。找不到 ffmpeg 返回 500。</p></div>
+</div>
+<div class="def" id="api-gpu-put">
+  <h3 class="def__name"><code>/api/settings/gpu</code></h3>
+  <p class="def__dflt">方法 <code>PUT</code> · 需密钥</p>
+  <div class="def__body"><p>只改 GPU 相关的键：<code>vmaf_sycl_device</code>、<code>vmaf_sycl_min_width</code>、<code>scenedetect_hwaccel</code>、<code>reference_hwaccel</code>、<code>vmaf_zero_copy</code>、<code>vmaf_sycl_workers</code>、<code>gpu_vram_budget_mb</code>，以及 <code>vulkan_device</code>；请求体里的其他键被忽略。前七个和 PUT <code>/api/settings/optimizer</code> 一样合并、校验、只存与 config.yaml 不同的；<code>vulkan_device</code> 存进 <code>dirs.settings_file</code> 的 <code>dovi</code> 块。返回 <code>{"ok", "settings", "overrides"}</code>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-gpu">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="api-safety">
+  <h3 class="def__name"><code>/api/settings/safety</code></h3>
+  <p class="def__dflt">方法 <code>GET</code></p>
+  <div class="def__body"><p>返回 <code>{"delete_source": true|false}</code>：成功后是否删除源文件。</p></div>
+</div>
+<div class="def" id="api-delete-source">
+  <h3 class="def__name"><code>/api/settings/delete_source</code></h3>
+  <p class="def__dflt">方法 <code>PUT</code> · 需密钥</p>
+  <div class="def__body"><p>「成功后删除源文件」的开关：<code>{"enabled": true, "confirm": true}</code>。打开时必须带 <code>"confirm": true</code>，否则返回 422 <code>confirm=true required to enable delete_source</code>；关闭不用确认。立即生效并写进 <code>dirs.settings_file</code>，返回 <code>{"ok": true, "delete_source": …}</code>。</p>
+    <p>这个开关在作业<b>完成的那一刻</b>才读，所以打开之后，正在跑的作业完成时也会删源。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-safety">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="api-browse">
+  <h3 class="def__name"><code>/api/browse</code></h3>
+  <p class="def__dflt">方法 <code>GET</code> · 需密钥</p>
+  <div class="def__body"><p>目录浏览。<b>需 api_key</b>——它遍历的是宿主机文件系统。</p>
+    <p><code>?path=</code> 必须是绝对路径，默认 <code>/</code>，相对路径返回 400；给的是文件时列它所在的目录。返回 <code>{"path", "parent", "entries"}</code>，<code>entries</code> 每项是 <code>{"name", "dir", "size"}</code>，目录在前、再按名字排，以 <code>.</code> 开头的隐藏项不列。目录不存在返回 404，读不了返回 403。</p></div>
+</div>
+<div class="def" id="api-pages">
+  <h3 class="def__name"><code>/</code> <code>/static/*</code></h3>
+  <p class="def__dflt">方法 <code>GET</code></p>
+  <div class="def__body"><p>页面本身，不需要密钥：<code>/</code>（<code>/api/</code> 也一样）是队列页，<code>/static/settings.html</code> 是设置页，<code>/static/docs.html</code> 是本页；<code>/static/</code> 下还有页面用的 CSS 和 JS。</p>
+    <p>FastAPI 另外自动提供 <code>/docs</code>（Swagger UI）、<code>/redoc</code> 和 <code>/openapi.json</code>，列的就是上面这些接口；前两个的脚本从 cdn.jsdelivr.net 加载，浏览器上不了外网时打不开。</p></div>
+</div>
+
+<h3 id="api-webkey">网页端如何带密钥</h3>
+<p>密钥是服务端配置，页面没法从服务端读到它。在<a href="/static/settings.html#sec-key">「设置 → API 密钥」</a>里填一次，存在这个浏览器的 localStorage 里（键名 <code>av1tc_api_key</code>），之后队列页和设置页的每个 <code>/api</code> 请求都自动带上 <code>X-API-Key</code>，读请求也带：哪些接口要密钥由服务端决定，页面不用跟着改。</p>
+<p>收到 401 时页面会说清原因：没存密钥时提示「此操作需要 API 密钥（401）」，存了但对不上时提示「API 密钥被拒绝（401）」，两种都指向「设置 → API 密钥」。换浏览器或清掉站点数据后要重新填；隐私模式下可能存不住。</p>
+</section>
+
+</article>
 
 </main>
+<a class="toc-return" href="#toc">↑ 目录</a>
 </body>
 </html>

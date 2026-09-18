@@ -1,0 +1,947 @@
+/* ===========================================================================
+   AV1 Transcode Archive - shared stylesheet for index / settings / docs.
+   No build step: this file is served straight off StaticFiles (api.py:388).
+
+   Reading order
+     1  TOKENS            2  RESET + PROSE       3  LAYOUT PRIMITIVES
+     4  .bar              5  .sheet / .head      6  .mark
+     7  .figure           8  .ladder             9  .row
+    10  .kv              11  controls + .field  12  .disclose
+    13  .chip            14  .btn               15  .formstate / .notice
+    16  .dlg             17  .def / .tag        18  .devcard / .dot
+    19  .empty           20  motion budget
+
+   Rules the next person should not quietly undo are commented with the
+   failure that produced them. If a comment names a width or a commit, it is
+   there because something broke at that width.
+   =========================================================================== */
+
+/* ---------------------------------------------------------------- 1 TOKENS */
+:root{
+  /* ---------- 表面：四级灰阶，全站零阴影 ---------- */
+  --ink:       #13161a;  /* 页面底 */
+  --sheet:     #1a1e24;  /* 一级抬起：区块、行、抽屉 */
+  --sheet-2:   #212630;  /* 输入框底、行 hover、对话框 */
+  --rule:      #2a3038;  /* 1px 分隔线：只确认网格，不替代网格 */
+  --edge:      #5d6775;  /* 可输入 / 可按的东西的边框，3.1:1（WCAG 1.4.11 下限） */
+
+  /* ---------- 文字 ---------- */
+  --type:      #e4e8ee;  /* 正文 14.4:1 */
+  --dim:       #98a2af;  /* 次要 / 帮助 6.9:1，13px 下过 AA */
+  --faint:     #6d7784;  /* 3.6:1，只用于装饰刻度，绝不承载必读的字 */
+
+  /* ---------- 信号：一种饱和色 ---------- */
+  --signal:    #f0a32e;  /* 8.4:1 正在发生 / 与默认不同 / 需要注意 */
+  --signal-bg: rgba(240,163,46,.13);
+  --ok:        #5fb07a;  /* 6.7:1 已完成、已就绪 */
+  --fail:      #e2645c;  /* 5.2:1 失败、不可逆操作 */
+  --idle:      #8ca0b8;  /* 6.6:1 排队 / 已取消 / 已跳过：静止但活着 */
+
+  /* ---------- 字体 ---------- */
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto,
+          "PingFang SC", "HarmonyOS Sans SC", "Noto Sans CJK SC",
+          "Source Han Sans SC", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
+          "Liberation Mono", "Noto Sans Mono CJK SC",
+          "PingFang SC", "Microsoft YaHei", monospace;
+
+  /* ---------- 字号 ---------- */
+  --t-micro: 12px;   /* 单位、默认值标签、key 名、刻度 */
+  --t-meta:  13px;   /* 源路径、时间戳、参数摘要 */
+  --t-body:  15px;   /* 正文与全部帮助文字 */
+  --t-lead:  17px;   /* 区块标题 */
+  --t-head:  20px;   /* 页标题 */
+  --t-fig:   34px;   /* 唯一的大号：正在转码的百分比 */
+  --lh-prose: 1.75;  /* 中文散文 */
+  --lh-data:  1.45;  /* 数据行 */
+
+  /* ---------- 间距（8 基，4 半步） ---------- */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px;
+  --s5: 24px; --s6: 32px; --s7: 48px;
+
+  /* ---------- 圆角：编码可操作性 ---------- */
+  --r-ctl:   4px;    /* 可按 / 可输入 */
+  --r-float: 10px;   /* 浮起来的：dialog、sheet */
+  /* 结构面（区块、行、表格单元、阶梯段）圆角 0；全站没有 999px 胶囊 */
+
+  --z-bar: 20;
+}
+@media (prefers-color-scheme: light){ :root{ color-scheme: dark; } }
+
+/* Derived tokens. Kept out of the block above so that block stays a verbatim
+   copy of the spec and can be diffed against it. */
+:root{
+  --bar-h: 56px;                 /* sticky 顶栏高度，不含安全区 */
+  --bar-total: calc(var(--bar-h) + env(safe-area-inset-top, 0px));
+  --pad: var(--s5);              /* 页面左右边距；.sheet 用它出血到通版 */
+  --anchor-offset: calc(var(--bar-h) + var(--s4));  /* = 72px：锚点不钻到顶栏底下 */
+  --touch: 44px;                 /* 最小触摸目标 */
+  --touch-main: 48px;            /* 主操作 */
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------ 2 RESET + PROSE */
+*, *::before, *::after{ box-sizing: border-box; }
+
+html{
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;   /* 横屏时 iOS 会自作主张放大正文 */
+}
+
+body{
+  margin: 0;
+  background: var(--ink);
+  color: var(--type);
+  font-family: var(--sans);
+  font-size: var(--t-body);
+  line-height: var(--lh-data);
+  /* 队列每 4 秒重绘一次：比例数字会让整列在原地抖动。 */
+  font-variant-numeric: tabular-nums;
+  /* 横屏刘海：左右安全区由 body 兜底，页面组件只管自己的 padding。 */
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+/* 字重只用 400 / 500 / 700：600 在 PingFang SC / Microsoft YaHei 上会被合成
+   加粗，中文合成加粗是糊的。全站不用 text-transform / letter-spacing / 斜体。 */
+h1, h2, h3, h4, h5, h6{ margin: 0; font-weight: 500; line-height: 1.35; }
+h1{ font-size: var(--t-head); }
+h2{ font-size: var(--t-lead); }
+h3{ font-size: var(--t-body); }
+
+p{ margin: 0 0 var(--s3); line-height: var(--lh-prose); }
+p:last-child{ margin-bottom: 0; }
+ul, ol{ margin: 0 0 var(--s3); padding-left: 1.4em; line-height: var(--lh-prose); }
+li{ margin: var(--s1) 0; }
+b, strong{ font-weight: 500; color: var(--type); }
+small{ font-size: var(--t-meta); }
+hr{ border: 0; border-top: 1px solid var(--rule); margin: var(--s5) 0; }
+
+a{ color: var(--type); text-decoration-color: var(--faint); text-underline-offset: 3px; }
+a:hover{ text-decoration-color: var(--type); }
+
+/* 等宽只表示一件事：这串字是机器写的，你可能要复制它。
+   路径、作业 id、设备名、key=value、CRF 网格、日志、config 键。
+   禁止用在标签、按钮、标题、计数上。 */
+code, kbd, samp, pre, .mono{ font-family: var(--mono); }
+code, kbd, samp{ font-size: .92em; }
+:not(pre) > code{
+  background: var(--sheet-2);
+  border: 1px solid var(--rule);
+  border-radius: 0;              /* 结构面，不可按 */
+  padding: 1px 5px;
+  overflow-wrap: anywhere;       /* 说明页里的 key 在 390px 上要能断行 */
+}
+pre{
+  margin: 0 0 var(--s4);
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  padding: var(--s3) var(--s4);
+  overflow-x: auto;
+  font-size: var(--t-meta);
+  line-height: 1.6;
+}
+
+/* 表格：给说明页的散文表和队列表一个共同底。th 不大写——旧样式
+   th{text-transform:uppercase} 对中文无效，只把英文 status 弄难读。 */
+table{ width: 100%; border-collapse: collapse; font-size: var(--t-meta); }
+th{
+  text-align: left; font-weight: 500; color: var(--dim);
+  padding: var(--s2) var(--s3); border-bottom: 1px solid var(--rule);
+  vertical-align: bottom;
+}
+td{
+  padding: var(--s3); border-top: 1px solid var(--rule);
+  vertical-align: top;
+  min-width: 0;   /* 没有它，一个 4K 文件名会把进度列挤出屏幕 */
+}
+
+/* UA 的 [hidden] 是 display:none，但本文件里的 display 规则（.rows、.row、
+   .chip…）特异性更高，会把它盖掉：一个「隐藏」的展开面板就那样一直开着。 */
+[hidden]{ display: none !important; }
+
+/* 任何地方不得 outline:none。 */
+:focus-visible{ outline: 2px solid var(--signal); outline-offset: 2px; border-radius: var(--r-ctl); }
+
+/* 深链要落在内容上，不是落在 sticky 顶栏底下。 */
+[id]{ scroll-margin-top: var(--anchor-offset); }
+
+/* --------------------------------------------- 3 LAYOUT PRIMITIVES */
+main{
+  /* 左右安全区由 body 统一加（见 2 RESET），这里不能再加一次：.sheet 的
+     通版出血靠 margin-inline: -1 * --pad 抵消，两边必须严格相等。 */
+  padding: var(--s5) var(--pad) calc(var(--s7) + env(safe-area-inset-bottom, 0px));
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+/* 说明页正文的行宽。1440px 上一行 80 个汉字是读不下去的。 */
+.prose{ max-width: 82ch; }
+.prose h2{ margin: var(--s6) 0 var(--s3); padding-bottom: var(--s2); border-bottom: 1px solid var(--rule); }
+.prose h3{ margin: var(--s5) 0 var(--s2); }
+
+/* 设置页：左轨 + 正文。手机上左轨变索引网格，见 .rail。 */
+.wrap{
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: var(--s5);
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: var(--s5) var(--pad) calc(var(--s7) + env(safe-area-inset-bottom, 0px));
+}
+.wrap > main{ padding: 0; max-width: none; min-width: 0; }
+
+/* 设置页的工具条。手机上它是页面唯一的第二条 sticky——旧版 header≈44 +
+   rail≈34 两条堆起来吃掉五分之一视口。 */
+.tools{
+  position: sticky;
+  top: var(--bar-total);
+  z-index: calc(var(--z-bar) - 1);
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: var(--s2) var(--s4);
+  padding: var(--s2) var(--pad);
+  background: var(--ink);
+  border-bottom: 1px solid var(--rule);
+}
+.tools input[type="search"]{ flex: 1 1 260px; max-width: 420px; min-width: 0; }
+.tools label{
+  display: inline-flex; align-items: center; gap: var(--s2);
+  min-height: var(--touch); color: var(--dim); font-size: var(--t-body);
+  white-space: nowrap; cursor: pointer;
+}
+
+/* 字段网格。三档而不是两档：
+     <900   单列
+     900-1100 两列（.field 自己还是堆叠的，两列才够密）
+     >=1100 单列（.field 自己分成 仪表 | 说明 两栏，再切两列就是四栏） */
+.grid{ display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s4) var(--s5); }
+@media (min-width: 900px) and (max-width: 1099.98px){
+  .grid{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* 队列页把同一批作业渲染两份：>=900px 是真 <table>（1440px 上扫 100 行是
+   真实动作，表格的列对齐赢），以下是卡片列表。用 CSS 切而不是 matchMedia
+   分支，是为了转屏时展开着的行不会合上。
+   .tablewrap 是队列表格专用的壳；说明页的散文表用 .scrollx。 */
+.tablewrap{ overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.scrollx{ overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.rows{ display: none; list-style: none; margin: 0; padding: 0; }
+@media (max-width: 899.98px){
+  .tablewrap{ display: none; }
+  .rows{ display: block; }
+}
+
+/* ------------------------------------------------------------- 4 .bar */
+.bar{
+  position: sticky; top: 0; z-index: var(--z-bar);
+  display: flex; align-items: center; flex-wrap: nowrap;   /* 换行会让 sticky 高度变化，锚点就跳错位置 */
+  gap: var(--s4);
+  min-height: var(--bar-total);
+  padding: env(safe-area-inset-top, 0px) var(--pad) 0;
+  background: var(--sheet);
+  border-bottom: 1px solid var(--rule);
+}
+.bar__title{
+  flex: none;
+  display: inline-flex; align-items: center; min-height: var(--touch);
+  font-size: var(--t-body); font-weight: 500;
+  color: var(--type); text-decoration: none; white-space: nowrap;
+}
+.bar__short{ display: none; }
+.bar__pulse{
+  flex: 1 1 auto; min-width: 0;
+  margin: 0; color: var(--dim); font-size: var(--t-meta);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bar__pulse[data-state="run"]{ color: var(--signal); }
+.bar__pulse[data-state="idle"]{ color: var(--dim); }
+.bar__pulse[data-state="down"]{ color: var(--fail); }
+.bar__nav{ flex: none; margin-left: auto; display: flex; align-items: stretch; gap: var(--s4); }
+.bar__nav a{
+  display: inline-flex; align-items: center;
+  min-height: var(--touch);
+  color: var(--dim); text-decoration: none; font-size: var(--t-meta);
+  border-bottom: 2px solid transparent;
+}
+.bar__nav a:hover{ color: var(--type); }
+.bar__nav a[aria-current="page"]{ color: var(--type); border-bottom-color: var(--type); }
+
+/* ------------------------------------------------- 5 .sheet / .head */
+.sheet{
+  background: var(--sheet);
+  border-top: 1px solid var(--rule);
+  border-radius: 0;
+  padding: var(--s5);
+  margin-bottom: var(--s5);
+  scroll-margin-top: var(--anchor-offset);
+}
+.sheet:last-child{ margin-bottom: 0; }
+.head{
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--s2) var(--s3);
+  font-size: var(--t-lead); font-weight: 500;
+  margin: 0 0 var(--s4);
+  scroll-margin-top: var(--anchor-offset);
+}
+.head__note{ font-size: var(--t-meta); font-weight: 400; color: var(--dim); line-height: var(--lh-data); }
+
+/* 组标题（设置页的 h3.group）。没有 ALL-CAPS eyebrow。 */
+.group{
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--s2) var(--s3);
+  font-size: var(--t-body); font-weight: 500;
+  margin: var(--s6) 0 var(--s3);
+  padding-top: var(--s4);
+  border-top: 1px solid var(--rule);
+  scroll-margin-top: var(--anchor-offset);
+}
+.group:first-child{ border-top: 0; padding-top: 0; margin-top: 0; }
+.group span, .group small{ font-size: var(--t-meta); font-weight: 400; color: var(--dim); }
+
+/* ------------------------------------------------------------ 6 .mark */
+/* 七个状态在四个通道上正交：轮廓（方/圆/菱/勾/带叉）× 填充（实/空/半）×
+   尺寸（10/8）× 中文词。灰度截图里七个仍然可分——色相从不单独承载含义。
+   形状全部用 CSS 画：容器里的中文字体不保证有 ✓ ✕ 这些字形。
+   <span class="mark" data-state="running"><i></i>转码中</span> */
+.mark{
+  display: inline-flex; align-items: center; gap: var(--s2);
+  white-space: nowrap;
+  font-size: var(--t-meta); line-height: var(--lh-data);
+  color: var(--idle);
+}
+.mark > i{
+  position: relative; flex: none; display: block;
+  width: 8px; height: 8px;
+  border: 2px solid currentColor; border-radius: 0;
+  background: transparent;
+}
+/* pending：空心方块 8px */
+.mark[data-state="pending"]{ color: var(--idle); }
+/* analyzing：半填圆环 8px */
+.mark[data-state="analyzing"]{ color: var(--signal); }
+.mark[data-state="analyzing"] > i{
+  border-radius: 50%;
+  background: linear-gradient(90deg, currentColor 0 50%, transparent 50% 100%);
+}
+/* running：实心圆 10px */
+.mark[data-state="running"]{ color: var(--signal); }
+.mark[data-state="running"] > i{ width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+/* done：✓（两条边转 40°，不依赖字形） */
+.mark[data-state="done"]{ color: var(--ok); }
+.mark[data-state="done"] > i{
+  width: 6px; height: 10px;
+  border: 0; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  border-radius: 0; transform: rotate(40deg) translate(0, -1px);
+}
+/* failed：带贯穿叉的圆 10px */
+.mark[data-state="failed"]{ color: var(--fail); }
+.mark[data-state="failed"] > i{ width: 10px; height: 10px; border-radius: 50%; }
+.mark[data-state="failed"] > i::before,
+.mark[data-state="failed"] > i::after{
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 14px; height: 2px; margin: -1px 0 0 -7px; background: currentColor;
+}
+.mark[data-state="failed"] > i::before{ transform: rotate(45deg); }
+.mark[data-state="failed"] > i::after{ transform: rotate(-45deg); }
+/* cancelled：圆环 + 斜杠 8px */
+.mark[data-state="cancelled"]{ color: var(--idle); }
+.mark[data-state="cancelled"] > i{ border-radius: 50%; }
+.mark[data-state="cancelled"] > i::before{
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 12px; height: 2px; margin: -1px 0 0 -6px; background: currentColor;
+  transform: rotate(-45deg);
+}
+/* skipped：菱形环 8px */
+.mark[data-state="skipped"]{ color: var(--idle); }
+.mark[data-state="skipped"] > i{ transform: rotate(45deg); }
+
+/* ---------------------------------------------------------- 7 .figure */
+/* 全站只有「正在转码的百分比」用这个字号；字号跳跃本身就是层级，
+   所以周围不需要任何边框或阴影。 */
+.figure{
+  margin: 0;
+  font-size: var(--t-fig); font-weight: 500; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.figure__u{ font-size: var(--t-lead); font-weight: 400; color: var(--dim); margin-left: 2px; }
+
+/* ---------------------------------------------------------- 8 .ladder */
+/* 后端每次阶段切换把 progress 归零：一趟 optimizer 作业看起来「到了 90%」
+   三次，而页面上一个字都没有。阶梯是全套 UI 里唯一花掉大胆额度的元件。
+   段宽按墙钟占比给（optimizer 分镜 1 : 探测 3 : 编码 5 : 校验 1，
+   av1an 分析 1 : 编码 9），走完的段保持实心。 */
+.ladder{
+  display: flex; gap: 2px;
+  list-style: none; margin: 0; padding: 0;
+}
+.ladder__seg{
+  flex: var(--w, 1) 1 0;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto 8px auto;
+  row-gap: var(--s1);
+  margin: 0;
+}
+/* 轨道与填充占同一个格子：轨道是 ::before（先画），填充后画，盖在上面。 */
+.ladder__seg::before{
+  content: ""; grid-area: 2 / 1; align-self: stretch;
+  background: var(--sheet-2);
+}
+.ladder__fill{
+  grid-area: 2 / 1; justify-self: start; align-self: stretch;
+  width: 0; height: 100%;
+  background: var(--signal);
+}
+.ladder__seg[data-state="done"] .ladder__fill{ width: 100%; opacity: .55; }
+.ladder__seg[data-state="todo"]::before{ align-self: center; height: 1px; background: var(--rule); }
+.ladder__seg[data-state="todo"] .ladder__fill{ display: none; }
+.ladder__name{
+  grid-area: 1 / 1;
+  font-size: var(--t-micro); color: var(--dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ladder__seg[data-state="live"] .ladder__name{ color: var(--type); }
+.ladder__read{
+  grid-area: 3 / 1;
+  font-size: var(--t-micro); color: var(--dim); line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+/* 平板以下：只有当前段的读数还有地方放。 */
+@media (max-width: 899.98px){
+  .ladder__seg:not([data-state="live"]) .ladder__read{ display: none; }
+}
+/* 手机：读数离开段列，横跨整条阶梯占一行——一个 1/10 宽的段容不下
+   「8 420/20 340 帧 · 12 fps」，它会塌成一座字塔。 */
+@media (max-width: 560px){
+  .ladder{ position: relative; padding-bottom: 20px; }
+  .ladder__seg{ grid-template-rows: auto 8px; }
+  .ladder__read{ position: absolute; inset: auto 0 0 0; }
+  .ladder:not(:has([data-state="live"] .ladder__read)){ padding-bottom: 0; }
+}
+
+/* ------------------------------------------------------------- 9 .row */
+/* 桌面是 <tr>，手机是 <ul class="rows"> 里的 <li>：同一套类名，两套布局。
+   旧版的 data-label + td::before 那套连带四个已知 bug（td:empty、孙节点
+   不换行、内联 max-width、没有 :empty 的操作列），整套删掉了。 */
+.row{
+  /* 左槽线在三页语义统一：这一行不在静止状态。宽度恒定 3px，只换线型——
+     2px/3px 混用会让相邻两行的文字差 1px，100 行扫下来是抖的。 */
+  --gutter: transparent;
+  --gutter-style: solid;
+}
+.row[data-state="pending"]  { --gutter: var(--idle);   --gutter-style: dotted; }
+.row[data-state="analyzing"]{ --gutter: var(--signal); --gutter-style: solid; }
+.row[data-state="running"]  { --gutter: var(--signal); --gutter-style: solid; }
+.row[data-state="failed"]   { --gutter: var(--fail);   --gutter-style: solid; }
+.row[data-state="cancelled"]{ --gutter: var(--idle);   --gutter-style: dashed; }
+
+/* 4K 文件名与绝对路径：旧规则 td > .muted 只匹配直接子元素，而源路径是
+   孙节点，于是它永远不换行。这次对整行的所有后代生效。 */
+.row, .row *{ overflow-wrap: anywhere; }
+.row .mark, .row .btn, .row .ladder__name{ overflow-wrap: normal; }
+
+.row__file{ min-width: 0; }
+.row__toggle{
+  /* 整行标题就是展开按钮，所以操作按钮全住在 .row__detail 里：
+     没有嵌套 button 的无效标记。 */
+  appearance: none; -webkit-appearance: none;
+  display: block; width: 100%; text-align: left;
+  background: none; border: 0; padding: 0;
+  color: var(--type); font: inherit; font-size: var(--t-body); line-height: var(--lh-data);
+  cursor: pointer;
+}
+.row__toggle::before{
+  content: ""; display: inline-block; vertical-align: middle;
+  width: 0; height: 0; margin-right: var(--s2);
+  border-left: 5px solid var(--dim);
+  border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  transition: transform .18s ease-out;
+}
+.row__toggle[aria-expanded="true"]::before{ transform: rotate(90deg); }
+.row__sub{
+  margin: var(--s1) 0 0;
+  font-size: var(--t-meta); color: var(--dim); line-height: var(--lh-data);
+}
+.row__err{
+  margin: var(--s1) 0 0;
+  font-size: var(--t-meta); color: var(--fail); line-height: var(--lh-data);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; overflow: hidden;
+}
+.row__num{ white-space: nowrap; font-variant-numeric: tabular-nums; }
+.row__detail > td, .row__detail{ background: var(--sheet-2); }
+
+/* 桌面：列由 <table> 承担。 */
+@media (min-width: 900px){
+  .row > td{ border-top: 1px solid var(--rule); }
+  .row > td:first-child{ border-left: 3px var(--gutter-style) var(--gutter); }
+  /* 触摸屏上 :hover 会粘住不放，只给真有指针的设备。 */
+  @media (hover: hover){ .row:hover > td{ background: var(--sheet-2); } }
+  .row__detail > td{ border-left: 3px var(--gutter-style) var(--gutter); padding: var(--s4); }
+  .row__mark{ white-space: nowrap; }
+  .row__prog{ width: 26%; }
+}
+
+/* 手机：每行一张卡，三行式（状态+数字 / 文件名 / 阶段·预设·大小）。 */
+@media (max-width: 899.98px){
+  .row{
+    position: relative;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--s1) var(--s3);
+    margin: 0; padding: var(--s3) var(--s3) var(--s3) calc(var(--s3) - 3px);
+    background: var(--sheet);
+    border-top: 1px solid var(--rule);
+    border-left: 3px var(--gutter-style) var(--gutter);
+  }
+  .row__mark{ grid-column: 1; grid-row: 1; align-self: center; }
+  .row__num{ grid-column: 2; grid-row: 1; text-align: right; align-self: center; color: var(--dim); font-size: var(--t-meta); }
+  .row__file, .row__prog, .row__detail{ grid-column: 1 / -1; }
+  /* 整卡即触摸目标（>=64px）：::after 把按钮的命中区铺满整张卡，同时
+     文件名还留在它该在的位置上——绝对定位整个按钮会把文字一起带走。 */
+  .row__toggle{ min-height: var(--touch); display: flex; align-items: center; }
+  .row__toggle::after{ content: ""; position: absolute; inset: 0; }
+  /* 展开面板自己定位，于是画在命中区之上，里面的按钮点得着。 */
+  .row__detail{ position: relative; z-index: 1; margin-top: var(--s2); padding-top: var(--s3); border-top: 1px solid var(--rule); background: transparent; }
+}
+
+/* -------------------------------------------------------------- 10 .kv */
+.kv{ margin: 0; font-size: var(--t-meta); }
+.kv > div{
+  display: flex; align-items: baseline; gap: var(--s3);
+  padding: var(--s1) 0;
+}
+.kv dt{ flex: none; width: 96px; color: var(--dim); }
+.kv dd{ margin: 0; min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+.kv dd .btn{ margin-left: var(--s2); vertical-align: baseline; }
+/* 手机：dt 与 dd 各占一行。旧的 .paths div{flex-direction:column;gap:0} 把
+   「VMAF 打分」和它的值糊成一条连读。 */
+@media (max-width: 560px){
+  .kv > div{ display: block; padding: var(--s2) 0; }
+  .kv > div + div{ border-top: 1px solid var(--rule); }
+  .kv dt{ width: auto; display: block; margin-bottom: var(--s1); color: var(--dim); }
+}
+
+/* ------------------------------------------- 11 controls + .field */
+/* iOS 会放大一个 font-size < 16px 的聚焦输入框，而且不会自己缩回去。旧版
+   index.html 完全没防，settings.html 只防到 620px——621-900px 的平板和横屏
+   手机照样缩放。所以不分断点：所有宽度恒为 16px。 */
+input, select, textarea, button{ font-family: inherit; font-size: 16px; }
+input, select, textarea{
+  width: 100%; min-width: 0;
+  min-height: var(--touch);
+  padding: var(--s2) var(--s3);
+  background: var(--sheet-2);
+  color: var(--type);
+  border: 1px solid var(--edge);   /* 旧的 --border 在暗屏上是 1.3:1，等于没有边框 */
+  border-radius: var(--r-ctl);
+  line-height: var(--lh-data);
+}
+textarea{ resize: vertical; line-height: var(--lh-prose); }
+input[type="checkbox"], input[type="radio"]{
+  width: 20px; height: 20px; min-height: 0; padding: 0; flex: none;
+  accent-color: var(--signal);
+}
+input::placeholder{ color: var(--dim); }   /* placeholder 里写着路径范例，不是装饰 */
+input:disabled, select:disabled, textarea:disabled{ opacity: .5; }
+select{ appearance: none; -webkit-appearance: none; padding-right: var(--s5);
+  background-image: linear-gradient(45deg, transparent 50%, var(--dim) 50%),
+                    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
+  background-size: 6px 6px, 6px 6px;
+  background-position: right var(--s4) center, right calc(var(--s4) - 6px) center;
+  background-repeat: no-repeat;
+}
+@media (pointer: coarse){
+  input, select, textarea{ min-height: var(--touch-main); }
+  input[type="checkbox"], input[type="radio"]{ min-height: 0; width: 22px; height: 22px; }
+}
+label{ font-size: var(--t-body); }
+form{ margin: 0; }
+fieldset{ border: 1px solid var(--rule); border-radius: 0; padding: var(--s3); margin: 0 0 var(--s4); }
+legend{ padding: 0 var(--s2); color: var(--dim); font-size: var(--t-meta); }
+
+/* .field = 一个设置旋钮。标签 + key + 控件 + 单位 + 一行 help + 实测 note +
+   「默认 X ⟲」+ 可选的「说明 ›」深链。 */
+.field{
+  min-width: 0;
+  padding-left: var(--s3);
+  border-left: 3px solid transparent;   /* 与 .row 的左槽线同义：和默认不同 */
+}
+.field.is-changed{ border-left-color: var(--signal); }
+.field__label{
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--s1) var(--s2);
+  font-size: var(--t-body); font-weight: 500;
+  margin-bottom: var(--s2);
+}
+.field__key{
+  font-family: var(--mono); font-size: var(--t-micro); font-weight: 400;
+  color: var(--dim); background: none; border: 0; padding: 0;
+  overflow-wrap: anywhere;
+}
+.field__ctl{ display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.field__unit{ flex: none; color: var(--dim); font-size: var(--t-micro); white-space: nowrap; }
+.field__help{
+  margin: var(--s2) 0 0;
+  font-size: var(--t-body);       /* 旧版 12px：全页最该被读的一行，字最小 */
+  color: var(--dim); line-height: var(--lh-prose);
+}
+.field__note{ margin-top: var(--s1); }
+.field__foot{ display: flex; align-items: center; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s2); }
+/* 旧版是个 11px / 1px 内距的 18px 药丸，唯一的说明是触摸设备上根本不存在
+   的 title=。它其实是「改回默认」这个动作的按钮。 */
+.field__dflt{
+  appearance: none; -webkit-appearance: none;
+  display: inline-flex; align-items: center; gap: var(--s2);
+  min-height: var(--touch); padding: 0 var(--s3);
+  background: transparent; color: var(--dim);
+  border: 1px dashed var(--rule); border-radius: var(--r-ctl);
+  font: inherit; font-size: var(--t-meta); white-space: nowrap; cursor: pointer;
+}
+.field__dflt:hover{ color: var(--type); border-color: var(--edge); }
+.field.is-changed .field__dflt{
+  color: var(--signal); border-style: solid; border-color: var(--signal); background: var(--signal-bg);
+}
+.field__doc{
+  margin-left: auto;
+  display: inline-flex; align-items: center;
+  min-height: var(--touch); color: var(--dim); font-size: var(--t-meta); text-decoration: none;
+}
+.field__doc:hover{ color: var(--type); }
+/* 数字框清空后会弹回该字段的默认值；闪一下是这次回弹的唯一证据，否则
+   旧版就是静默地变成默认值或 0。 */
+.is-flash{ animation: flash .6s ease-out 2; }
+@keyframes flash{ 0%, 100%{ background: transparent } 50%{ background: var(--signal-bg) } }
+
+/* >=1100px：左仪表 / 右说明书。以下堆叠。 */
+@media (min-width: 1100px){
+  .field{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); column-gap: var(--s5); align-items: start; }
+  .field > .field__label{ grid-area: 1 / 1; }
+  .field > .field__ctl  { grid-area: 2 / 1; }
+  .field > .field__foot { grid-area: 3 / 1; }
+  .field > .field__help { grid-area: 1 / 2; margin-top: 0; }
+  .field > .field__note { grid-area: 2 / 2 / 4 / 3; }
+}
+.field--wide{ grid-column: 1 / -1; }
+/* .grid 用 gap 管间距；直接堆在区块或 sheet 里的字段自己管。 */
+.sheet > .field + .field, .dlg__body > .field + .field{ margin-top: var(--s5); }
+
+/* ------------------------------------------------------- 12 .disclose */
+/* 层 2 的唯一入口。summary 必须点名里面是什么（「展开实测数据（912 个
+   镜头）」），禁止写「更多」。 */
+.disclose{ font-size: var(--t-body); }
+.disclose > summary{
+  display: flex; align-items: center; gap: var(--s2);
+  min-height: var(--touch);
+  color: var(--dim); cursor: pointer;
+  list-style: none;
+}
+.disclose > summary::-webkit-details-marker{ display: none; }
+.disclose > summary::before{
+  content: ""; flex: none;
+  width: 0; height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  transition: transform .18s ease-out;
+}
+.disclose[open] > summary::before{ transform: rotate(90deg); }
+.disclose > summary:hover{ color: var(--type); }
+.disclose__body, .disclose > :not(summary){
+  color: var(--dim); font-size: var(--t-body); line-height: var(--lh-prose);
+  padding-left: calc(5px + var(--s2));
+  overflow-wrap: anywhere;
+}
+
+/* ----------------------------------------------------------- 13 .chip */
+/* 统计瓷砖与状态筛选器是同一行东西。固定八项顺序，零计数显示 — 且不消失：
+   旧版瓷砖只在计数非零时存在、顺序还随 SQL GROUP BY 走，队列排空时整行
+   自己跳动重排。 */
+.chiprow{
+  display: flex; gap: var(--s2);
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x proximity;
+  /* overflow-x:auto 把 overflow-y 也变成 auto，焦点环（outline-offset 2px）
+     会被裁掉；上下各留 3px 让它有地方画。 */
+  padding: 3px 0 var(--s2);
+  margin-bottom: var(--s3);
+}
+.chip{
+  flex: 0 0 auto; scroll-snap-align: start;
+  display: inline-flex; align-items: center; gap: var(--s2);
+  min-height: var(--touch); padding: 0 var(--s3);
+  background: transparent; color: var(--dim);
+  border: 1px solid var(--rule); border-radius: var(--r-ctl);
+  font: inherit; font-size: var(--t-body); white-space: nowrap; cursor: pointer;
+}
+.chip:hover{ color: var(--type); border-color: var(--edge); }
+.chip[aria-pressed="true"]{ color: var(--type); border-color: var(--edge); background: var(--sheet-2); }
+.chip__n{ color: var(--type); font-weight: 500; font-variant-numeric: tabular-nums; }
+.chip[aria-pressed="false"] .chip__n{ color: var(--dim); }
+
+/* ------------------------------------------------------------ 14 .btn */
+.btn{
+  appearance: none; -webkit-appearance: none;
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--s2);
+  min-height: var(--touch-main); padding: 0 var(--s4);
+  background: transparent; color: var(--type);
+  border: 1px solid var(--edge); border-radius: var(--r-ctl);
+  font: inherit; font-size: var(--t-body); line-height: 1.2;
+  text-decoration: none; text-align: center; cursor: pointer;
+}
+.btn:hover{ border-color: var(--type); }
+.btn--solid{ background: var(--type); color: var(--ink); border-color: var(--type); font-weight: 500; }  /* 一屏最多一个 */
+.btn--solid:hover{ background: #fff; border-color: #fff; }
+.btn--danger{ border-color: var(--fail); color: var(--fail); }
+.btn--danger:hover{ background: rgba(226,100,92,.12); border-color: var(--fail); }
+.btn--quiet{ border-color: transparent; color: var(--dim); }
+.btn--quiet:hover{ color: var(--type); border-color: var(--rule); }
+.btn--sm{ min-height: 36px; padding: 0 var(--s3); font-size: var(--t-meta); }
+.btn--wide{ width: 100%; }
+.btn:disabled{ opacity: .5; cursor: default; }
+.btn:disabled:hover{ border-color: var(--edge); }
+/* 触摸设备上 36px 的小按钮是够不着的（Apple 44 / Material 48）。 */
+@media (pointer: coarse){ .btn, .btn--sm{ min-height: var(--touch-main); } }
+
+.btnrow{ display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); margin-top: var(--s4); }
+@media (max-width: 560px){
+  .btnrow > .btn{ flex: 1 1 auto; }
+  .btnrow > .formstate{ flex: 1 0 100%; }   /* 回执自己占一行，不被按钮挤成两个字 */
+}
+
+/* ----------------------------------------- 15 .formstate / .notice */
+/* 两条反馈通道。右下角 toast 在 49 个字段的长表单上会在操作者看不到的地方
+   出现又消失，所以每个 <form> 自己带一个就地回执，贴在提交按钮旁边。 */
+.formstate{
+  margin: 0; min-height: calc(var(--t-body) * var(--lh-data));
+  font-size: var(--t-body); color: var(--dim); line-height: var(--lh-data);
+  overflow-wrap: anywhere;
+}
+.formstate:empty{ min-height: 0; }
+.formstate[data-tone="ok"]{ color: var(--ok); }
+.formstate[data-tone="err"]{ color: var(--fail); }
+.formstate[data-tone="warn"]{ color: var(--signal); }
+.formstate[data-tone="dim"]{ color: var(--dim); }
+
+.notice-host{
+  position: fixed; z-index: calc(var(--z-bar) + 10);
+  right: var(--s5); bottom: calc(var(--s5) + env(safe-area-inset-bottom, 0px));
+  display: flex; flex-direction: column; align-items: flex-end; gap: var(--s2);
+  width: min(420px, calc(100vw - var(--s6)));
+  pointer-events: none;   /* 空的时候不挡住它底下的东西 */
+}
+.notice{
+  pointer-events: auto;
+  display: flex; align-items: flex-start; gap: var(--s3);
+  width: 100%;
+  padding: var(--s3) var(--s3) var(--s3) var(--s4);
+  background: var(--sheet-2); color: var(--type);
+  border: 1px solid var(--rule); border-left: 3px solid var(--edge);
+  border-radius: var(--r-ctl);
+  font-size: var(--t-body); line-height: var(--lh-data);
+}
+.notice > p{ margin: 0; flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: var(--lh-data); }
+.notice[data-tone="ok"]{ border-left-color: var(--ok); }
+.notice[data-tone="err"]{ border-left-color: var(--fail); }
+.notice__x{
+  appearance: none; -webkit-appearance: none;
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: var(--touch); height: var(--touch); margin: calc(var(--s3) * -1) calc(var(--s3) * -1) 0 0;
+  background: none; border: 0; color: var(--dim); font: inherit; cursor: pointer;
+}
+.notice__x:hover{ color: var(--type); }
+@media (max-width: 560px){
+  .notice-host{ left: var(--s3); right: var(--s3); width: auto; bottom: calc(var(--s3) + env(safe-area-inset-bottom, 0px)); }
+}
+
+/* ------------------------------------------------------------ 16 .dlg */
+/* 原生 <dialog> + showModal()：焦点陷阱、Esc、::backdrop、背景 inert、焦点
+   归还全是白拿的。旧版的目录浏览 modal 是个 div，这四样一个都没有，手机上
+   返回手势会直接离开整页。 */
+.dlg{
+  width: min(720px, 94vw); max-width: 94vw;
+  max-height: 86vh; max-height: 86svh;
+  padding: 0; border: 1px solid var(--rule); border-radius: var(--r-float);
+  background: var(--sheet-2); color: var(--type);
+  overflow: hidden;
+}
+.dlg[open]{ display: flex; flex-direction: column; }
+.dlg::backdrop{ background: rgba(0,0,0,.6); }
+.dlg__head{
+  display: flex; align-items: center; gap: var(--s3);
+  margin: 0; padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--rule);
+}
+.dlg__head h2{ flex: 1; min-width: 0; margin: 0; font-size: var(--t-lead); font-weight: 500; }
+.dlg__head .btn{ flex: none; }
+.dlg__body{
+  flex: 1 1 auto; min-height: 0;
+  padding: var(--s4);
+  overflow-y: auto; -webkit-overflow-scrolling: touch;
+}
+.dlg__foot{
+  position: sticky; bottom: 0;   /* 键盘弹出时按钮跟着上移 */
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--s3);
+  justify-content: flex-end;
+  padding: var(--s3) var(--s4) calc(var(--s3) + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--rule);
+  background: var(--sheet-2);
+}
+.dlg__foot .formstate{ margin-right: auto; }
+.dlg--confirm{ width: min(460px, 94vw); }
+.dlg--confirm .dlg__body{ color: var(--type); line-height: var(--lh-prose); }
+/* 手机：sheet 自底升起，占满宽，底部留安全区。 */
+@media (max-width: 560px){
+  .dlg--sheet{
+    width: 100vw; max-width: 100vw;
+    max-height: 92vh; max-height: 92svh;
+    margin: auto 0 0; border-radius: var(--r-float) var(--r-float) 0 0;
+    border-bottom: 0;
+  }
+  .dlg__head, .dlg__body, .dlg__foot{ padding-left: var(--s3); padding-right: var(--s3); }
+  .dlg__foot > .btn{ flex: 1 1 auto; }
+}
+
+/* ------------------------------------------------------ 17 .def / .tag */
+/* 说明页的参数词条。旧版是三列表：main :is(pre,table){overflow-x:auto} 对
+   table 盒是空操作（overflow 不作用于 table），所以 375px 下「说明」列被压到
+   约 180px，一条 130 个汉字的说明变成 15 行字塔。词条块在 390px 和 1440px
+   上是同一个东西，还顺手给了每个参数一个可深链的锚点。 */
+.def{
+  padding: var(--s4) 0;
+  border-top: 1px solid var(--rule);
+  scroll-margin-top: var(--anchor-offset);
+}
+.def__name{
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--s2);
+  font-size: var(--t-body); font-weight: 500; margin: 0;
+}
+.def__key{ font-family: var(--mono); font-size: var(--t-micro); font-weight: 400; color: var(--dim); overflow-wrap: anywhere; }
+.def__dflt{ margin: var(--s1) 0 0; font-size: var(--t-micro); color: var(--dim); }
+.def__body{ min-width: 0; }
+.def__body > :last-child{ margin-bottom: 0; }
+.def__link{ display: inline-block; margin-top: var(--s2); font-size: var(--t-meta); color: var(--dim); text-decoration: none; }
+.def__link:hover{ color: var(--type); }
+@media (min-width: 1024px){
+  .def{ display: grid; grid-template-columns: 240px minmax(0, 1fr); column-gap: var(--s5); }
+  .def__name, .def__dflt{ grid-column: 1; }
+  .def__body, .def__link{ grid-column: 2; }
+  .def__body{ grid-row: 1 / 3; }
+}
+/* 核心 / 进阶 的区别不能只靠颜色：核心多 500 字重和一条 2px 左线。
+   .tag.core / .tag.adv 是旧写法，说明页的表格原文里就带着它们。 */
+.tag{
+  display: inline-block; padding: 1px var(--s2);
+  font-size: var(--t-micro); color: var(--dim);
+  background: var(--sheet-2); border-radius: var(--r-ctl);
+}
+.tag--core, .tag.core{ color: var(--type); font-weight: 500; border-left: 2px solid var(--type); }
+.tag--adv, .tag.adv{ color: var(--dim); }
+
+/* 说明页的常驻目录（>=1024px）。零 JavaScript：:target + <details> 就够了。 */
+.toc a{ display: block; padding: var(--s1) 0; color: var(--dim); font-size: var(--t-meta); text-decoration: none; }
+.toc a:hover{ color: var(--type); }
+
+/* -------------------------------------------------- 18 .devcard / .dot */
+/* 容器 .devcards（网格）+ 卡 .devcard。 */
+.devcards{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--s2); margin-bottom: var(--s4); }
+.devcard{
+  min-width: 0; padding: var(--s3);
+  background: var(--ink); border: 1px solid var(--rule);
+}
+.devcard__k{ display: flex; align-items: center; gap: var(--s2); color: var(--dim); font-size: var(--t-micro); }
+.devcard__v{ margin: var(--s1) 0 0; font-family: var(--mono); font-size: var(--t-meta); overflow-wrap: anywhere; line-height: var(--lh-data); }
+.dot{ flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.dot[data-state="ok"]{ background: var(--ok); }
+.dot[data-state="warn"]{ background: var(--signal); }   /* 降级但能用 */
+.dot[data-state="err"]{ background: var(--fail); }
+
+/* ----------------------------------------- 19 .rail / .empty / .skel */
+/* 设置页导航。>=900px 是左轨；以下是索引网格，两列，层 1 常显——旧版
+   .rail a.sub{display:none} 让「字幕」等六个组在手机上完全不可达。 */
+.rail{
+  position: sticky; top: calc(var(--bar-total) + var(--s4));
+  align-self: start;
+  display: flex; flex-direction: column; gap: 1px;
+  min-width: 0;
+}
+.rail a{
+  display: flex; align-items: center; gap: var(--s2);
+  min-height: 36px; padding: 0 var(--s3);
+  color: var(--dim); text-decoration: none; font-size: var(--t-meta);
+  border-left: 2px solid transparent;
+}
+.rail a:hover{ color: var(--type); background: var(--sheet); }
+.rail a.on{ color: var(--type); background: var(--sheet); border-left-color: var(--type); }
+.rail a.sub{ padding-left: var(--s5); }
+.rail .n{
+  margin-left: auto; padding: 0 var(--s2);
+  color: var(--signal); background: var(--signal-bg);   /* 与默认不同的项数 */
+  font-size: var(--t-micro); font-variant-numeric: tabular-nums;
+}
+.rail .n:empty{ display: none; }
+.rail__note{ margin: var(--s4) 0 0; padding: 0 var(--s3); color: var(--dim); font-size: var(--t-micro); line-height: var(--lh-data); }
+@media (max-width: 899.98px){
+  .rail{
+    position: static;
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 var(--s3);
+  }
+  .rail a{ min-height: var(--touch-main); border-left: 0; border-bottom: 1px solid var(--rule); padding: 0 var(--s2); }
+  .rail a.on{ background: transparent; color: var(--type); }
+  .rail a.sub{ padding-left: var(--s4); }
+  .rail a::after{ content: "\203A"; margin-left: var(--s2); color: var(--faint); }
+  .rail a .n{ margin-left: auto; }
+  .rail__note{ grid-column: 1 / -1; }
+}
+
+.empty{
+  display: flex; flex-direction: column; align-items: center; gap: var(--s4);
+  text-align: center; color: var(--dim);
+  padding: var(--s6) var(--s4);
+  line-height: var(--lh-prose);
+}
+.empty .btn{ flex: none; }
+
+/* 首屏骨架：三条灰条，而不是一句英文 loading。 */
+.skel{ height: 14px; background: var(--sheet-2); margin-bottom: var(--s2); }
+.skel--wide{ width: 100%; }
+.skel--mid{ width: 62%; }
+.skel--short{ width: 34%; }
+
+/* 轮询失败时给 <main> 加上：数据停在某个时刻，别让它看起来像现在的。
+   这不是动效，reduced-motion 下同样生效。 */
+.is-stale{ filter: saturate(.5); }
+
+/* -------------------------------------------------- 20 断点与动效预算 */
+/* 断点三个：560 手机细调 / 900 结构切换 / 1024 说明页左轨。 */
+@media (max-width: 899.98px){
+  :root{ --pad: var(--s4); }
+  .wrap{ grid-template-columns: minmax(0, 1fr); gap: var(--s4); padding: var(--s4) var(--pad); }
+  /* 手机上顶栏是唯一的 sticky。旧版 header≈44 + rail≈34 两条堆起来，
+     加上工具条就是三条，一屏被吃掉五分之一。 */
+  .tools{ position: static; }
+  /* 通版出血：区块在窄屏上顶满两边，省下 2×12px 的横向噪声。 */
+  .sheet{ margin-inline: calc(var(--pad) * -1); padding: var(--s4) var(--pad); }
+}
+@media (max-width: 560px){
+  :root{
+    --pad: var(--s3);
+    --bar-h: 48px;
+    --t-fig: 28px;
+  }
+  main{ padding-top: var(--s4); }
+  .bar{ gap: var(--s3); }
+  .bar__full{ display: none; }
+  .bar__short{ display: inline; }
+  .bar__nav{ gap: var(--s3); }
+  .head{ font-size: var(--t-body); }
+}
+
+/* 动效预算两条：机器自己的状态（阶梯填充），以及对一次点击的回答。 */
+.ladder__fill{ transition: width .6s linear; }
+.dlg[open]{ animation: dlg-in .18s ease-out; }
+@keyframes dlg-in{ from{ opacity: 0; transform: translateY(8px); } to{ opacity: 1; transform: none; } }
+@media (max-width: 560px){
+  .dlg--sheet[open]{ animation: sheet-in .18s ease-out; }
+  @keyframes sheet-in{ from{ transform: translateY(100%); } to{ transform: none; } }
+}
+@media (prefers-reduced-motion: reduce){
+  *{ transition: none !important; animation: none !important; }
+  html{ scroll-behavior: auto; }
+}

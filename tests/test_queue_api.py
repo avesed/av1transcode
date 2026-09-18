@@ -519,20 +519,37 @@ def test_browse_refuses_a_relative_path(settings, store):
 # --------------------------------------------------------------- the UI ----
 
 def test_ui_pages_send_the_api_key():
-    """Both pages must route their /api calls through the key-aware wrapper.
+    """Every /api call in the UI must go through the key-aware wrapper.
 
     Neither page used to send X-API-Key at all, which made web.api_key
     unusable: setting it locked the bundled UI out of every write rather than
-    securing anything. A bare fetch("/api/...") here is that regression.
+    securing anything. A bare fetch("/api/...") is that regression.
+
+    The pages' script moved out of the HTML into .js files, so every file
+    the static dir serves is scanned, not a list of names: a list is exactly
+    what the guard would have been left pointing at while the calls moved
+    somewhere it did not look.
     """
+    import re
+
     static = Path(__file__).resolve().parent.parent / "app" / "static"
     assert (static / "apikey.js").exists()
     for page in ("index.html", "settings.html"):
-        text = (static / page).read_text()
-        assert "/static/apikey.js" in text, f"{page} does not load the helper"
-        for bad in ('fetch("/api', "fetch(`/api"):
-            assert bad not in text.replace("afetch(", ""), \
-                f"{page} calls {bad}...) without the key"
+        assert "/static/apikey.js" in (static / page).read_text(), \
+            f"{page} does not load the helper"
+    scanned = [p for p in sorted(static.iterdir())
+               if p.suffix in (".html", ".js") and p.name != "apikey.js"]
+    assert {"index.html", "settings.html", "queue.js", "settings.js", "ui.js"} \
+        <= {p.name for p in scanned}
+    for path in scanned:
+        # ui.js's own comment quotes the forbidden call to say it is
+        # forbidden; comments are dropped so only code can fail this
+        text = re.sub(r"/\*.*?\*/|<!--.*?-->", "", path.read_text(), flags=re.S)
+        text = "\n".join(line for line in text.splitlines()
+                         if not line.lstrip().startswith("//"))
+        text = text.replace("afetch(", "")
+        for bad in ('fetch("/api', "fetch(`/api", "fetch('/api"):
+            assert bad not in text, f"{path.name} calls {bad}...) without the key"
 
 
 def test_optimizer_overrides_merge_over_config_yaml(settings, store, tmp_path, monkeypatch):

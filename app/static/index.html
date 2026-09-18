@@ -2,388 +2,261 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
   <title>AV1 Transcode Archive</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/base.css">
   <style>
-    :root {
-      --bg: #14161a; --panel: #1d2128; --border: #2c323c;
-      --text: #dfe3e9; --muted: #8b95a5; --accent: #4f9cf9;
-      --ok: #3ecf6e; --warn: #e3b341; --err: #ef6b6b;
+    /* The clock is the first thing a 390px bar can spare; the counts are not.
+       While disconnected the retry countdown stays, because it is the one
+       thing the operator is waiting for. */
+    @media (max-width: 560px){
+      .bar__pulse:not([data-state="down"]) .pulse__at{ display: none; }
     }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-           background: var(--bg); color: var(--text); }
-    header { display: flex; align-items: center; gap: 16px; padding: 14px 22px;
-             background: var(--panel); border-bottom: 1px solid var(--border); }
-    header h1 { font-size: 18px; margin: 0; font-weight: 600; }
-    .badge { font-size: 12px; padding: 3px 10px; border-radius: 99px; }
-    .badge.ok { background: rgba(62,207,110,.15); color: var(--ok); }
-    main { padding: 20px 22px; max-width: 1200px; margin: 0 auto; }
-    .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
-    .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-            padding: 10px 18px; }
-    .stat b { display: block; font-size: 20px; }
-    .stat span { color: var(--muted); font-size: 12px; }
-    .tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-    table { width: 100%; border-collapse: collapse; background: var(--panel);
-            border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-    th, td { text-align: left; padding: 10px 14px; font-size: 13px; border-bottom: 1px solid var(--border); }
-    th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; }
-    .bar { width: 120px; max-width: 100%; height: 6px; background: #2a2f3a;
-           border-radius: 4px; overflow: hidden; }
-    .bar > div { height: 100%; background: var(--accent); }
-    .st-done { color: var(--ok); } .st-failed { color: var(--err); }
-    .st-pending { color: var(--warn); } .st-running { color: var(--accent); }
-    button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
-             padding: 6px 12px; cursor: pointer; font-size: 12px; }
-    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
-    form { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
 
-    /* Phones. A seven-column table of 4K filenames cannot be made to fit by
-       shrinking, so below this width each row becomes a stacked card with
-       its column name as the label - the header row is what carries the
-       labels on a wide screen, and it is the first thing that has to go. */
-    @media (max-width: 720px) {
-      main { padding: 14px 12px; }
-      header { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
-      header h1 { font-size: 16px; }
-      header nav { margin-left: auto; }
-      .stats { gap: 8px; }
-      .stat { padding: 8px 12px; flex: 1 1 30%; }
-      .stat b { font-size: 17px; }
-      form { gap: 6px; }
-      form input[type=text], form select, form button { flex: 1 1 100%; max-width: none; }
-      table, thead, tbody, tr, th, td { display: block; }
-      thead { position: absolute; left: -9999px; }        /* labels move inline */
-      table { border: 0; background: transparent; }
-      tr { background: var(--panel); border: 1px solid var(--border);
-           border-radius: 10px; margin-bottom: 10px; padding: 4px 0; }
-      td { border-bottom: 0; padding: 6px 12px; display: flex; gap: 10px;
-           align-items: baseline; }
-      td::before { content: attr(data-label); color: var(--muted); font-size: 11px;
-                   text-transform: uppercase; flex: 0 0 4.2em; }
-      td:empty { display: none; }
-      td > .muted { word-break: break-all; }
-      .bar { width: 100%; }
+    /* ---- transport block: one per running / analyzing job */
+    .now + .now{ margin-top: var(--s5); padding-top: var(--s5); border-top: 1px solid var(--rule); }
+    .now__name{ margin: 0 0 var(--s2); font-size: var(--t-body); font-weight: 500; overflow-wrap: anywhere; }
+    .now__top{ display: flex; align-items: center; gap: var(--s4); margin-bottom: var(--s3); }
+    .now__stage{ margin: 0; display: flex; flex-direction: column; line-height: var(--lh-data); }
+    .now__stage span{ color: var(--dim); font-size: var(--t-meta); }
+    .now__stage b{ font-size: var(--t-lead); }
+    .now .ladder{ margin-bottom: var(--s3); }
+    /* One line for the live readout instead of a tower of wrapped digits in a
+       10%-wide segment: only the live segment carries text, so running into
+       its neighbours overlaps nothing. The last segment grows leftwards. */
+    @media (min-width: 560.02px){
+      .now .ladder__read{ white-space: nowrap; }
+      .now .ladder__seg:last-child .ladder__read{ justify-self: end; }
     }
-    input[type=text] { flex: 1; min-width: 200px; background: var(--panel); border: 1px solid var(--border);
-      border-radius: 6px; padding: 8px 12px; color: var(--text); }
-    select { max-width:180px; background: var(--panel); border: 1px solid var(--border);
-      border-radius: 6px; padding: 8px 12px; color: var(--text); font-size: 13px; }
-    .muted { color: var(--muted); font-size: 12px; }
-    .empty { text-align: center; color: var(--muted); padding: 30px; }
-    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none;
-                align-items: center; justify-content: center; z-index: 50; }
-    .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-             width: min(720px, 94vw); max-height: 82vh; display: flex; flex-direction: column; }
-    .modal h3 { margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 14px; }
-    .bpath { color: var(--muted); font-size: 12px; padding: 8px 16px 0; word-break: break-all; }
-    .btree { overflow-y: auto; padding: 8px; flex: 1; }
-    .brow { display: flex; gap: 8px; align-items: center; padding: 7px 10px; border-radius: 6px;
-            cursor: pointer; font-size: 13px; }
-    .brow:hover { background: #262c36; }
-    .brow .ico { width: 18px; text-align: center; color: var(--muted); }
-    .brow.d { color: var(--accent); }
-    .brow .sz { margin-left: auto; color: var(--muted); font-size: 11px; }
-    .modal-foot { padding: 10px 16px; border-top: 1px solid var(--border); display: flex;
-                  justify-content: flex-end; gap: 8px; }
-    #path { background: var(--panel); }
-    .custom-hint { width: 100%; color: var(--muted); font-size: 12px; margin-top: -10px; }
-    #custom:disabled { opacity: .4; }
-    .toolbar { display: flex; align-items: center; gap: 8px; margin: 14px 0 8px; }
-    .toolbar .ghost-sel { background: var(--panel); border: 1px solid var(--border); color: var(--text);
-      border-radius: 6px; padding: 5px 8px; font-size: 12px; margin-left: auto; }
+    .now__line{ margin: 0; font-size: var(--t-meta); color: var(--dim); line-height: var(--lh-data); overflow-wrap: anywhere; }
+    .now__facts{ margin: var(--s2) 0 0; display: flex; flex-wrap: wrap; gap: var(--s1) var(--s4); font-size: var(--t-meta); color: var(--dim); line-height: var(--lh-data); }
+    .now__facts b{ font-weight: 400; color: var(--type); }
+    .now__facts .mono{ overflow-wrap: anywhere; }
+    .now .row__err{ margin-top: var(--s2); }
+    .now__detail{ margin-top: var(--s4); padding: var(--s4); background: var(--sheet-2); }
+    .now__none{ margin: 0; color: var(--dim); }
+
+    /* ---- queue toolbar */
+    .qtools{ display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); margin-bottom: var(--s4); }
+    .qtools__end{ display: flex; flex-wrap: wrap; gap: var(--s2); margin-left: auto; }
+    @media (max-width: 560px){
+      .qtools > .btn--solid{ flex: 1 0 100%; }
+      .qtools__end{ flex: 1 0 100%; margin-left: 0; }
+      .qtools__end > .btn{ flex: 1 1 0; }
+    }
+
+    /* ---- table columns (>= 900px) */
+    #jobsTable th.num, #jobsTable td.row__num{ text-align: right; }
+    #jobsTable .c-mark{ width: 88px; }
+    #jobsTable .c-prog{ width: 19%; }
+    #jobsTable .c-preset{ width: 17%; }
+    #jobsTable .c-size{ width: 150px; }
+    #jobsTable .c-time{ width: 76px; }
+    #jobsTable .row__prog{ width: auto; }
+    /* A landscape tablet is past 900px and gets the table, not the cards,
+       and a one-line file name there is a 22px target. */
+    @media (pointer: coarse){ #jobsTable .row__toggle{ min-height: var(--touch); } }
+    .prog{ margin: 0; line-height: var(--lh-data); font-size: var(--t-meta); color: var(--dim); }
+    .prog b{ font-weight: 500; color: var(--type); }
+    .row__prog .ladder{ margin-top: var(--s2); }
+    .preset{ font-size: var(--t-meta); line-height: var(--lh-data); overflow-wrap: anywhere; }
+    .preset .mono{ display: block; margin-top: var(--s1); color: var(--dim); }
+    .ratio{ display: block; margin-top: var(--s1); }
+    .ratio[data-dir="down"]{ color: var(--ok); }
+    .ratio[data-dir="up"]{ color: var(--signal); }
+    .card{ margin: 0; font-size: var(--t-meta); color: var(--dim); line-height: var(--lh-data); }
+    .rows .row__num .ratio{ display: inline; margin: 0; }
+
+    /* ---- expanded detail: identity + config | media + timeline */
+    .detail{ display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 var(--s5); }
+    @media (min-width: 1100px){
+      .detail{ grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    }
+    .detail__full{ grid-column: 1 / -1; }
+    .detail .kv dd .btn{ vertical-align: middle; }
+    .aux{ color: var(--dim); margin-left: var(--s2); white-space: nowrap; }
+    .errtext{
+      margin: 0; max-height: 40vh; overflow: auto;
+      white-space: pre-wrap; overflow-wrap: anywhere;
+      background: var(--ink); color: var(--type);
+    }
+    .row__detail .btnrow{ margin-top: var(--s3); }
+
+    .tally{ margin: 0; color: var(--dim); font-size: var(--t-meta); }
+    .more{ display: flex; flex-wrap: wrap; align-items: center; gap: var(--s3); margin-top: var(--s4); }
+    .more .btn{ margin-left: auto; }
+    @media (max-width: 560px){ .more .btn{ flex: 1 0 100%; margin-left: 0; } }
+
+    /* ---- dialogs. .field splits into gauge | manual at >=1100px, which is
+       right for the settings page and cramped inside a 720px sheet. */
+    .dlg .field{ display: block; padding-left: 0; border-left: 0; }
+    .dlg .field + .field, .dlg .field + .pair, .dlg .hint + .field{ margin-top: var(--s5); }
+    .dlgform{ display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+    .pair{ display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s4); margin-top: var(--s5); }
+    @media (min-width: 561px){ .pair{ grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .pair .field + .field{ margin-top: 0; }
+    .echo{ margin: var(--s2) 0 0; font-size: var(--t-meta); color: var(--dim); overflow-wrap: anywhere; line-height: var(--lh-data); }
+    .hint{ margin: var(--s2) 0 0; font-size: var(--t-body); color: var(--dim); line-height: var(--lh-prose); }
+    .warn{ color: var(--signal); }
+    .dirs{ display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); color: var(--dim); font-size: var(--t-meta); }
+    .keys{ list-style: none; margin: var(--s2) 0 0; padding: 0; font-size: var(--t-meta); line-height: var(--lh-data); }
+    .keys li{ margin: 0; padding: var(--s1) 0; border-top: 1px solid var(--rule); }
+    .keys span{ color: var(--dim); margin-left: var(--s2); }
+    #path, #bPath, #custom{ font-family: var(--mono); }
+
+    .bnav{ display: flex; flex-wrap: wrap; gap: var(--s2); padding: var(--s3) var(--s4); border-bottom: 1px solid var(--rule); }
+    .bnav input{ flex: 1 1 280px; }
+    @media (max-width: 560px){ .bnav{ padding-left: var(--s3); padding-right: var(--s3); } .bnav .btn{ flex: 1 0 100%; } }
+    .bstate:empty{ display: none; }
+    .bstate{ margin-bottom: var(--s3); }
+    .btree{ list-style: none; margin: 0; padding: 0; transition: opacity .18s ease-out; }
+    .btree.is-loading{ opacity: .5; }
+    .btree li{ margin: 0; }
+    .brow{
+      appearance: none; -webkit-appearance: none;
+      display: flex; align-items: center; gap: var(--s3);
+      width: 100%; min-height: var(--touch-main); padding: var(--s2) var(--s2);
+      background: none; border: 0; border-bottom: 1px solid var(--rule); border-radius: 0;
+      color: var(--type); font: inherit; font-size: var(--t-body); text-align: left; cursor: pointer;
+    }
+    @media (hover: hover){ .brow:hover{ background: var(--sheet); } }
+    .brow__ico{ flex: none; width: 1em; color: var(--dim); text-align: center; }
+    .brow__name{ flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; line-height: var(--lh-data); }
+    .brow__sz{ flex: none; color: var(--dim); font-size: var(--t-meta); }
   </style>
 </head>
 <body>
-<header>
-  <h1>AV1 Transcode Archive</h1>
-  <span class="badge ok" id="sysinfo">loading…</span>
-  <nav style="margin-left:auto">
-    <a href="/static/settings.html" style="color:var(--muted);text-decoration:none;font-size:13px;margin-left:14px">设置</a>
-    <a href="/static/docs.html" style="color:var(--muted);text-decoration:none;font-size:13px;margin-left:14px">说明</a>
+<header class="bar">
+  <a class="bar__title" href="/"><span class="bar__full">AV1 Transcode Archive</span><span class="bar__short">队列</span></a>
+  <p class="bar__pulse" id="pulse" data-state="idle"><span id="pulseMain">正在连接…</span><span class="pulse__at" id="pulseAt"></span></p>
+  <nav class="bar__nav">
+    <a href="/" aria-current="page">队列</a>
+    <a href="/static/settings.html">设置</a>
+    <a href="/static/docs.html">说明</a>
   </nav>
 </header>
-<main>
-  <div class="stats" id="stats"></div>
-  <form id="submit">
-    <input type="text" id="path" placeholder="绝对路径：/media/input/xxx.mkv 或目录">
-    <button type="button" class="ghost" id="browseBtn">浏览…</button>
-    <select id="preset"></select>
-    <select id="engine" title="编码引擎">
-      <option value="av1an">av1an</option>
-      <option value="optimizer">optimizer</option>
-    </select>
-    <select id="target_metric" title="optimizer 探测指标" disabled>
-      <option value="vmaf">VMAF</option>
-      <option value="ssimulacra2">SSIMULACRA2</option>
-    </select>
-    <input type="text" id="custom" placeholder="自定义参数: crf=24,preset=3,target_quality=75-85" style="max-width:280px">
-    <button type="submit">提交转码</button>
-    <div class="custom-hint" id="customHint">提示：自定义参数会覆盖所选预设的对应字段；预设选择 custom 时以默认参数为基准。</div>
-  </form>
-  <div id="error" style="display:none;color:var(--err);margin-bottom:12px;font-size:13px"></div>
-  <div class="modal-bg" id="modalBg">
-    <div class="modal">
-      <h3>目录浏览</h3>
-      <div class="bpath" id="bpath">/</div>
-      <div class="btree" id="btree"></div>
-      <div class="modal-foot">
-        <button class="ghost" id="bUsePath">选择当前目录</button>
-        <button class="ghost" id="bClose">关闭</button>
+
+<main id="main">
+  <section class="sheet" id="now" aria-labelledby="nowHead">
+    <h2 class="head" id="nowHead">正在转码 <small class="head__note" id="nowCount"></small></h2>
+    <div id="nowList">
+      <div class="skel skel--mid"></div><div class="skel skel--wide"></div><div class="skel skel--short"></div>
+    </div>
+    <p class="now__none" id="nowEmpty" hidden>没有作业在跑。</p>
+  </section>
+
+  <section class="sheet" id="queue" aria-label="任务列表">
+    <div class="qtools">
+      <button type="button" class="btn btn--solid" data-open="submit">＋ 提交转码</button>
+      <div class="qtools__end">
+        <button type="button" class="btn btn--quiet" id="cancelAllBtn">取消全部排队</button>
+        <button type="button" class="btn btn--quiet" id="pruneBtn" title="删除所有已结束（完成/失败/取消/跳过）的记录">清除历史记录</button>
       </div>
     </div>
-  </div>
-  <div class="toolbar">
-    <select id="statusFilter" class="ghost-sel">
-      <option value="all">全部状态</option>
-      <option value="pending">排队中</option>
-      <option value="running">转码中</option>
-      <option value="done">已完成</option>
-      <option value="failed">失败</option>
-      <option value="cancelled">已取消</option>
-      <option value="skipped">已跳过</option>
-    </select>
-    <button type="button" class="ghost" id="pruneBtn" title="删除所有已结束（完成/失败/取消/跳过）的记录">清除历史记录</button>
-  </div>
-  <div class="tablewrap">
-    <table>
-      <thead><tr>
-        <th>状态</th><th>文件</th><th>进度</th><th>阶段</th><th>预设</th><th>大小</th><th>操作</th>
-      </tr></thead>
-      <tbody id="jobs"></tbody>
-    </table>
-  </div>
-  <div class="empty" id="empty" style="display:none">暂无任务</div>
+
+    <div class="chiprow" id="chips" role="group" aria-label="按状态筛选"></div>
+
+    <div id="jobsSkel"><div class="skel skel--wide"></div><div class="skel skel--wide"></div><div class="skel skel--mid"></div></div>
+    <div class="tablewrap" id="tableWrap" hidden>
+      <table id="jobsTable">
+        <thead><tr>
+          <th scope="col" class="c-mark">状态</th>
+          <th scope="col">文件</th>
+          <th scope="col" class="c-prog">阶段与进度</th>
+          <th scope="col" class="c-preset">预设</th>
+          <th scope="col" class="c-size num">源 → 成品</th>
+          <th scope="col" class="c-time num">用时</th>
+        </tr></thead>
+      </table>
+    </div>
+    <ul class="rows" id="jobsList"></ul>
+    <div class="empty" id="jobsEmpty" hidden></div>
+
+    <div class="more">
+      <p class="tally" id="tally"></p>
+      <button type="button" class="btn" id="moreBtn" hidden>载入更多</button>
+    </div>
+  </section>
 </main>
+
+<dialog class="dlg dlg--sheet" id="submitDlg" aria-labelledby="submitTitle">
+  <div class="dlg__head">
+    <h2 id="submitTitle">提交转码</h2>
+    <button type="button" class="btn btn--quiet" data-close aria-label="关闭">✕</button>
+  </div>
+  <form class="dlgform" id="submitForm" novalidate>
+    <div class="dlg__body">
+      <div class="field">
+        <label class="field__label" for="path">文件或目录</label>
+        <div class="field__ctl"><input type="text" id="path" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="绝对路径：/media/input/xxx.mkv 或目录"></div>
+        <p class="field__help">填容器里看得到的绝对路径。目录会把里面每个可识别的文件各排一个任务。</p>
+        <div class="field__foot">
+          <button type="button" class="btn btn--sm" id="browseBtn">浏览…</button>
+          <span class="dirs" id="dirs"></span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="preset">预设</label>
+        <div class="field__ctl"><select id="preset"></select></div>
+        <p class="echo mono" id="presetEcho" hidden></p>
+      </div>
+
+      <div class="pair" id="customCtl" hidden>
+        <div class="field">
+          <label class="field__label" for="engine">编码引擎</label>
+          <div class="field__ctl"><select id="engine"></select></div>
+        </div>
+        <div class="field">
+          <label class="field__label" for="target_metric">探测指标</label>
+          <div class="field__ctl"><select id="target_metric"></select></div>
+          <p class="field__help">只对 optimizer 引擎生效。</p>
+        </div>
+      </div>
+      <p class="hint" id="customHint"></p>
+
+      <div class="field">
+        <label class="field__label" for="custom">自定义参数</label>
+        <div class="field__ctl"><input type="text" id="custom" list="paramKeys" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="crf=24,preset=3,target_quality=75-85"></div>
+        <p class="field__help">逗号或分号分隔的 key=value，值里可以带 =。会覆盖所选预设的对应字段。</p>
+        <p class="field__help warn" id="paramWarn" hidden></p>
+        <details class="disclose field__note"><summary id="keysSummary">可用字段</summary><ul class="keys" id="keysList"></ul></details>
+        <datalist id="paramKeys"></datalist>
+      </div>
+    </div>
+    <div class="dlg__foot">
+      <p class="formstate" id="submitState" role="status" aria-live="polite"></p>
+      <button type="submit" class="btn btn--solid" id="submitBtn">提交转码</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="dlg dlg--sheet" id="browseDlg" aria-labelledby="browseTitle">
+  <div class="dlg__head">
+    <h2 id="browseTitle">目录浏览</h2>
+    <button type="button" class="btn btn--quiet" data-close aria-label="关闭">✕</button>
+  </div>
+  <form class="bnav" id="browseNav">
+    <input type="text" id="bPath" aria-label="当前目录（可编辑，回车跳转）" enterkeyhint="go" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button type="button" class="btn" id="bUp">↑ 上一级</button>
+  </form>
+  <div class="dlg__body">
+    <p class="formstate bstate" id="bState" role="status" aria-live="polite"></p>
+    <ul class="btree" id="btree"></ul>
+  </div>
+  <div class="dlg__foot">
+    <button type="button" class="btn" data-close>关闭</button>
+    <button type="button" class="btn btn--solid" id="bUse">选择当前目录</button>
+  </div>
+</dialog>
+
+<div class="notice-host" id="notices"></div>
+
 <script src="/static/apikey.js"></script>
-<script>
-const fmt = n => { if (n==null) return "–"; const u=["B","KB","MB","GB","TB"]; let i=0;
-  while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
-const esc = s => String(s??"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const stCls = s => "st-"+esc(s);
-const stageLabel = s => ({encoding:"转码中",cancelling:"取消中…",analyzing:"分析中",scenedetect:"场景检测",probing:"质量探测中",verifying:"成品质量校验中"}[s]||s||"");
-function liveStats(j) {
-  const total = j.progress_total || 0, done = j.progress_done || 0, fps = j.progress_fps || 0;
-  if (j.stage === "scenedetect") return total ? ` · 场景检测 ${done}/${total} 帧` : (done ? ` · 场景检测 ${done} 处` : "");
-  if (j.stage === "probing") return total ? ` · 探测 ${done}/${total} 段` : ` · 探测 ${done} 段`;
-  if (j.stage === "verifying") return total ? ` · 校验 ${done}/${total} 段` : "";
-  if (j.stage === "encoding") {
-    if (!total) return "";
-    const base = ` · ${done}/${total} 帧`;
-    if (!fps) return base;
-    const rem = Math.max(0, total - done) / fps;
-    const mm = String(Math.floor(rem / 60)).padStart(2, "0"), ss = String(Math.round(rem % 60)).padStart(2, "0");
-    return `${base} · ${fps.toFixed(0)} fps · 剩余 ${mm}:${ss}`;
-  }
-  if (!total || !fps) return "";
-  const rem = Math.max(0, total - done) / fps;
-  const mm = String(Math.floor(rem / 60)).padStart(2, "0"), ss = String(Math.round(rem % 60)).padStart(2, "0");
-  return ` · ${done}/${total} 帧 · ${fps.toFixed(0)} fps · 剩余 ${mm}:${ss}`;
-}
-async function loadPresets() {
-  try {
-    const r = await afetch("/api/presets").then(r=>r.json());
-    presetsMap = r;
-    const sel = document.getElementById("preset");
-    const names = Object.keys(r);
-    sel.innerHTML = "";
-    const opt = names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
-    sel.innerHTML = opt + `<option value="custom">custom（自定义）</option>`;
-    sel.value = "balanced";
-    if (!names.includes("balanced") && names.length) sel.value = names[0];
-    syncCustom();
-  } catch(e) { /* presets endpoint is best-effort */ }
-}
-let presetsMap = {};
-function syncCustom() {
-  const isCustom = document.getElementById("preset").value === "custom";
-  const engineSel = document.getElementById("engine");
-  const metricSel = document.getElementById("target_metric");
-  const p = presetsMap[document.getElementById("preset").value] || {};
-  if (isCustom) {
-    if (engineSel.disabled) engineSel.value = "av1an";  // clean slate from a named preset
-    engineSel.disabled = false;
-    metricSel.disabled = engineSel.value !== "optimizer";
-    document.getElementById("customHint").textContent =
-      "custom 模式：以默认参数为基准，自定义参数框 + 引擎/指标下拉全部生效（留空等于默认 preset）。";
-  } else {
-    engineSel.disabled = true;
-    metricSel.disabled = true;
-    if (p.engine) engineSel.value = p.engine;
-    const eng = p.engine || "av1an";
-    document.getElementById("customHint").textContent =
-      `所选预设的引擎/探测指标以设置页为准（当前引擎：${eng}）；自定义参数框可覆盖其余字段。`;
-  }
-}
-document.getElementById("preset").addEventListener("change", syncCustom);
-function syncEngine() {
-  const isCustom = document.getElementById("preset").value === "custom";
-  document.getElementById("target_metric").disabled = !isCustom || document.getElementById("engine").value !== "optimizer";
-  if (isCustom) {
-    document.getElementById("customHint").textContent =
-      "optimizer：Shot-based 并行探测，需填 target_quality（如 target_quality=80 或 75-85）。探测指标取右侧下拉（VMAF/SSIMULACRA2）。";
-  } else {
-    syncCustom();
-  }
-}
-document.getElementById("engine").addEventListener("change", syncEngine);
-syncEngine();
-let statusFilter = "all";
-async function refresh() {
-  const [s, jobs] = await Promise.all([
-    afetch("/api/status").then(r=>r.json()),
-    afetch("/api/jobs?status="+(statusFilter==="all"?"":statusFilter)+"&limit=100").then(r=>r.json()),
-  ]);
-  document.getElementById("sysinfo").textContent =
-    `队列 ${s.queue_len} · worker ${s.workers_running?"运行中":"停止"}`;
-  document.getElementById("stats").innerHTML = Object.entries(s.jobs).map(([k,v]) =>
-    `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join("");
-  const t = document.getElementById("jobs");
-  t.innerHTML = "";
-  document.getElementById("empty").style.display = jobs.length ? "none" : "block";
-  for (const j of jobs) {
-    const meta = j.meta || {};
-    const size = j.size_after ? fmt(j.size_after) : (j.meta ? fmt(j.meta.size) : "–");
-    const ov = (j.params && j.params.overrides) || {};
-    const ovKeys = Object.keys(ov);
-    const paramCell = ovKeys.length
-      ? `${esc(j.params?.preset||"")}<div class="muted">${esc(ovKeys.map(k=>k+"="+ov[k]).join(", "))}</div>`
-      : esc(j.params?.preset||"");
-    const err = j.error ? `<div class="muted" style="color:var(--err)">${esc(j.error)}</div>` : "";
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td data-label="状态" class="${stCls(j.status)}">${esc(j.status)}</td>
-      <td data-label="文件"><div>${esc((j.meta&&j.meta.display)||(j.source||"").split("/").pop())}
-          <div class="muted">${esc(j.source||"")}</div>${err}</div></td>
-      <td data-label="进度"><div style="flex:1"><div class="bar"><div style="width:${j.progress||0}%"></div></div>
-          <span class="muted">${(j.progress||0).toFixed(0)}%${esc(liveStats(j))}</span></div></td>
-      <td data-label="阶段" class="muted">${esc(stageLabel(j.stage))}</td>
-      <td data-label="预设" class="muted">${paramCell}</td>
-      <td data-label="大小" class="muted">${size}</td>
-      <td data-label="操作">${["running","pending","analyzing"].includes(j.status)
-        ? `<button class="ghost" data-id="${j.id}">取消</button>` : ""}
-          ${["running","analyzing","done","failed","cancelled"].includes(j.status)
-            ? `<button class="ghost" data-log="${j.id}">日志</button>` : ""}</td>`;
-    t.appendChild(tr);
-  }
-}
-document.getElementById("submit").addEventListener("submit", async e => {
-  e.preventDefault();
-  const path = document.getElementById("path").value.trim();
-  const preset = document.getElementById("preset").value || "";
-  const err = document.getElementById("error");
-  err.style.display = "none";
-  if (!path) { err.textContent = "请输入要转码的文件或目录路径"; err.style.display = "block"; return; }
-  // parse custom params: "crf=24,preset=3,target_quality=75-85"
-  const overrides = {};
-  const raw = document.getElementById("custom").value.trim();
-  if (raw) {
-    for (const pair of raw.split(/[,;]/)) {
-      const kv = pair.trim().split("=");
-      if (kv.length !== 2 || !kv[0].trim()) {
-        err.textContent = `自定义参数格式错误: "${pair.trim()}"（应为 key=value）`;
-        err.style.display = "block"; return;
-      }
-      overrides[kv[0].trim()] = kv[1].trim();
-    }
-  }
-  // engine / target_metric selectors only apply in custom mode; otherwise the
-  // selected preset (set in 设置页) is authoritative.
-  if (preset === "custom") {
-    const engine = document.getElementById("engine").value;
-    const metric = document.getElementById("target_metric").value;
-    if (engine && engine !== "av1an" && !("engine" in overrides)) overrides.engine = engine;
-    if (engine === "optimizer" && metric && !("target_metric" in overrides)) overrides.target_metric = metric;
-    if (engine === "optimizer" && !overrides.target_quality) {
-      err.textContent = "optimizer 引擎需要 target_quality（如 crf=24,preset=3,target_quality=80 或 75-85）";
-      err.style.display = "block"; return;
-    }
-  }
-  const r = await afetch("/api/jobs", { method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({path, preset, overrides}) });
-  if (!r.ok) {
-    let msg = `提交失败 (HTTP ${r.status})`;
-    try { const b = await r.json(); if (b && b.detail) msg = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch(_) {}
-    err.textContent = msg; err.style.display = "block"; return;
-  }
-  document.getElementById("path").value = "";
-  refresh();
-});
-document.getElementById("jobs").addEventListener("click", async e => {
-  const btn = e.target.closest("button[data-id]");
-  const logBtn = e.target.closest("button[data-log]");
-  if (btn) {
-    const r = await afetch(`/api/jobs/${btn.dataset.id}/cancel`, {method:"POST"});
-    // Cancel used to be fire-and-forget. Now that it is keyed, a silent
-    // no-op would look exactly like a job that refused to stop.
-    if (!r.ok) alert(authHint(r.status) || `取消失败 (HTTP ${r.status})`);
-    refresh();
-  }
-  if (logBtn) { window.open(`/api/jobs/${logBtn.dataset.log}/log`, "_blank"); }
-});
-// ---- directory browser ----
-const modalBg = document.getElementById("modalBg");
-const btree = document.getElementById("btree");
-const bpath = document.getElementById("bpath");
-const fmt2 = n => { if (n==null) return ""; const u=["B","KB","MB","GB"]; let i=0;
-  while (n>=1024 && i<u.length-1){ n/=1024; i++; } return n.toFixed(1)+" "+u[i]; };
-let curPath = "/";
-async function openBrowser(path) {
-  curPath = path || "/";
-  modalBg.style.display = "flex";
-  await renderBrowse();
-}
-async function renderBrowse() {
-  let d;
-  try {
-    d = await afetch("/api/browse?path="+encodeURIComponent(curPath)).then(r=>{
-      if (!r.ok) throw new Error(authHint(r.status) || `读取失败 (HTTP ${r.status})`);
-      return r.json();
-    });
-  } catch(e) {
-    bpath.textContent = "无法读取 " + curPath;
-    btree.innerHTML = `<div class="empty">${esc(e.message || "读取失败")}</div>`;
-    return;
-  }
-  bpath.textContent = d.path;
-  let html = "";
-  if (d.parent) html += `<div class="brow d" data-dir="${esc(d.parent)}"><span class="ico">↑</span>..</div>`;
-  for (const e of d.entries || []) {
-    if (e.dir) html += `<div class="brow d" data-dir="${esc(d.path)}/${esc(e.name)}"><span class="ico">▸</span>${esc(e.name)}</div>`;
-    else html += `<div class="brow" data-file="${esc(d.path)}/${esc(e.name)}"><span class="ico">·</span>${esc(e.name)}<span class="sz">${fmt2(e.size)}</span></div>`;
-  }
-  btree.innerHTML = html || `<div class="empty">（空目录）</div>`;
-}
-btree.addEventListener("click", e => {
-  const dir = e.target.closest(".brow.d");
-  const file = e.target.closest(".brow[data-file]");
-  if (dir) { curPath = dir.dataset.dir; renderBrowse(); }
-  if (file) {
-    document.getElementById("path").value = file.dataset.file;
-    modalBg.style.display = "none";
-  }
-});
-document.getElementById("browseBtn").addEventListener("click", () => openBrowser(document.getElementById("path").value.trim() || "/media"));
-document.getElementById("bUsePath").addEventListener("click", () => {
-  document.getElementById("path").value = curPath;
-  modalBg.style.display = "none";
-});
-document.getElementById("bClose").addEventListener("click", () => modalBg.style.display = "none");
-modalBg.addEventListener("click", e => { if (e.target === modalBg) modalBg.style.display = "none"; });
-document.getElementById("statusFilter").addEventListener("change", e => { statusFilter = e.target.value; refresh(); });
-document.getElementById("pruneBtn").addEventListener("click", async () => {
-  if (!confirm("删除所有已结束（完成/失败/取消/跳过）的任务记录？此操作不可恢复。")) return;
-  try {
-    const r = await afetch("/api/jobs/prune", { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    refresh();
-  } catch(err) { alert("清除失败: " + err.message); }
-});
-loadPresets();
-refresh();
-setInterval(refresh, 4000);
-</script>
+<script src="/static/ui.js"></script>
+<script src="/static/fields.js"></script>
+<script src="/static/queue.js"></script>
 </body>
 </html>

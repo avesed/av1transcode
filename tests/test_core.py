@@ -233,63 +233,236 @@ def test_optimizer_settings_put_merges_partial_body(settings, monkeypatch):
     assert merged.vmaf_4k_min_width == 3000
 
 
+# The settings page renders every form from one field table in fields.js and
+# posts exactly the keys in it. These read that table as text: there is no JS
+# runtime in the test image, and F("<key>" is the one shape every entry has.
+_STATIC = Path(__file__).resolve().parent.parent / "app" / "static"
+
+# install paths, not tuning - they point at .so files baked into the image
+_UI_EXEMPT = {"bestsource_plugin", "vszip_plugin"}
+
+
+def _js_array(src, name):
+    """The body of a top-level `const NAME = [ ... ];` in fields.js. Top-level
+    arrays close with `];` at column 0, which no nested entry does."""
+    import re
+
+    m = re.search(r"^const " + name + r" = \[(.*?)^\];", src, re.S | re.M)
+    assert m, f"{name} is not a top-level array in fields.js"
+    return m.group(1)
+
+
+def _keys(block):
+    import re
+
+    return re.findall(r'F\("(\w+)"', block)
+
+
+def _optimizer_fields():
+    from app.config import OptimizerSettings
+
+    return set(OptimizerSettings.model_fields)
+
+
 def test_settings_page_covers_every_editable_optimizer_field():
     """Every optimizer knob is either on the settings page or explicitly
     exempt. A whitelist of names to check would pass for any field nobody
     remembered to add, which is how vmaf_sycl_device ended up settable exactly
     once: saving from the UI writes a JSON that overrides config.yaml, so a
     knob missing from the form is a knob the user cannot change afterwards.
+
+    Only the optimizer and GPU tables count. The preset editor has its own
+    min_scene_len, so grepping the whole file would let a preset field stand
+    in for an optimizer field of the same name that had gone missing.
     """
-    import re
-    from pathlib import Path
+    src = (_STATIC / "fields.js").read_text()
+    html = (_STATIC / "settings.html").read_text()
 
-    from app.config import Settings
+    # a table the page never loads renders nothing, however complete it is
+    assert "/static/fields.js" in html, "settings.html does not load fields.js"
+    # and a field hand-written back into the page is one this test cannot see
+    assert 'F("' not in html, "a field table has leaked back into settings.html"
 
-    # install paths, not tuning - they point at .so files baked into the image
-    exempt = {"bestsource_plugin", "vszip_plugin"}
-
-    fields = set(
-        Settings.model_fields["transcode"].annotation
-        .model_fields["optimizer"].annotation.model_fields
-    )
-    html = Path("app/static/settings.html").read_text()
-    # the page renders its optimizer and GPU forms from one field table, and
-    # posts exactly the keys in it: F("<key>", ...)
-    posted = set(re.findall(r'F\("(\w+)"', html))
-    missing = fields - posted - exempt
+    shown = set(_keys(_js_array(src, "OPT_GROUPS"))) | set(_keys(_js_array(src, "GPU_FIELDS")))
+    missing = _optimizer_fields() - shown - _UI_EXEMPT
     assert not missing, f"not on the settings form and not exempt: {sorted(missing)}"
 
 
-def test_settings_page_rail_lists_every_optimizer_group():
-    """The left rail is hand-written HTML while the groups themselves are
-    rendered from OPT_GROUPS, so a new group appears in the page and not in
-    the rail unless someone remembers both. The switch a user goes looking for
-    is the one that just dropped a track they wanted.
+def test_every_optimizer_group_is_reachable():
+    """The left rail used to be hand-written HTML beside groups rendered from
+    OPT_GROUPS, so a new group appeared in the page and not in the rail unless
+    someone remembered both - grp-subs was unreachable from the phone index
+    for months that way. The rail is generated from OPT_GROUPS now; this makes
+    sure nobody hand-writes it back, and that the data it is generated from
+    can actually produce a working entry: an empty or repeated id is a link
+    that goes nowhere or to the wrong group, a group without a name is a
+    blank rail entry, and a group without fields is a heading over nothing.
     """
     import re
-    from pathlib import Path
 
-    html = Path("app/static/settings.html").read_text()
-    groups = re.findall(r'\{ id: "(grp-\w+)"', html)
-    rail = re.findall(r'href="#(grp-\w+)"', html)
-    assert groups and rail == groups, f"rail {rail} against groups {groups}"
+    html = (_STATIC / "settings.html").read_text()
+    assert 'href="#grp-' not in html, "the optimizer rail is hand-written again"
+
+    body = _js_array((_STATIC / "fields.js").read_text(), "OPT_GROUPS")
+    starts = [m.start() for m in re.finditer(r'\{ id: "', body)] + [len(body)]
+    groups = [body[a:b] for a, b in zip(starts, starts[1:])]
+    assert groups, "OPT_GROUPS is empty"
+
+    ids = []
+    for g in groups:
+        gid = re.match(r'\{ id: "([^"]*)"', g).group(1)
+        assert gid, "a group has an empty id"
+        ids.append(gid)
+        assert re.search(r'\bname: "[^"]+"', g), f"{gid} has no name"
+        assert re.search(r'\bnote: "[^"]+"', g[:g.find("fields:")]), f"{gid} has no note"
+        assert _keys(g), f"{gid} has no fields"
+    assert len(ids) == len(set(ids)), f"repeated group ids: {ids}"
 
 
 def test_the_subtitle_switches_are_all_in_the_subtitle_group():
-    """The rail test above says every group is reachable; this says a field is
-    in the group a user would look in. A subtitle switch filed under "verify
+    """The test above says every group is reachable; this says a field is in
+    the group a user would look in. A subtitle switch filed under "verify
     and debug" is one nobody finds, and all three of these are on by default -
     so the one a user goes looking for is the one that just changed a track
     they wanted left alone.
     """
     import re
-    from pathlib import Path
 
-    html = Path("app/static/settings.html").read_text()
-    block = re.search(r'\{ id: "grp-subs".*?\n  \]\},', html, re.S)
+    body = _js_array((_STATIC / "fields.js").read_text(), "OPT_GROUPS")
+    # from grp-subs to the next group or the end of the array, whatever the
+    # indentation: the old boundary was two spaces and a "]}," and failed
+    # the moment the table was reformatted
+    block = re.search(r'\{ id: "grp-subs".*?(?=\{ id: "|\Z)', body, re.S)
     assert block, "grp-subs is not in OPT_GROUPS"
-    assert set(re.findall(r'F\("(\w+)"', block.group(0))) == {
+    assert set(_keys(block.group(0))) == {
         "drop_empty_subtitles", "ass_srt_companion", "pgs_ocr_srt"}
+
+
+def test_every_rendered_field_is_posted_by_some_form():
+    """probe_dataset and max_crf were rendered in the GPU card for months
+    while neither form posted them: PUT /api/settings/gpu keeps _GPU_KEYS only
+    and the optimizer form posted only its own groups, so every edit to either
+    reported success and was silently discarded. The coverage test above
+    passed the whole time - the fields were on the page, just on the wrong
+    form. A GPU field has to be one the GPU endpoint writes, an optimizer
+    field one the model has, and between them they cover the model.
+    """
+    import re
+
+    src = (_STATIC / "fields.js").read_text()
+    opt_ui = set(_keys(_js_array(src, "OPT_GROUPS")))
+    gpu_ui = set(_keys(_js_array(src, "GPU_FIELDS")))
+
+    api = (_STATIC.parent / "api.py").read_text()
+    m = re.search(r"_GPU_KEYS = \((.*?)\)", api, re.S)
+    assert m, "_GPU_KEYS is gone from app/api.py"
+    gpu_keys = set(re.findall(r'"(\w+)"', m.group(1)))
+    assert gpu_keys
+
+    # vulkan_device lives in transcode.dovi; the GPU endpoint takes it apart
+    stray = gpu_ui - gpu_keys - {"vulkan_device"}
+    assert not stray, f"on the GPU card but not saved by it: {sorted(stray)}"
+    fields = _optimizer_fields()
+    stray = opt_ui - fields
+    assert not stray, f"on the optimizer form but not in OptimizerSettings: {sorted(stray)}"
+    missing = fields - _UI_EXEMPT - opt_ui - gpu_ui
+    assert not missing, f"posted by no form: {sorted(missing)}"
+    both = opt_ui & gpu_ui
+    assert not both, f"on both forms, saved by whichever posts last: {sorted(both)}"
+
+
+def test_long_help_is_split_not_truncated():
+    """Splitting a long help into a one-line conclusion and a folded note is
+    the one edit in the frontend refactor that can lose a measurement, and a
+    lost number reads exactly like a tidy page. These are the measured
+    sentences that were in settings.html's help text before the split, copied
+    from it; the note is meant to keep the original text whole, so each one
+    must still be in the table verbatim.
+    """
+    src = (_STATIC / "fields.js").read_text()
+    for needle in (
+        # pgs_ocr_srt: the PGS OCR sample
+        "忽略大小写的字符错误率 0.1276%，689/711 条完全一致",
+        "成品库实测 5005 条图形轨里 1034 条是英文",
+        # drop_empty_subtitles: the Plex burn-in incident
+        "转码进程 660% CPU，而那条轨里什么都没有；成品库里 42/45 个输出的字幕轨全是空的",
+        # probe_encoder: the qsv+svt measurement
+        "三段 4K 杜比视界片段共 912 个镜头）：探测阶段比 svt 快 23%、23%、33%，合计 27%",
+        "每镜头 SVT 探测 3.8–3.9 次降到 2.3–2.6 次",
+        "实测一次 300 帧 4K 探测 16.4 CPU 秒对 88.3 秒",
+        # vmaf_zero_copy: the B580 timings
+        "常规每次打分 5.4s / 23 CPU 秒，零拷贝 1.18s / 1.36 CPU 秒，247 次打分逐帧分数完全一致",
+        "代价是每次打分约 1.55GB 显存",
+        # reference_hwaccel: slower on 40 cores, faster on 20
+        "40 核实测它反而更慢（探测 401s→448s）",
+        "（20 核上 826s→592s）",
+        # luminance_qp_bias
+        "实测 50：体积 +9~10%，交付中位 +0.06~0.37 分，够不到目标的镜头 6/23 → 2/23",
+    ):
+        assert needle in src, f"lost from the field table: {needle}"
+
+
+def _docs_ids():
+    import re
+
+    return re.findall(r'\bid="([^"]+)"', (_STATIC / "docs.html").read_text())
+
+
+def test_docs_page_has_an_anchor_for_every_knob():
+    """The docs page drifted by omission: 25 optimizer fields, codec and
+    luminance_qp_bias had no entry at all, and nothing noticed. This checks
+    coverage, not wording - wording can only be checked by reading it.
+
+    It also checks the exact anchor each settings field's 说明 › link goes to.
+    settings.js sends a key that a preset also has (min_scene_len,
+    vmaf_threads, probing_rate) to p-opt-<key>, because the docs page has an
+    entry for each owner and p-<key> is the preset's.
+    """
+    from app.config import VideoParams
+
+    ids = set(_docs_ids())
+    src = (_STATIC / "fields.js").read_text()
+    preset = set(_keys(_js_array(src, "PRESET_FIELDS")))
+
+    missing = [k for k in sorted(_optimizer_fields() - _UI_EXEMPT)
+               if f"p-{k}" not in ids and f"p-opt-{k}" not in ids]
+    assert not missing, f"optimizer fields with no docs entry: {missing}"
+    missing = [k for k in VideoParams.model_fields if f"p-{k}" not in ids]
+    assert not missing, f"preset parameters with no docs entry: {missing}"
+
+    assert '"p-opt-"' in (_STATIC / "settings.js").read_text(), "settings.js no longer picks p-opt- anchors"
+    linked = _keys(_js_array(src, "OPT_GROUPS")) + _keys(_js_array(src, "GPU_FIELDS"))
+    dead = [k for k in linked if ("p-opt-" if k in preset else "p-") + k not in ids]
+    assert not dead, f"说明 › links that land nowhere: {dead}"
+
+
+def test_docs_page_links_resolve():
+    """A docs page nobody can navigate is as good as a missing one. Every jump
+    inside the page, and every 去设置页 › link out of it, has to land on
+    something: settings fields are rendered as f-<key> from OPT_GROUPS and
+    GPU_FIELDS, and its sections come from SECTIONS. The page also has to
+    stay script-free - it is the one read when the API is refusing writes."""
+    import collections
+    import re
+
+    html = (_STATIC / "docs.html").read_text()
+    assert "<script" not in html.lower(), "docs.html has a script element"
+
+    ids = _docs_ids()
+    twice = sorted(k for k, n in collections.Counter(ids).items() if n > 1)
+    assert not twice, f"repeated ids: {twice}"
+    broken = sorted({h for h in re.findall(r'href="#([^"]+)"', html) if h not in ids})
+    assert not broken, f"in-page links to nothing: {broken}"
+
+    src = (_STATIC / "fields.js").read_text()
+    fields = set(_keys(_js_array(src, "OPT_GROUPS"))) | set(_keys(_js_array(src, "GPU_FIELDS")))
+    sections = set(re.findall(r'\bid: "(sec-[\w-]+)"', _js_array(src, "SECTIONS")))
+    assert sections, "SECTIONS has no ids"
+    for target in re.findall(r'href="/static/settings\.html#([^"]+)"', html):
+        if target.startswith("f-"):
+            assert target[2:] in fields, f"去设置页 › to a field the settings page does not render: {target}"
+        else:
+            assert target in sections, f"去设置页 › to a settings section that does not exist: {target}"
 
 
 def test_config_yaml_documents_every_optimizer_field():
