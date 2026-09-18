@@ -116,6 +116,110 @@ def test_enqueue_allows_a_requeue_once_the_job_is_done(settings, store, tmp_path
     assert second is not None and second != first
 
 
+# ---------------------------------------------------------------- cancel ----
+
+def _analysed(settings, store, tmp_path, monkeypatch, during):
+    """A manager whose analysis step runs `during(manager, jid)` before it
+    returns, and whose encoder only records that it was started."""
+    from types import SimpleNamespace
+
+    from app import queue as queue_mod
+
+    src = tmp_path / "movie.mkv"
+    src.write_bytes(b"x")
+    manager = queue_mod.TranscodeManager(settings, store)
+    jid = manager.enqueue_file(str(src))
+    assert jid
+    info = SimpleNamespace(
+        display="hevc 3840x2160", width=3840, height=2160, fps=23.976,
+        video_codec="hevc", duration=60.0, size=1, audio_count=1,
+        is_hdr=False, is_hlg=False, path=src,
+        dovi=SimpleNamespace(present=False, profile=None))
+    encoded = []
+
+    def analyze(_settings, _path):
+        during(manager, jid)
+        return info
+
+    monkeypatch.setattr(queue_mod.analyzer_mod, "analyze", analyze)
+    monkeypatch.setattr(queue_mod.decisions, "decide_action", lambda *a, **k: SimpleNamespace(
+        skip=False, skip_reason="", rpu_path=None, output_path=tmp_path / "out.av1.mkv"))
+    monkeypatch.setattr(queue_mod, "run_full_transcode", lambda *a, **k: encoded.append(1))
+    return manager, jid, encoded
+
+
+@pytest.mark.parametrize("how", ["this job", "cancel all", "another process"])
+def test_a_job_cancelled_while_it_is_analyzed_is_never_encoded(
+        settings, store, tmp_path, monkeypatch, how):
+    """Cancel used to write "cancelled" to the DB and nothing else for an
+    analyzing job, so the worker that owned it finished the analysis, wrote
+    RUNNING straight over the cancel and encoded the whole file - the button
+    said 已取消 and a four-hour encode started anyway. Cancel-all
+    (db.cancel_pending) covers analyzing rows and had the same hole, and so
+    does a cancel from another process (the CLI), which cannot reach this
+    process's in-memory flags at all."""
+    def during(manager, jid):
+        if how == "this job":
+            assert manager.cancel(jid) == 1
+        elif how == "cancel all":
+            assert manager.cancel() == 1
+        else:
+            store.update(jid, status=db.CANCELLED, stage="cancelled")
+
+    manager, jid, encoded = _analysed(settings, store, tmp_path, monkeypatch, during)
+    manager._process(jid)
+
+    assert not encoded
+    job = store.get(jid)
+    assert job["status"] == db.CANCELLED
+    assert job["stage"] == "cancelled"
+    assert jid not in manager._cancel
+
+
+def test_a_failed_analysis_does_not_resurrect_a_cancelled_job(settings, store, tmp_path, monkeypatch):
+    """_fail re-queued with status=pending unconditionally, so a job cancelled
+    while its analysis was failing came back as a retry."""
+    from app import queue as queue_mod
+
+    manager, jid, _ = _analysed(settings, store, tmp_path, monkeypatch, lambda m, j: None)
+
+    def analyze(_settings, _path):
+        store.update(jid, status=db.CANCELLED, stage="cancelled")
+        return None                                   # "analysis failed"
+
+    monkeypatch.setattr(queue_mod.analyzer_mod, "analyze", analyze)
+    manager._process(jid)
+    assert store.get(jid)["status"] == db.CANCELLED
+
+
+@pytest.mark.parametrize("status", [db.DONE, db.FAILED, db.SKIPPED, db.CANCELLED])
+def test_cancelling_a_finished_job_leaves_it_alone(settings, store, tmp_path, status):
+    """The queue page's 取消转码 dialog can sit open while the job finishes;
+    confirming it used to turn 已完成 into 已取消."""
+    from app.queue import TranscodeManager
+
+    manager = TranscodeManager(settings, store)
+    jid = store.create(source=str(tmp_path / "a.mkv"), preset="balanced")
+    store.update(jid, status=status, stage=status)
+
+    assert manager.cancel(jid) == 0
+    assert store.get(jid)["status"] == status
+    assert jid not in manager._cancel
+
+
+def test_cancelling_a_running_job_asks_the_engine_to_stop(settings, store, tmp_path):
+    from app.queue import TranscodeManager
+
+    manager = TranscodeManager(settings, store)
+    jid = store.create(source=str(tmp_path / "a.mkv"), preset="balanced")
+    store.update(jid, status=db.RUNNING, stage="encoding")
+
+    assert manager.cancel(jid) == 1
+    job = store.get(jid)
+    assert (job["status"], job["stage"]) == (db.RUNNING, "cancelling")
+    assert jid in manager._cancel
+
+
 # -------------------------------------------------------------- watcher ----
 
 def _watched(settings, store, tmp_path):
@@ -647,3 +751,17 @@ def test_gpu_parsers():
     assert p["count"] == 1 and p["device"] is None and "out of range" in p["error"]
     assert gpu.parse_sycl("nothing here") == {"device": None, "error": None}
 
+
+
+def test_cancel_endpoint_tells_a_finished_job_from_a_missing_one(settings, store, tmp_path):
+    """manager.cancel() now leaves finished jobs alone and returns 0 for them;
+    the endpoint turned every 0 into 404 "job not found", which is wrong about
+    a job the page is showing."""
+    client = _client(settings, store)
+    jid = store.create(source=str(tmp_path / "a.mkv"), preset="balanced")
+    store.update(jid, status=db.DONE, stage="done")
+
+    r = client.post(f"/api/jobs/{jid}/cancel")
+    assert r.status_code == 409 and "done" in r.json()["detail"]
+    assert store.get(jid)["status"] == db.DONE
+    assert client.post("/api/jobs/no-such-job/cancel").status_code == 404

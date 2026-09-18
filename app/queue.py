@@ -135,17 +135,23 @@ class TranscodeManager:
             job = self.store.get(jid)
             if not job:
                 return 0
-            status = job.get("status")
-            # pending/analyzing: mark cancelled immediately so a worker never picks it up
-            if status not in (db.RUNNING,):
-                self.store.update(jid, status=db.CANCELLED, stage="cancelled",
-                                  finished_at=time.time())
+            # Pending or analyzing: mark it cancelled now, so no worker picks
+            # it up, and the worker analyzing it finds the status changed when
+            # it tries to move the job on (_process writes only_from ANALYZING).
+            # The DB write alone used to be all an analyzing job got, and its
+            # worker then wrote RUNNING over it and encoded the whole file.
+            # A finished job is left alone: this used to turn done into cancelled.
+            if self.store.update(jid, status=db.CANCELLED, stage="cancelled",
+                                 finished_at=time.time(),
+                                 only_from=(db.PENDING, db.ANALYZING)):
                 self._emit(jid, "cancelled")
-                logger.info("Cancelled job {} (status={})", jid, status)
+                logger.info("Cancelled job {} (status={})", jid, job.get("status"))
                 return 1
-            # running: request async abort at the next check
+            # running (possibly only just): request an abort at the next check
             self._cancel.add(jid)
-            self.store.update(jid, stage="cancelling")
+            if not self.store.update(jid, stage="cancelling", only_from=(db.RUNNING,)):
+                self._cancel.discard(jid)
+                return 0
             logger.info("Cancel requested for running job {}", jid)
             return 1
         n = self.store.cancel_pending()
@@ -231,24 +237,28 @@ class TranscodeManager:
                 return
             plan = decisions.decide_action(self.settings, info, preset, overrides)
             if plan.skip:
-                self.store.update(
+                if not self.store.update(
                     jid,
                     status=db.SKIPPED,
                     meta=self._meta(info),
                     stage="skipped",
                     error=plan.skip_reason,
                     finished_at=time.time(),
-                )
+                    only_from=(db.ANALYZING,),
+                ):
+                    return self._cancelled_while_analyzing(jid)
                 self._emit(jid, "skipped")
                 logger.info("Skip {}: {}", source.name, plan.skip_reason)
                 return
 
-            self.store.update(
+            if not self.store.update(
                 jid, status=db.RUNNING, stage="encoding",
                 meta=self._meta(info), started_at=time.time(),
                 size_before=source.stat().st_size,
                 rpu_path=str(plan.rpu_path) if plan.rpu_path else "",
-            )
+                only_from=(db.ANALYZING,),
+            ):
+                return self._cancelled_while_analyzing(jid)
             self._emit(jid, "running")
 
             out = plan.output_path or (self.settings.dirs.output or source.parent / "av1") / f"{info.path.stem}.av1.mkv"
@@ -308,6 +318,12 @@ class TranscodeManager:
             else:
                 self._fail(jid, str(e), job)
 
+    def _cancelled_while_analyzing(self, jid: str) -> None:
+        """The job left ANALYZING under this worker: a cancel (from the API,
+        cancel-all, or another process's CLI) got there first. Leave it."""
+        self._cancel.discard(jid)
+        logger.info("Job {} was cancelled during analysis; not starting it", jid)
+
     def _fail(self, jid: str, error: str, job: dict) -> None:
         if jid in self._cancel:
             self._cancel.discard(jid)
@@ -317,15 +333,18 @@ class TranscodeManager:
             logger.info("Job {} cancelled (was failing: {})", jid, error)
             return
         retries = int(job.get("retries") or 0)
+        live = (db.ANALYZING, db.RUNNING)   # cancelled elsewhere meanwhile: stays cancelled
         if retries < self.settings.workers.max_retries:
-            self.store.update(jid, retries=retries + 1, error=error,
-                             status=db.PENDING, stage="retry",
-                             started_at=None)
+            if not self.store.update(jid, retries=retries + 1, error=error,
+                                     status=db.PENDING, stage="retry",
+                                     started_at=None, only_from=live):
+                return
             logger.warning("Job {} failed ({}) - will retry ({}/{})",
                           jid, error, retries + 1, self.settings.workers.max_retries)
         else:
-            self.store.update(jid, status=db.FAILED, error=error,
-                             stage="failed", finished_at=time.time())
+            if not self.store.update(jid, status=db.FAILED, error=error,
+                                     stage="failed", finished_at=time.time(), only_from=live):
+                return
             logger.error("Job {} failed after retries: {}", jid, error)
         self._emit(jid, "failed")
 

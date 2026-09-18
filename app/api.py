@@ -111,9 +111,12 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
     @router.post("/jobs/{jid}/cancel")
     def cancel_job(jid: str, request: Request):
         _auth(request)
-        ok = manager.cancel(jid)
-        if not ok:
-            raise HTTPException(404, "job not found")
+        if not manager.cancel(jid):
+            job = store.get(jid)
+            if not job:
+                raise HTTPException(404, "job not found")
+            # finished jobs are left as they are; say so rather than "not found"
+            raise HTTPException(409, f"job already {job['status']}")
         return {"cancelled": jid}
 
     @router.post("/cancel")

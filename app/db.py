@@ -145,9 +145,13 @@ class JobStore:
             self._conn.commit()
         return jid
 
-    def update(self, jid: str, **fields: Any) -> None:
+    def update(self, jid: str, *, only_from: Optional[tuple] = None, **fields: Any) -> bool:
+        """Write columns of one job. With only_from, the write happens only
+        while the job's status is still one of those - a worker moving its
+        job on must not write over a cancel that landed in the meantime.
+        Returns whether a row was written."""
         if not fields:
-            return
+            return False
         # NB: these must be real column names - anything else is dropped without
         # a word. "size_bytes" used to sit here in place of "size_before", so
         # every job stored 0 for its source size and the API reported 0 too.
@@ -157,16 +161,22 @@ class JobStore:
                    "progress_fps", "progress_done", "progress_total"}
         f = {k: v for k, v in fields.items() if k in allowed}
         if not f:
-            return
+            return False
         cols = ", ".join(f"{k}=?" for k in f)
         if "meta" in f:
             f["meta"] = json.dumps(f["meta"], default=str)
         if "params" in f:
             f["params"] = json.dumps(f["params"], default=str)
         vals = list(f.values())
+        where, args = "id=?", [jid]
+        if only_from:
+            where += f" AND status IN ({','.join('?' * len(only_from))})"
+            args += list(only_from)
         with self._cursor() as cur:
-            cur.execute(f"UPDATE jobs SET {cols} WHERE id=?", [*vals, jid])
+            cur.execute(f"UPDATE jobs SET {cols} WHERE {where}", [*vals, *args])
+            n = cur.rowcount
             self._conn.commit()
+        return n > 0
 
     def get(self, jid: str) -> Optional[Dict[str, Any]]:
         with self._cursor() as cur:
@@ -254,8 +264,9 @@ class JobStore:
 
     def cancel_pending(self) -> int:
         with self._cursor() as cur:
-            cur.execute("UPDATE jobs SET status=? WHERE status IN (?,?)",
-                        (CANCELLED, PENDING, ANALYZING))
+            cur.execute("UPDATE jobs SET status=?, stage='cancelled', finished_at=? "
+                        "WHERE status IN (?,?)",
+                        (CANCELLED, time.time(), PENDING, ANALYZING))
             n = cur.rowcount
             self._conn.commit()
             return n

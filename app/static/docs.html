@@ -833,7 +833,7 @@
 <div class="def" id="g-status-analyzing">
   <h4 class="def__name"><span class="mark" data-state="analyzing"><i></i>分析中</span> <code>analyzing</code></h4>
   <div class="def__body"><p>worker 已经领走这个作业，正在用 ffprobe 读源文件（分辨率、编码、HDR、杜比视界、音轨和字幕），然后决定跳过还是开始转码。</p>
-    <p><b>这个状态下目前取消不掉。</b>点「取消」或「取消全部排队」会先把它标成已取消，但 worker 收不到通知：分析一结束照样往下跑，状态被改回转码中，最后照常完成。要停它，等它变成转码中再取消一次。</p></div>
+    <p>这时点「取消」或「取消全部排队」，作业立刻变成已取消；worker 分析完发现状态已经变了，不会再开始转码。</p></div>
 </div>
 <div class="def" id="g-status-running">
   <h4 class="def__name"><span class="mark" data-state="running"><i></i>转码中</span> <code>running</code></h4>
@@ -1248,13 +1248,13 @@ python3 -m app.cli status / cancel [job_id] / check</pre>
   <p class="def__dflt">方法 <code>POST</code> · 需密钥</p>
   <div class="def__body"><p>取消任务（需 api_key）。会中断在编的任务并删除其输出文件。</p>
     <p>返回 <code>{"cancelled": "&lt;id&gt;"}</code>，id 不存在返回 404。排队中的作业立刻变成已取消；转码中的作业先变成取消中，引擎在下一次检查时停下，然后才是已取消。</p>
-    <p>两个例外：分析中的作业目前取消不掉，会先显示已取消，分析完又被 worker 改回转码中（见<a href="#g-status-analyzing">分析中</a>）；对已结束的作业（已完成、失败、已跳过）调用，也会把状态改成已取消，但成品不删。队列页只给排队中、分析中、转码中的作业显示「取消」。</p></div>
+    <p>分析中的作业也立刻变成已取消，worker 分析完发现后不会开始转码（见<a href="#g-status-analyzing">分析中</a>）。已结束的作业（已完成、失败、已跳过、已取消）不会被改动，返回 409。队列页只给排队中、分析中、转码中的作业显示「取消」。</p></div>
 </div>
 <div class="def" id="api-cancel-all">
   <h3 class="def__name"><code>/api/cancel</code></h3>
   <p class="def__dflt">方法 <code>POST</code> · 需密钥</p>
   <div class="def__body"><p>把所有排队中和分析中的作业标成已取消，返回 <code>{"cancelled": 数量}</code>。转码中的作业不受影响，要停它用上面的单个取消。队列页的「取消全部排队」就是它。</p>
-    <p>它只改状态，阶段保持原样，也不写结束时间。和单个取消一样，分析中的那几个分析完会被改回转码中，所以实际效果是只取消了排队中的。</p></div>
+    <p>阶段记为已取消并写入结束时间。分析中的那几个，worker 分析完会发现并停下，不会开始转码。</p></div>
 </div>
 <div class="def" id="api-prune">
   <h3 class="def__name"><code>/api/jobs/prune</code></h3>

@@ -645,14 +645,16 @@ ${ce ? h`<p class="row__err">${ce}</p>` : ""}
       await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
       S.cancelErr.delete(id);
       // What the server did, not what was asked: a running job only gets
-      // stage=cancelling and stops at the engine's next check, and an
-      // analyzing one is marked cancelled but its worker still runs it
-      // (app/queue.py cancel(); see the docs glossary).
-      const was = j && j.status;
-      if (was === "running") notice(`已请求取消 ${name}，引擎停下后变为已取消`);
-      else if (was === "analyzing") notice(`已标记取消 ${name}；分析中的作业目前停不下来，变成转码中后请再取消一次`, "err");
+      // stage=cancelling and stops at the engine's next check.
+      if (j && j.status === "running") notice(`已请求取消 ${name}，引擎停下后变为已取消`);
       else notice(`已取消 ${name}`);
     } catch (err) {
+      // 409: it finished between the last poll and the click. Nothing failed.
+      if (err && err.status === 409) {
+        notice(`${name} 已经结束，没有取消`);
+        render(); S.ctl.now();
+        return;
+      }
       // Kept on the row as well as in the notice: a cancel that failed must
       // not look like a job that is ignoring the button (commit ca1b68c).
       const t = failText("取消失败", err);
@@ -674,7 +676,7 @@ ${ce ? h`<p class="row__err">${ce}</p>` : ""}
       body: [
         "取消队列里所有排队中的任务？正在转码的任务不受影响，要停它请用它自己的「取消」。",
         `将取消 ${n + a} 个任务。`,
-      ].concat(a ? [`其中 ${a} 个正在分析，目前停不下来：会被标记为已取消，但分析结束后照常转码，到时需要再单独取消。`] : []),
+      ],
       confirm: "取消全部排队",
       cancel: "返回",
     });
