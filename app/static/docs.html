@@ -1163,7 +1163,7 @@ AV1TC_WATCHER_MIN_SIZE_MB=5</pre>
 python3 -m app.cli run --no-watch --no-web
 python3 -m app.cli process &lt;file&gt; --single --custom crf=24 --custom preset=3
 python3 -m app.cli process &lt;file&gt; -p compact
-python3 -m app.cli scan                    # 把输入目录现有文件全部入队
+python3 -m app.cli scan                    # 把输入目录里没做过的文件入队
 python3 -m app.cli scan --preset compact
 python3 -m app.cli presets                 # 查看当前预设
 python3 -m app.cli status / cancel [job_id] / check</pre>
@@ -1179,7 +1179,7 @@ python3 -m app.cli status / cancel [job_id] / check</pre>
 </div>
 <div class="def" id="cli-scan">
   <h3 class="def__name"><code>scan</code></h3>
-  <div class="def__body"><p>把 <code>dirs.input</code> 下（总是递归）扩展名匹配的文件全部入队，<code>--preset</code> 选预设。只写任务库，由 <code>run</code> 处理。不看 <code>min_size_mb</code>、不等文件稳定、不排除 <code>av1/</code> 子目录；已经转过的源也会再入队，只排除正在排队或进行中的同一文件。</p></div>
+  <div class="def__body"><p>把 <code>dirs.input</code> 下（总是递归）扩展名匹配、且任务库里从没有过作业的文件入队，<code>--preset</code> 选预设。和监视器用同一套规则：跳过 <code>av1/</code>、<code>work/</code>、<code>rpu/</code> 子目录；做过的文件（不论完成、失败、跳过还是取消）不再入队，要重新提交用 <code>process</code>。只写任务库，由 <code>run</code> 处理。不看 <code>min_size_mb</code>、不等文件稳定。</p></div>
 </div>
 <div class="def" id="cli-status">
   <h3 class="def__name"><code>status</code></h3>

@@ -120,24 +120,29 @@ def scan(
     config: Optional[Path] = typer.Option(None, "--config", "-c"),
     preset: str = typer.Option("", help="preset name to use"),
 ) -> None:
-    """Analyze all files in the input dir and enqueue those needing transcode."""
+    """Enqueue every video in the input dir that has never had a job.
+
+    The same rule as the watcher (enqueue_new_file): a file with any job in
+    the history - done, failed, skipped, cancelled - was a decision, and
+    `process FILE` is how to submit it again. scan used to enqueue every file
+    not currently in flight, so each run re-queued the whole library, and it
+    walked into <input>/av1/ and queued the outputs (skipped as AV1)."""
     settings = load_settings(config)
     settings.ensure_dirs()
     store = db.JobStore(settings)
     from app.queue import TranscodeManager
+    from app.watcher import input_videos
 
     manager = TranscodeManager(settings, store)
-    files = sorted(settings.dirs.input.rglob("*"))
-    n = 0
-    for p in files:
-        if not p.is_file():
+    n = known = 0
+    for p in input_videos(settings):
+        if store.has_job(str(p)):
+            known += 1
             continue
-        if p.suffix.lower().lstrip(".") not in settings.watcher.extensions:
-            continue
-        jid = manager.enqueue_file(str(p), preset=preset)
-        if jid:
+        if manager.enqueue_file(str(p), preset=preset):
             n += 1
-    typer.echo(f"Enqueued {n} file(s).")
+    typer.echo(f"Enqueued {n} new file(s); {known} already have a job "
+               f"(resubmit one with: {sys.argv[0]} process FILE).")
 
 
 def _parse_custom(items: Optional[List[str]]) -> dict:

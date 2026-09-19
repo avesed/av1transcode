@@ -851,3 +851,32 @@ def test_cli_process_only_enqueues(settings, store, tmp_path, monkeypatch):
     assert again.exit_code == 0 and f"Already queued or running as job {new}" in again.output
     missing = CliRunner().invoke(cli.app, ["process", str(tmp_path / "gone.mkv")])
     assert missing.exit_code == 1 and "does not exist" in missing.output
+
+
+def test_cli_scan_enqueues_only_files_that_never_had_a_job(settings, store, tmp_path, monkeypatch):
+    """scan enqueued every file not currently in flight: each run re-queued
+    everything already transcoded (the source stays in place by default), and
+    it walked into <input>/av1/ and queued our own outputs. It now lists files
+    the way the watcher does and skips any with a job in the history."""
+    from typer.testing import CliRunner
+
+    from app import cli
+
+    inp = tmp_path / "in"
+    for rel in ("new.mkv", "done.mkv", "sub/also_new.mp4", "av1/done.av1.mkv",
+                "work/probe.mkv", "av1/rpu/x.mkv", "notes.txt"):
+        (inp / rel).parent.mkdir(parents=True, exist_ok=True)
+        (inp / rel).write_bytes(b"x")
+    settings.dirs.input = inp
+    monkeypatch.setattr(cli, "load_settings", lambda _config=None: settings)
+    old = store.create(source=str(inp / "done.mkv"), preset="balanced")
+    store.update(old, status=db.DONE, stage="done")
+
+    r = CliRunner().invoke(cli.app, ["scan"])
+    assert r.exit_code == 0, r.output
+    assert "Enqueued 2 new file(s); 1 already have a job" in r.output
+    queued = {j["source"] for j in store.list(status=db.PENDING, limit=100)}
+    assert queued == {str(inp / "new.mkv"), str(inp / "sub/also_new.mp4")}
+
+    again = CliRunner().invoke(cli.app, ["scan"])
+    assert "Enqueued 0 new file(s); 3 already have a job" in again.output

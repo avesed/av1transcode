@@ -10,6 +10,27 @@ from app import analyzer
 from app.config import Settings
 
 
+
+# Directories never fed back into the queue: our own output when it is
+# source-relative (<input>/av1/, and its rpu/), and temp work.
+_OWN_DIRS = {"av1", "work", "rpu"}
+
+
+def input_videos(settings: Settings, recursive: bool = True) -> list[Path]:
+    """Video files under dirs.input that could be sources: the watcher's scan
+    and `cli scan` both list them here, so neither walks into av1/."""
+    inp = settings.dirs.input
+    results: list[Path] = []
+    for p in sorted(inp.rglob("*")) if recursive else sorted(inp.iterdir()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower().lstrip(".") not in settings.watcher.extensions:
+            continue
+        if any(part in _OWN_DIRS for part in p.relative_to(inp).parts[:-1]):
+            continue
+        results.append(p)
+    return results
+
 class FileWatcher:
     """Watch a directory for new/staged video files and feed them to the queue.
 
@@ -80,21 +101,7 @@ class FileWatcher:
             self._stop.wait(5.0)
 
     def _scan(self) -> list[Path]:
-        inp = self.settings.dirs.input
-        results: list[Path] = []
-        pattern = self.settings.watcher.extensions
-        # Directories we must never feed back into the queue (our own output
-        # dirs when output is source-relative: `<input>/av1/`, temp work, rpu)
-        exclude = {"av1", "work", "rpu"}
-        for p in inp.rglob("*") if self.settings.watcher.recursive else sorted(inp.iterdir()):
-            if not p.is_file():
-                continue
-            if p.suffix.lower().lstrip(".") not in pattern:
-                continue
-            if any(part in exclude for part in p.relative_to(inp).parts[:-1]):
-                continue
-            results.append(p)
-        return results
+        return input_videos(self.settings, self.settings.watcher.recursive)
 
     def _maybe_submit(self, p: Path) -> None:
         """Submit `p` once it has stopped changing.
