@@ -701,7 +701,7 @@ def test_gpu_settings_persist_and_apply(settings, store, tmp_path, monkeypatch):
     settings.dirs.settings_file = tmp_path / "settings.json"
     client = _client(settings, store)
     client.delete("/api/settings/optimizer")
-    r = client.put("/api/settings/gpu", json={"vmaf_sycl_device": 0, "vmaf_sycl_min_width": 1920,
+    r = client.put("/api/settings/gpu", json={"vmaf_sycl_device": 0, "vmaf_sycl_min_width": 2560,
                                               "scenedetect_hwaccel": "off", "reference_hwaccel": "auto",
                                               "vulkan_device": "llvmpipe"})
     assert r.status_code == 200, r.text
@@ -710,7 +710,7 @@ def test_gpu_settings_persist_and_apply(settings, store, tmp_path, monkeypatch):
     saved = load_user_settings(settings)
     # only what differs from config.yaml is stored; reference_hwaccel ships
     # off, so "auto" is the override here and "off" would not be one
-    assert saved["optimizer"] == {"vmaf_sycl_device": 0, "vmaf_sycl_min_width": 1920,
+    assert saved["optimizer"] == {"vmaf_sycl_device": 0, "vmaf_sycl_min_width": 2560,
                                   "scenedetect_hwaccel": "off", "reference_hwaccel": "auto"}
     assert saved["dovi"] == {"vulkan_device": "llvmpipe"}
     r = client.put("/api/settings/gpu", json={"vmaf_sycl_device": 7, "scenedetect_hwaccel": "maybe"})

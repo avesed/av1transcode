@@ -287,11 +287,13 @@ class OptimizerSettings(BaseModel):
     # Scores are unchanged - see the note on the vmaf-builder stage.
     vmaf_sycl_device: int = -1
     # Below this source width the CPU path is used even when vmaf_sycl_device
-    # is set. The GPU win scales with frame size while its per-invocation
-    # overhead does not: at 1080p CPU scoring is already only ~1.8s and the
-    # warm GPU cost there has not been measured. Conservative on purpose -
-    # lower it once 1080p is measured, do not assume.
-    vmaf_sycl_min_width: int = 2560
+    # is set. Measured at 1080p on the B580 (a Blu-ray 8-bit H.264 cut, 88
+    # shots, qsv+svt, 40 cores, two runs each): probe phase 199s on the CPU,
+    # 124s on SYCL with the usual read, 99s zero-copy - CPU per shot 84.5 ->
+    # 44.6 -> 24.2 CPU-s, scores within 1.1e-3 of the CPU's. A CPU score
+    # there is ~70% libvmaf, and the probe phase is CPU-bound, so that is
+    # where the time went. Below 1920 it is still unmeasured.
+    vmaf_sycl_min_width: int = 1920
     # Parallel probe workers across shots. Probes now encode at source
     # resolution, so each instance holds a multi-GB frame pool at 4K just like
     # the final encode (measured 3.5GB at 4K). 0 = auto, from the memory

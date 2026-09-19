@@ -1613,10 +1613,10 @@ def test_sycl_off_by_default_costs_nothing(settings, info, plan, tmp_path):
 
 
 def test_sycl_gated_below_min_width(settings, info, plan, tmp_path):
-    """1080p CPU scoring is already ~1.8s; the GPU's per-call overhead is not
-    amortised there, and the warm number has never been measured."""
+    """1080p is measured (the default gate is 1920); a 720p source is not,
+    so it stays on the CPU."""
     settings.transcode.optimizer.vmaf_sycl_device = 0
-    info.width, info.height = 1920, 1080
+    info.width, info.height = 1280, 720
     enc = make_encoder(settings, info, plan, tmp_path)
     calls = _stub_run(enc)
     assert enc._sycl_device() == -1
@@ -4312,26 +4312,54 @@ def test_zero_copy_scores_probes_without_the_frames_leaving_the_card(
     assert cmd.count("zc") == 2 and "vaapi" in cmd
 
 
-@pytest.mark.parametrize("case", ["off", "shard", "8-bit source", "features",
+def test_zero_copy_lifts_an_8bit_1080p_source_to_p010_on_the_card(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A 1080p Blu-ray is 8-bit H.264 scored with the 1080p model: its
+    min(iw,1920) scale does nothing, and its NV12 surfaces meet P010 probes.
+    The usual read converts both sides to yuv420p10le; the card does the same
+    with scale_vaapi, to both, since a card probe of it is 8-bit too."""
+    enc = _zc_encoder(settings, info, plan, tmp_path)
+    info.width, info.height = 1920, 1080
+    info.color.bit_depth, info.color.pix_fmt = 8, "yuv420p"
+    assert enc._zc_unsupported() is None
+    enc._zc_ok = True
+    cmds = []
+
+    def fake_run(args, timeout=None):
+        args = [str(a) for a in args]
+        cmds.append(args)
+        _write_score(args, 96.5)
+        return ""
+
+    monkeypatch.setattr(enc, "_run", fake_run)
+    assert enc._score_probe(600, 720, tmp_path / "d.ivf", 0, 30) == 96.5
+    lavfi = cmds[0][cmds[0].index("-lavfi") + 1]
+    dist, ref = lavfi.split(";")[:2]
+    assert dist == "[0:v]setpts=PTS-STARTPTS,scale_vaapi=format=p010[dist]"
+    assert ref.endswith("setpts=PTS-STARTPTS,scale_vaapi=format=p010[ref]")
+    assert "libvmaf_sycl=" in lavfi and "format=yuv" not in lavfi
+
+
+@pytest.mark.parametrize("case", ["off", "shard", "8-bit probes", "features",
                                   "1080p model", "no sycl"])
 def test_zero_copy_stays_off_where_it_cannot_apply(
         settings, info, plan, tmp_path, monkeypatch, case):
     """A DV shard is an FFV1 file for the CPU; the import carries luma only,
     so luma-only is all a feature list may ask for, and there is none;
     libvmaf_sycl compares frames as decoded, so no 1080p-model downscale and
-    no 8-bit source against 10-bit probes; and none of it without SYCL."""
+    no 10-bit source against 8-bit probes; and none of it without SYCL."""
     enc = _zc_encoder(settings, info, plan, tmp_path)
     shard = None
     if case == "off":
         settings.transcode.optimizer.vmaf_zero_copy = "off"
     elif case == "shard":
         shard = tmp_path / "s.mkv"
-    elif case == "8-bit source":
-        info.color.bit_depth, info.color.pix_fmt = 8, "yuv420p"
+    elif case == "8-bit probes":
+        plan.params.pixel_format = "yuv420p"
     elif case == "features":
         plan.params.probing_vmaf_features = "name=psnr"
     elif case == "1080p model":
-        info.width, info.height = 1920, 1080
+        info.width, info.height = 2048, 858     # wider than vmaf_width: downscaled
     elif case == "no sycl":
         enc._sycl_ok = False
     monkeypatch.setattr(enc, "_zc_preflight",

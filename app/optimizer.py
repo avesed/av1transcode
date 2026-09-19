@@ -4155,7 +4155,10 @@ class ShotEncoder:
         """Why this job cannot score zero-copy, or None when it can."""
         if not self._hwdec_args():
             return "no /dev/dri render node in this container"
-        if self._vmaf_scale_filter():
+        # min(iw, vmaf_width) leaves a source no wider than that as it is, so
+        # only a real downscale rules the card out
+        if self._vmaf_scale_filter() and not (
+                0 < (self.info.width or 0) <= int(self.opt.vmaf_width or 0)):
             return ("scores are scaled for the 1080p model, and libvmaf_sycl "
                     "compares the frames as decoded")
         if self._probe_scale():
@@ -4164,10 +4167,21 @@ class ShotEncoder:
             return "probing_vmaf_features is set, and the import carries luma only"
         src = self.info.color.bit_depth or 8
         probe = 10 if "10" in self._pix_fmt() else 8
-        if src != probe:
+        if src > probe:
             return (f"the source is {src}-bit and the probes {probe}-bit, and both "
                     "sides have to decode to the same surface format")
         return None
+
+    def _zc_lift(self) -> bool:
+        """Whether a zero-copy score lifts 8-bit surfaces to P010 on the card.
+
+        An 8-bit source decodes to NV12 while its 10-bit SVT probes decode to
+        P010, and libvmaf_sycl compares the two as they arrive. The usual read
+        puts both through format=yuv420p10le, so this does the same on the
+        card - to both sides, because a card probe of an 8-bit source is
+        itself 8-bit. The preflight checks the result against the usual read.
+        """
+        return (self.info.color.bit_depth or 8) < 10 and "10" in self._pix_fmt()
 
     def _zc_input_args(self) -> List[str]:
         """Input options that decode one side of a zero-copy score on the card."""
@@ -4874,15 +4888,17 @@ class ShotEncoder:
         scorer = "libvmaf"
         if zero_copy:
             # Surfaces all the way in: libvmaf_sycl takes the frames as the
-            # card decoded them, so there is no format= to convert and no
-            # scale (see _zc_unsupported). The fps= subsampling and the
+            # card decoded them, so there is no format= and no scale (see
+            # _zc_unsupported) - only an 8-bit source's lift to P010, which
+            # the card does too (_zc_lift). The fps= subsampling and the
             # rebases only re-time frames and run on surfaces unchanged.
             scorer = "libvmaf_sycl"
             hw = ["-init_hw_device", f"vaapi={self._ZC_DEVICE}:{_render_nodes()[0]}"]
             dist_args = [*self._zc_input_args(), *dist_args]
             ref_args = [*self._zc_input_args(), *ref_args]
-            dist_chain = rebase
-            ref_chain = ",".join((*ref_vf, rebase))
+            lift = ["scale_vaapi=format=p010"] if self._zc_lift() else []
+            dist_chain = ",".join((rebase, *lift))
+            ref_chain = ",".join((*ref_vf, rebase, *lift))
         else:
             dist_chain = ",".join(f for f in (rebase, scale, fmt) if f)
             # the reference goes through the same probe-side filters the
