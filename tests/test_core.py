@@ -66,6 +66,60 @@ def test_dv_p5_plan(settings):
     assert plan.output_path.name == "p5.av1.mkv"
 
 
+def test_saved_rpu_is_not_named_bin(settings):
+    """Sonarr/Radarr count .bin as a video extension and imported an
+    `S01E01.rpu.bin` as the episode."""
+    info = MediaInfo(path=Path("/tmp/Show - S01E01.mkv"))
+    info.video_codec = "hevc"
+    info.dovi = DolbyVisionInfo(present=True, profile=8, rpu_present=True)
+    plan = decide_action(settings, info)
+    assert plan.rpu_path.name == "Show - S01E01.rpu"
+    assert plan.output_path.name == "Show - S01E01.av1.mkv"   # no codec token to swap
+
+
+@pytest.mark.parametrize("stem, dr, want", [
+    # Sonarr: {Quality.Full}.{MediaInfo.Simple}.{MediaInfo.VideoDynamicRangeType}
+    ("Stranger.Things.2016.S01E01.Chapter.One.The.Vanishing.of.Will.Byers.Bluray-2160p.Remux.h265.DTS-HD.MA.DV.HDR10",
+     "HDR10", "Stranger.Things.2016.S01E01.Chapter.One.The.Vanishing.of.Will.Byers.Bluray-2160p.Remux.AV1.DTS-HD.MA.HDR10"),
+    ("Shameless.US.2011.S04E08.Hope.Springs.Paternal.Bluray-1080p.Remux.AVC.DTS-HD.MA",
+     "", "Shameless.US.2011.S04E08.Hope.Springs.Paternal.Bluray-1080p.Remux.AV1.DTS-HD.MA"),
+    ("Show.S01E01.Title.WEBDL-2160p.x265.EAC3.HDR10Plus", "HDR10", "Show.S01E01.Title.WEBDL-2160p.AV1.EAC3.HDR10"),
+    ("Show.S01E01.Title.WEBDL-2160p.h265.EAC3.DV.HLG", "HLG", "Show.S01E01.Title.WEBDL-2160p.AV1.EAC3.HLG"),
+    ("Show.S01E01.Title.WEBDL-2160p.h265.EAC3.DV.SDR", "", "Show.S01E01.Title.WEBDL-2160p.AV1.EAC3"),
+    ("Show.S01E01.Title.WEBDL-2160p.h265.EAC3.HDR10", "HDR10", "Show.S01E01.Title.WEBDL-2160p.AV1.EAC3.HDR10"),
+    # scene names
+    ("Show.S01E01.2160p.WEB-DL.DDP5.1.DV.HDR10+.H.265-GRP", "HDR10", "Show.S01E01.2160p.WEB-DL.DDP5.1.HDR10.AV1-GRP"),
+    ("Movie.2020.1080p.BluRay.HEVC.x265.10bit-GRP", "", "Movie.2020.1080p.BluRay.AV1.10bit-GRP"),
+    # nothing before the resolution is touched: titles keep their words
+    ("Show.S01E01.The.DV.Tape.2160p.h265.DV", "HDR10", "Show.S01E01.The.DV.Tape.2160p.AV1.HDR10"),
+])
+def test_output_named_the_way_sonarr_would(stem, dr, want):
+    from app.naming import av1_stem
+    assert av1_stem(stem, dr) == (want, True)
+
+
+def test_no_codec_token_keeps_the_name_and_says_so():
+    from app.naming import av1_stem
+    assert av1_stem("Smoke.2025.S01E02.2160p.ATVP.WEB-DL.DV.HDR10+[Ben The Men]", "HDR10") == (
+        "Smoke.2025.S01E02.2160p.ATVP.WEB-DL.HDR10[Ben The Men]", False)
+    assert av1_stem("Show - S01E01 - HDR DV Special", "HDR10") == ("Show - S01E01 - HDR DV Special", False)
+
+
+@pytest.mark.parametrize("compat, transfer, dr", [
+    (1, "smpte2084", "HDR10"), (4, "arib-std-b67", "HLG"), (2, "bt709", None)])
+def test_dv_output_and_rpu_share_the_sonarr_name(settings, compat, transfer, dr):
+    info = MediaInfo(path=Path("/tv/S1/Agatha.All.Along.2024.S01E01.Seekest.Thou.The.Road.WEBDL-2160p.h265.EAC3.DV.HDR10.mkv"))
+    info.video_codec = "hevc"
+    info.color.transfer = transfer
+    info.is_hdr = transfer == "smpte2084"
+    info.is_hlg = transfer == "arib-std-b67"
+    info.dovi = DolbyVisionInfo(present=True, profile=8, rpu_present=True, compatible_id=compat)
+    plan = decide_action(settings, info)
+    stem = "Agatha.All.Along.2024.S01E01.Seekest.Thou.The.Road.WEBDL-2160p.AV1.EAC3" + (f".{dr}" if dr else "")
+    assert plan.output_path.name == f"{stem}.mkv"
+    assert plan.rpu_path.name == f"{stem}.rpu"
+
+
 def test_dv_p7_plan(settings):
     info = MediaInfo(path=Path("/tmp/p7.mkv"))
     info.video_codec = "hevc"
@@ -832,7 +886,7 @@ def test_rpu_extraction_never_uses_dovi_tools_matroska_reader(settings, tmp_path
 
     monkeypatch.setattr(shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
     src = tmp_path / "ep.mkv"; src.write_bytes(b"x")
-    dest = tmp_path / "ep.rpu.bin"
+    dest = tmp_path / "ep.rpu"
     seen = {}
 
     class FakePopen:
@@ -863,7 +917,7 @@ def test_a_truncated_rpu_is_a_failure_however_clean_the_exit(settings, tmp_path,
 
     monkeypatch.setattr(shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
     src = tmp_path / "ep.mkv"; src.write_bytes(b"x")
-    dest = tmp_path / "ep.rpu.bin"
+    dest = tmp_path / "ep.rpu"
 
     class FakePopen:
         def __init__(self, cmd, **kw): self.stdout = None

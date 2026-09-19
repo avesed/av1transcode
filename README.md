@@ -13,7 +13,8 @@
   - P5：ICtCp → HDR10（`libplacebo`，需 Vulkan）
   - P7：取 BL（自带 HDR10）转码，RPU/EL 丢弃
   - P8：剥 RPU 后以 HDR10 编码
-  - 三种均通过 `dovi_tool extract-rpu` **单独保存 `.rpu.bin`** 到 rpu 目录
+  - 三种均通过 `dovi_tool extract-rpu` **单独保存 `.rpu`** 到 rpu 目录
+- **输出命名**：沿用源文件名，只改 Sonarr/Radarr 会改的两处——编码（h265/x265/HEVC/AVC/H.264… → `AV1`）和动态范围（成品不带 DV 和 HDR10+：`DV.HDR10`、`HDR10+` → `HDR10`，`DV.HLG` → `HLG`，`DV.SDR` 删去），所以 `…Remux.h265.DTS-HD.MA.DV.HDR10.mkv` 输出为 `…Remux.AV1.DTS-HD.MA.HDR10.mkv`，正是 Sonarr 重命名后的样子。文件名里找不到编码标记时保留旧的 `<片名>.av1.mkv`。RPU 与成品同名，扩展名 `.rpu`（`.bin` 会被 *arr/Plex 当成视频）
 - **音频/字幕直通**：av1an 合并时全部 `copy`，不重编码
 - **Web 界面 + CLI**：任务状态、进度、日志、提交/取消
 
@@ -43,8 +44,8 @@ docker compose up -d --build
 
 ```
 media/input/      # 放入待转码文件
-media/output/     # AV1 输出（<片名>.av1.mkv）
-media/rpu/        # Dolby Vision 提取的 RPU (.bin)
+media/output/     # AV1 输出（按 Sonarr/Radarr 的命名改写源文件名，见下）
+media/rpu/        # Dolby Vision 提取的 RPU (.rpu)
 media/work/       # av1an 临时文件
 ```
 

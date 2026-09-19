@@ -29,7 +29,7 @@ def _duration_seconds(settings: Settings, source: Path) -> float:
 
 
 def extract_rpu(settings: Settings, source: Path, dest: Path, profile: int) -> bool:
-    """Extract the Dolby Vision RPU into a standalone .bin for archival."""
+    """Extract the Dolby Vision RPU into a standalone .rpu file for archival."""
     dovi = settings.tool_path("dovi_tool")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():

@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from loguru import logger
 
+from app import naming
 from app.analyzer import MediaInfo
 from app.config import Settings, VideoParams
 
@@ -166,14 +167,14 @@ def decide_action(settings: Settings, info: MediaInfo, preset_name: str = "",
         )
 
     # DV detection/handling
+    rpu_dir: Optional[Path] = None
     if info.dovi.present:
         plan.dovi_present = True
         plan.dv_profile = info.dovi.profile
         if settings.transcode.dovi.enabled:
             rpu_note = ""
             if settings.transcode.dovi.save_rpu:
-                rpu_dir = _output_dir(settings, info, "rpu")
-                plan.rpu_path = rpu_dir / f"{info.path.stem}.rpu.bin"
+                rpu_dir = _output_dir(settings, info, "rpu")   # named with the output below
                 rpu_note = " + RPU saved separately"
             target = {"pq": "HDR10", "hlg": "HLG", "sdr": "SDR"}[
                 "pq" if info.dovi.profile == 5 else dv_base_signal(info)]
@@ -192,9 +193,17 @@ def decide_action(settings: Settings, info: MediaInfo, preset_name: str = "",
 
     _color_tags_for(settings, info, plan)
 
-    stem = info.path.stem
+    stem, says_av1 = naming.av1_stem(info.path.stem, naming.dynamic_range(
+        plan.color_trc, bool(plan.master_display or plan.max_cll)))
     out_dir = _output_dir(settings, info, "video")
-    plan.output_path = out_dir / f"{stem}.av1.mkv"
+    # No codec token to turn into AV1: the old marker says it instead (and
+    # keeps the output off the source's own name when dirs.output is its dir).
+    plan.output_path = out_dir / (f"{stem}.mkv" if says_av1 else f"{stem}.av1.mkv")
+    if rpu_dir is not None:
+        # Same name as the output, so the two pair up. Not .bin: Sonarr,
+        # Radarr and Plex list .bin as a video extension (VCD images) and
+        # imported an `S01E01.rpu.bin` as the episode.
+        plan.rpu_path = rpu_dir / f"{stem}.rpu"
     return plan
 
 

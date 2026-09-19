@@ -226,7 +226,7 @@
 <section id="sec-flow">
 <h2>工作流程</h2>
 <p><b>默认不会自动入队任何文件</b>（<code>watcher.enabled: false</code>）：只有通过首页表单 / API <code>POST /api/jobs</code> / CLI（<code>process</code>、<code>scan</code>）手动指定的文件或目录才会被转码。如需恢复自动监视，在 config.yaml 中设置 <code>watcher.enabled: true</code>。</p>
-<p>提交的文件会分析（Dolby Vision P5 → HDR10，P7/P8 编码基底层、按基底层的 HDR10/HLG/SDR 标记（RPU 默认另存为 <code>.rpu.bin</code>，成品本身不带 DV），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
+<p>提交的文件会分析（Dolby Vision P5 → HDR10，P7/P8 编码基底层、按基底层的 HDR10/HLG/SDR 标记（RPU 默认另存为 <code>.rpu</code>，成品本身不带 DV），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
 <ul>
   <li>已是 AV1 的源默认跳过（<code>skip_existing_av1</code>）。</li>
   <li>成功后源文件<b>默认保留</b>在原位置。可选：在<a href="/static/settings.html#sec-safety">设置页</a>开启「转码成功后删除源文件」（需要二次确认，危险操作）。</li>
@@ -236,13 +236,14 @@
 <section id="sec-output">
 <h2>输出行为</h2>
 <p>默认（<code>dirs.output</code>/<code>dirs.rpu</code> 为 null）转码输出到<b>源文件所在目录下的 <code>av1/</code> 子目录</b>：</p>
-<pre>movies/
-├── Big Buck Bunny.mkv        # 源文件
+<pre>S1/
+├── Show.S01E01.Title.Bluray-2160p.Remux.h265.DTS-HD.MA.DV.HDR10.mkv    # 源文件
 └── av1/
-    ├── Big Buck Bunny.av1.mkv    # 转码输出
+    ├── Show.S01E01.Title.Bluray-2160p.Remux.AV1.DTS-HD.MA.HDR10.mkv    # 转码输出
     └── rpu/
-        └── Big Buck Bunny.rpu.bin   # 抽取的 Dolby Vision RPU（仅 DV 源且 save_rpu=true）
+        └── Show.S01E01.Title.Bluray-2160p.Remux.AV1.DTS-HD.MA.HDR10.rpu    # 抽取的 Dolby Vision RPU（仅 DV 源且 save_rpu=true）
 </pre>
+<p>输出沿用源文件名，只改 Sonarr/Radarr 重命名时会变的两处：编码标记（h264/h265/x264/x265/AVC/HEVC/H.264/H.265/MPEG2/VC1/VP9/XviD/DivX）换成 <code>AV1</code>；动态范围里成品带不走的 DV 和 HDR10+ 按成品实际改写（<code>DV.HDR10</code>、<code>HDR10+</code> → <code>HDR10</code>，<code>DV.HLG</code> → <code>HLG</code>，<code>DV.SDR</code> 删去）。动态范围只在分辨率（如 <code>2160p</code>）之后查找，片名里的词不会被改。文件名里没有编码标记时（如 <code>Big Buck Bunny.mkv</code>）输出为旧式的 <code>Big Buck Bunny.av1.mkv</code>。RPU 与成品同名、扩展名 <code>.rpu</code>——<code>.bin</code> 在 Sonarr/Radarr/Plex 里是视频扩展名，会被当成一集。</p>
 <p>若在 <code>config.yaml</code> 中配置了固定的 <code>dirs.output</code>/<code>dirs.rpu</code>，则所有输出集中到这些目录。监视器（watcher）会排除 <code>av1</code>/<code>work</code>/<code>rpu</code> 目录，避免把转码输出再次入队。</p>
 </section>
 
@@ -762,7 +763,7 @@
 </div>
 <div class="def" id="dv-p7-p8">
   <h3 class="def__name">P7 / P8</h3>
-  <div class="def__body"><p>解码器直接返回基底层、自行忽略 EL/RPU，和旧的 <code>dovi_split=bl</code> remux 逐帧一致；那一步已删除（每集 4K 省约三分钟和一次 27GB 写）。RPU 单独保存为 <code>.rpu.bin</code>。</p>
+  <div class="def__body"><p>解码器直接返回基底层、自行忽略 EL/RPU，和旧的 <code>dovi_split=bl</code> remux 逐帧一致；那一步已删除（每集 4K 省约三分钟和一次 27GB 写）。RPU 单独保存为 <code>.rpu</code>。</p>
     <p>成品按基底层本来的信号标记，以 DV 配置里的兼容 id（<code>dv_bl_signal_compatibility_id</code>）为准：1、6（8.1、7）是 HDR10，4（8.4，手机和广播常见）是 HLG，2（8.2）是 SDR。没有这个 id 时看视频流自己的传输特性，都没有时按 HDR10。</p></div>
 </div>
 <div class="def" id="dv-hdr10-hlg">
@@ -1062,7 +1063,7 @@
 <div class="def" id="c-transcode-dovi-enabled">
   <h3 class="def__name"><code>enabled / save_rpu</code></h3>
   <p class="def__dflt">配置段 <code>transcode.dovi</code> · 默认 <code>true</code> / <code>true</code></p>
-  <div class="def__body"><p>DV 转换开关 / 是否把 RPU 另存为 <code>.rpu.bin</code>。P7·P8 一律只编基底层（解码器自己忽略 EL 和 RPU），没有开关。关掉 <code>enabled</code> 后 P5 不再应用 RPU（ICtCp 基底层原样编码），RPU 也不存。</p></div>
+  <div class="def__body"><p>DV 转换开关 / 是否把 RPU 另存为 <code>.rpu</code>。P7·P8 一律只编基底层（解码器自己忽略 EL 和 RPU），没有开关。关掉 <code>enabled</code> 后 P5 不再应用 RPU（ICtCp 基底层原样编码），RPU 也不存。</p></div>
 </div>
 <div class="def" id="c-transcode-dovi-p5_method">
   <h3 class="def__name"><code>p5_method</code></h3>
@@ -1134,7 +1135,7 @@
 <div class="def" id="c-tools-dovi_tool">
   <h3 class="def__name"><code>dovi_tool</code></h3>
   <p class="def__dflt">配置段 <code>tools</code> · 默认 <code>dovi_tool</code></p>
-  <div class="def__body"><p>提取 RPU 存成 <code>.rpu.bin</code>（<code>save_rpu</code>）。</p></div>
+  <div class="def__body"><p>提取 RPU 存成 <code>.rpu</code>（<code>save_rpu</code>）。</p></div>
 </div>
 <div class="def" id="c-tools-mkvmerge">
   <h3 class="def__name"><code>mkvmerge / mkvpropedit</code></h3>
