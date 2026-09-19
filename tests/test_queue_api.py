@@ -220,6 +220,57 @@ def test_cancelling_a_running_job_asks_the_engine_to_stop(settings, store, tmp_p
     assert jid in manager._cancel
 
 
+def test_a_running_job_cancelled_from_another_process_stops(settings, store, tmp_path, monkeypatch):
+    """`cli cancel <id>` runs in its own process: its manager.cancel() put the
+    id in THAT process's _cancel set and wrote stage=cancelling, which the
+    service running the encode never read - the CLI said "Cancelled 1 job(s)"
+    and the encode ran to the end. And the engine's next stage report
+    overwrote the stage anyway."""
+    from app import queue as queue_mod
+    from app.transcoder import TranscodeError
+
+    manager, jid, _ = _analysed(settings, store, tmp_path, monkeypatch, lambda m, j: None)
+    seen = {}
+
+    def run_full_transcode(*_a, cancel_flag=None, stage_cb=None, **_k):
+        other = queue_mod.TranscodeManager(settings, store)    # the CLI's process
+        assert other.cancel(jid) == 1
+        stage_cb("encoding")                                   # the engine moves on
+        seen["stage"] = store.get(jid)["stage"]
+        seen["flag"] = cancel_flag()
+        raise TranscodeError("Job cancelled by user")          # what the engines do
+
+    monkeypatch.setattr(queue_mod, "run_full_transcode", run_full_transcode)
+    manager._process(jid)
+
+    assert seen == {"stage": "cancelling", "flag": True}
+    job = store.get(jid)
+    assert (job["status"], job["stage"]) == (db.CANCELLED, "cancelled")
+
+
+def test_cli_cancel_takes_the_short_id_status_prints(settings, store, tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from app import cli
+
+    monkeypatch.setattr(cli, "load_settings", lambda _config=None: settings)
+    run = store.create(source=str(tmp_path / "a.mkv"), preset="balanced")
+    store.update(run, status=db.RUNNING, stage="encoding")
+    done = store.create(source=str(tmp_path / "b.mkv"), preset="balanced")
+    store.update(done, status=db.DONE, stage="done")
+
+    r = CliRunner().invoke(cli.app, ["cancel", run[:8]])
+    assert r.exit_code == 0 and "Cancel requested for running job" in r.output, r.output
+    assert store.get(run)["stage"] == "cancelling"
+
+    r = CliRunner().invoke(cli.app, ["cancel", done[:8]])
+    assert r.exit_code == 1 and "already finished (done)" in r.output
+    assert store.get(done)["status"] == db.DONE
+
+    r = CliRunner().invoke(cli.app, ["cancel", "zzzzzzzz"])
+    assert r.exit_code == 1 and "No job with id" in r.output
+
+
 # -------------------------------------------------------------- watcher ----
 
 def _watched(settings, store, tmp_path):

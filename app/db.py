@@ -178,6 +178,25 @@ class JobStore:
             self._conn.commit()
         return n > 0
 
+    def set_stage(self, jid: str, stage: str) -> bool:
+        """The engine's stage report. It never overwrites "cancelling": that
+        stage is how a cancel reaches the process running the job when it came
+        from another one (cli cancel), and an engine moving on from probing to
+        encoding used to erase it before the worker could see it."""
+        with self._cursor() as cur:
+            cur.execute("UPDATE jobs SET stage=? WHERE id=? AND stage IS NOT 'cancelling'",
+                        (stage, jid))
+            n = cur.rowcount
+            self._conn.commit()
+        return n > 0
+
+    def ids_with_prefix(self, prefix: str, limit: int = 2) -> List[str]:
+        """Job ids starting with prefix - the CLI prints the first 8 characters."""
+        with self._cursor() as cur:
+            cur.execute("SELECT id FROM jobs WHERE substr(id, 1, ?) = ? LIMIT ?",
+                        (len(prefix), prefix, limit))
+            return [r[0] for r in cur.fetchall()]
+
     def get(self, jid: str) -> Optional[Dict[str, Any]]:
         with self._cursor() as cur:
             cur.execute("SELECT * FROM jobs WHERE id=?", (jid,))

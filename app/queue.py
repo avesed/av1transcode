@@ -278,10 +278,28 @@ class TranscodeManager:
                 self.store.update(jid, **fields)
 
             def stage_cb(stage: str) -> None:
-                self.store.update(jid, stage=stage)
+                self.store.set_stage(jid, stage)
+
+            # A cancel from this process lands in self._cancel. One from
+            # another process (cli cancel) can only reach this one through the
+            # DB, as stage=cancelling on the row; set_stage keeps the engine
+            # from overwriting it. The engines call this from their polling
+            # loops, so the DB is read at most once a second.
+            db_checked = [0.0]
 
             def cancel_flag() -> bool:
-                return jid in self._cancel
+                if jid in self._cancel:
+                    return True
+                now = time.monotonic()
+                if now - db_checked[0] < 1.0:
+                    return False
+                db_checked[0] = now
+                row = self.store.get(jid)
+                if row and row.get("stage") == "cancelling":
+                    logger.info("Job {}: cancel requested from another process", jid)
+                    self._cancel.add(jid)
+                    return True
+                return False
 
             run_full_transcode(
                 self.settings, info, plan, source, out, log_path,
@@ -290,7 +308,8 @@ class TranscodeManager:
 
             if jid in self._cancel:
                 self._cancel.remove(jid)
-                self.store.update(jid, status=db.CANCELLED, finished_at=time.time())
+                self.store.update(jid, status=db.CANCELLED, stage="cancelled",
+                                  finished_at=time.time())
                 if out.exists():
                     out.unlink()
                 self._emit(jid, "cancelled")

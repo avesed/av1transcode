@@ -894,7 +894,7 @@
 <div class="def" id="g-stage-cancelling">
   <h4 class="def__name">取消中… <code>cancelling</code></h4>
   <p class="def__dflt">简称「取消」</p>
-  <div class="def__body"><p>已经请求取消一个转码中的作业，等引擎在下一次检查时停下。这时「取消」按钮不再显示，阶段条上不亮任何一段。</p></div>
+  <div class="def__body"><p>已经请求取消一个转码中的作业，等引擎在下一次检查时停下；取消来自网页、API 还是命令行都一样。引擎换阶段时不会把它改掉。这时「取消」按钮不再显示，阶段条上不亮任何一段。</p></div>
 </div>
 <div class="def" id="g-stage-retry">
   <h4 class="def__name">准备重试 <code>retry</code></h4>
@@ -902,7 +902,7 @@
 </div>
 <div class="def" id="g-stage-final">
   <h4 class="def__name"><code>done</code> / <code>failed</code> / <code>skipped</code> / <code>cancelled</code></h4>
-  <div class="def__body"><p>作业结束时和同名状态一起写入，队列页只显示状态。原始键里两者对不上是正常的：转码中的作业被取消、而引擎恰好正常结束时，阶段停在 <code>cancelling</code>；「取消全部排队」只改状态，阶段保持原来的空、<code>analyzing</code> 或 <code>retry</code>。</p></div>
+  <div class="def__body"><p>作业结束时和同名状态一起写入，队列页只显示状态。</p></div>
 </div>
 <div class="def" id="g-stage-empty">
   <h4 class="def__name">空 <code>""</code></h4>
@@ -1187,7 +1187,7 @@ python3 -m app.cli status / cancel [job_id] / check</pre>
 </div>
 <div class="def" id="cli-cancel">
   <h3 class="def__name"><code>cancel [job_id]</code></h3>
-  <div class="def__body"><p>不给 id 就取消所有排队中的作业。给 id 时排队中的直接取消；正在编码的作业在命令行里取消不了：库里只会标成 cancelling，编码照跑，要在网页或 API 上取消。</p></div>
+  <div class="def__body"><p>不给 id 就取消所有排队中和分析中的作业。id 可以只写 <code>status</code> 列出的前 8 位。排队中、分析中的作业直接取消；正在编码的作业标成取消中，正在跑的服务在下一次检查时（一秒左右）停下。已结束的作业不会被改动，命令以状态码 1 退出。</p></div>
 </div>
 <div class="def" id="cli-presets">
   <h3 class="def__name"><code>presets</code></h3>

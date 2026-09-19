@@ -224,8 +224,27 @@ def cancel(
 ) -> None:
     settings = load_settings(config)
     manager, store = _build_manager(settings)
-    n = manager.cancel(job_id)
-    typer.echo(f"Cancelled {n} job(s).")
+    if not job_id:
+        typer.echo(f"Cancelled {manager.cancel()} queued job(s).")
+        return
+    # `status` prints the first 8 characters of an id; accept those
+    if not store.get(job_id):
+        ids = store.ids_with_prefix(job_id)
+        if len(ids) != 1:
+            typer.echo(f"No job with id {job_id}." if not ids else f"{job_id} matches more than one job.")
+            raise typer.Exit(1)
+        job_id = ids[0]
+    if not manager.cancel(job_id):
+        job = store.get(job_id) or {}
+        typer.echo(f"Job {job_id} has already finished ({job.get('status')}); nothing to cancel.")
+        raise typer.Exit(1)
+    job = store.get(job_id) or {}
+    if job.get("status") == db.RUNNING:
+        # this process cannot stop the encode itself: the `run` service
+        # reads stage=cancelling at its next check (at most a second or so)
+        typer.echo(f"Cancel requested for running job {job_id}; the service stops it at its next check.")
+    else:
+        typer.echo(f"Cancelled job {job_id}.")
 
 
 @app.command()
