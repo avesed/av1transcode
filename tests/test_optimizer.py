@@ -18,6 +18,15 @@ from app import optimizer as opt
 from app import pgsocr
 
 
+def _write_out(args, data):
+    """What a faked ffmpeg/encoder call leaves behind: its output file, the
+    last argument. "-" is stdout, not a file - writing it dropped a file named
+    "-" into whatever directory the suite ran from."""
+    out = str(args[-1])
+    if out not in ("-", "pipe:", "pipe:1"):
+        Path(out).write_bytes(data)
+
+
 @pytest.fixture()
 def settings(tmp_path, monkeypatch):
     def fake_which(name, *_a, **_k):
@@ -637,7 +646,7 @@ def _capture_probe(enc, tmp_path, shot=(0, 90)):
             log_path = lavfi.split("log_path=")[1].split(":")[0]
             Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
         elif "-f" in args and args[args.index("-f") + 1] == "ivf":
-            Path(args[-1]).write_bytes(b"ivf-dummy")
+            _write_out(args, b"ivf-dummy")
         # the SYCL backend announces itself on stderr, which _run folds in;
         # the preflight refuses the GPU without it
         if "sycl_device=" in " ".join(args):
@@ -709,7 +718,7 @@ def test_staged_window_is_frame_exact_too(settings, info, plan, tmp_path):
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
         seen.append(args)
-        Path(args[-1]).write_bytes(b"x")
+        _write_out(args, b"x")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -867,7 +876,7 @@ def test_encoder_reads_rebase_by_a_constant_and_count_their_frames(
         args = [str(a) for a in args]
         ran.append(args)
         if "-lavfi" not in args:
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
             return ""
         _write_score(args, 90.0)
         return _ZC_LOG if "libvmaf_sycl=" in args[args.index("-lavfi") + 1] else ""
@@ -1058,7 +1067,7 @@ def _timeout_encoder(settings, info, plan, tmp_path, stall_first_n):
             log = lavfi.split("log_path=")[1].split(":")[0]
             Path(log).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 91.0}}}))
             return "[vmaf-sycl] timing: 30 frames, gpu%=100%"
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1311,11 +1320,11 @@ def test_run_full_pipeline(settings, info, plan, tmp_path, monkeypatch):
             return ""
         # shot extraction -> write y4m
         if "yuv4mpegpipe" in args:
-            Path(args[-1]).write_bytes(b"YUV4MPEG2 dummy")
+            _write_out(args, b"YUV4MPEG2 dummy")
             return ""
         # probe/final encode -> write ivf
         if "-f" in args and args[args.index("-f") + 1] == "ivf" and "libsvtav1" in args:
-            Path(args[-1]).write_bytes(b"ivf-dummy")
+            _write_out(args, b"ivf-dummy")
             return ""
         # vmaf score -> write score json (crf parsed from log_path filename).
         # The verification pass scores at the CHOSEN crf, which is not on the
@@ -1328,7 +1337,7 @@ def test_run_full_pipeline(settings, info, plan, tmp_path, monkeypatch):
                 {"pooled_metrics": {"vmaf": {"mean": score_at.get(crf, 76.0)}}}))
             return ""
         # concat + mux, and the verification window extractions
-        Path(args[-1]).write_bytes(b"output-dummy")
+        _write_out(args, b"output-dummy")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1378,13 +1387,13 @@ def test_p5_probe_converts_once_per_shot(settings, info, plan, tmp_path):
         args = [str(a) for a in args]
         cmds.append(args)
         if "ffv1" in args:                       # shard conversion
-            Path(args[-1]).write_bytes(b"shard")
+            _write_out(args, b"shard")
         elif any("libvmaf=" in a for a in args):
             lavfi = args[args.index("-lavfi") + 1]
             log_path = lavfi.split("log_path=")[1].split(":")[0]
             Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 92.0}}}))
         elif "-f" in args and args[args.index("-f") + 1] == "ivf":
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1423,13 +1432,13 @@ def test_p5_shard_holds_the_window_not_twice_it(settings, info, plan, tmp_path):
         args = [str(a) for a in args]
         cmds.append(args)
         if "ffv1" in args:
-            Path(args[-1]).write_bytes(b"shard")
+            _write_out(args, b"shard")
         elif any("libvmaf=" in a for a in args):
             lavfi = args[args.index("-lavfi") + 1]
             log_path = lavfi.split("log_path=")[1].split(":")[0]
             Path(log_path).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 92.0}}}))
         elif "-f" in args and args[args.index("-f") + 1] == "ivf":
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1465,11 +1474,11 @@ def test_a_shard_probe_encode_subtracts_nothing_mid_file(settings, info, plan, t
         args = [str(a) for a in args]
         cmds.append(args)
         if "ffv1" in args:
-            Path(args[-1]).write_bytes(b"shard")
+            _write_out(args, b"shard")
         elif any("libvmaf=" in a for a in args):
             _write_score(args, 92.0)
         elif "-f" in args and args[args.index("-f") + 1] == "ivf":
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1502,7 +1511,7 @@ def test_p5_final_encode_applies_rpu_inline(settings, info, plan, tmp_path):
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
         cmds.append(args)
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1847,11 +1856,11 @@ def test_ssimulacra2_stages_a_reference_shard(settings, info, plan, tmp_path):
         args = [str(a) for a in args]
         cmds.append(args)
         if "ffv1" in args:
-            Path(args[-1]).write_bytes(b"shard")
+            _write_out(args, b"shard")
             return ""
         if "app.vsmetrics" in args:
             return "93.512\n"
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1879,7 +1888,7 @@ def test_xpsnr_parses_weighted_luma(settings, info, plan, tmp_path):
         if any("xpsnr" in a for a in args):
             return ("[Parsed_xpsnr_2 @ 0x1] XPSNR  y: 43.6691  u: 49.5918  "
                     "v: 51.1706  (minimum: 43.6691)\n")
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1899,11 +1908,11 @@ def test_ssimulacra2_error_names_the_missing_plugins(settings, info, plan, tmp_p
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
         if "ffv1" in args:
-            Path(args[-1]).write_bytes(b"shard")
+            _write_out(args, b"shard")
             return ""
         if "app.vsmetrics" in args:
             raise opt.TranscodeError("boom")
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -1977,7 +1986,7 @@ def _encode_cmd(enc, crf):
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
         cmds.append(args)
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2054,13 +2063,13 @@ def test_shard_is_built_once_for_all_of_a_shots_probes(settings, info, plan, tmp
         args = [str(a) for a in args]
         if "ffv1" in args:
             conversions.append(args[-1])
-            Path(args[-1]).write_bytes(b"shard")
+            _write_out(args, b"shard")
         elif any("libvmaf=" in a for a in args):
             lavfi = args[args.index("-lavfi") + 1]
             log = lavfi.split("log_path=")[1].split(":")[0]
             Path(log).write_text(json.dumps({"pooled_metrics": {"vmaf": {"mean": 90.0}}}))
         elif "-f" in args and args[args.index("-f") + 1] == "ivf":
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2132,7 +2141,7 @@ def test_encode_shot_seeks_half_a_frame_early(settings, info, plan, tmp_path):
     def fake_run(self, args, timeout=None):
         args = [str(a) for a in args]
         cmds.append(args)
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2248,7 +2257,7 @@ def _encoder_writing(enc, frames_written):
         args = [str(a) for a in args]
         if "ffprobe" in args[0]:
             return f"{frames_written},\n"
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2278,7 +2287,7 @@ def test_shot_length_check_skipped_when_ffprobe_cannot_answer(
         args = [str(a) for a in args]
         if "ffprobe" in args[0]:
             return "N/A\n"
-        Path(args[-1]).write_bytes(b"ivf")
+        _write_out(args, b"ivf")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2327,7 +2336,7 @@ def _verifying_encoder(settings, info, plan, tmp_path, delivered):
             Path(log).write_text(json.dumps(
                 {"pooled_metrics": {"vmaf": {"mean": delivered}}}))
             return ""
-        Path(args[-1]).write_bytes(b"win")
+        _write_out(args, b"win")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2869,7 +2878,7 @@ def test_video_only_source_skips_the_audio_remux(settings, info, plan, tmp_path,
             if opt.ShotEncoder._PLAN_PROBE in args:
                 return _probe_json(("video", set()))   # video only: nothing to remux
             return ""
-        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        _write_out(args, b"\x1aE\xdf\xa3")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2900,7 +2909,7 @@ def test_source_with_audio_still_gets_remuxed(settings, info, plan, tmp_path,
                 # an audio stream is present, but no subtitle streams
                 return _probe_json(("video", set()), ("audio", {"default"}))
             return ""
-        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        _write_out(args, b"\x1aE\xdf\xa3")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -2953,7 +2962,7 @@ def test_ffmpeg_mux_fallback_delays_the_video_too(settings, info, plan, tmp_path
         ran.append(args)
         if "ffprobe" in args[0]:
             return "video\naudio\n" if "stream=codec_type" in args else ""
-        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3")
+        _write_out(args, b"\x1aE\xdf\xa3")
         return ""
 
     enc._run = fake_run.__get__(enc)
@@ -3818,7 +3827,7 @@ def test_concat_list_carries_each_shots_slot_duration(settings, info, plan, tmp_
         args = [str(a) for a in args]
         if "ffprobe" in args[0]:
             return "video\n"
-        Path(args[-1]).write_bytes(b"\x1aE\xdf\xa3"); return ""
+        _write_out(args, b"\x1aE\xdf\xa3"); return ""
 
     enc._run = fake_run.__get__(enc)
     enc.concat_shots([tmp_path / "a.ivf", tmp_path / "b.ivf"], [(0, 100), (100, 299)])
@@ -4442,7 +4451,7 @@ def test_zero_copy_preflight_decides_once_per_job(
         args = [str(a) for a in args]
         ran.append(args)
         if "libsvtav1" in args:
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
             return ""
         lavfi = args[args.index("-lavfi") + 1]
         if "libvmaf_sycl=" in lavfi:
@@ -4816,7 +4825,7 @@ def test_a_rebuild_on_a_software_read_warns_once_and_carries_on(
         if "-lavfi" in args:
             _write_score(args, 90.0)
         else:
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
         return changed
 
     monkeypatch.setattr(enc, "_run", fake_run)
@@ -4876,12 +4885,12 @@ def test_a_rebuild_while_staging_a_shard_is_warned_about_once(
         args = [str(a) for a in args]
         if "ffv1" in args:
             staged.append(args)
-            Path(args[-1]).write_bytes(b"shard")
+            _write_out(args, b"shard")
             return changed
         if "-lavfi" in args:
             _write_score(args, 92.0)
         elif "-f" in args and args[args.index("-f") + 1] == "ivf":
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
         return ""
 
     monkeypatch.setattr(enc, "_run", fake_run)
@@ -4932,7 +4941,7 @@ def test_zero_copy_preflight_steps_off_a_parameter_change(
         args = [str(a) for a in args]
         ran.append(args)
         if "libsvtav1" in args:
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
             return ""
         if "libvmaf_sycl=" in args[args.index("-lavfi") + 1]:
             if outcome == "every window rebuilds" or sum(
@@ -5039,7 +5048,7 @@ def test_a_card_probe_across_a_parameter_change_raises_graph_rebuilt(
 
     def fake_run(args, timeout=None):
         ran.append(args)
-        Path(args[-1]).write_bytes(b"partial")
+        _write_out(args, b"partial")
         if ending == "failed without it":
             return _ended("failed", "[av1_vaapi @ 0x1] Failed to end picture encode\n")
         return _ended(ending, _REBUILT_LINE + "x" * 3000)
@@ -5599,7 +5608,7 @@ def test_after_a_card_probe_rebuild_the_shots_svt_scores_skip_zero_copy(
         args = [str(a) for a in args]
         ran.append(args)
         if "-lavfi" not in args:
-            Path(args[-1]).write_bytes(b"ivf")
+            _write_out(args, b"ivf")
             return _REBUILT_LINE if "gpuprobe_00000_" in args[-1] else ""
         _write_score(args, 90.0)
         return _ZC_LOG if "libvmaf_sycl=" in args[args.index("-lavfi") + 1] else ""
