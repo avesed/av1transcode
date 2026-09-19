@@ -5115,6 +5115,30 @@ def test_gpu_probe_maps_the_bulk_and_keeps_anchor_samples(settings, info, plan, 
         assert crf == pytest.approx(crf_of(idx), abs=0.01)
 
 
+def test_gpu_probe_mapped_crfs_respect_min_and_max_crf(settings, info, plan, tmp_path, monkeypatch):
+    """In qsv mode a bulk shot ships the CRF the line maps it to. Anchors went
+    through pick_all_crfs and honoured max_crf; mapped shots were clamped to
+    the top of the probe grid instead, so max_crf only held for 6 shots."""
+    settings.transcode.optimizer.max_crf = 23
+    settings.transcode.optimizer.min_crf = 22
+    enc, shots = _gpu_encoder(settings, info, plan, tmp_path)
+    grid = [20, 26, 32, 38, 44]
+    qgrid = enc._qsv_grid()
+    crf_of = lambda i: 20.0 + (i % 5)                     # 20..24: both bounds in play
+    q_of = lambda i: (crf_of(i) + 14.0) / 2.0
+    monkeypatch.setattr(enc, "_probe_shot",
+                        lambda idx, s0, s1, g, lp: _curve(grid, crf_of(idx), enc.target))
+    monkeypatch.setattr(enc, "_probe_shot_qsv",
+                        lambda idx, s0, s1, qg: (_curve(qgrid, q_of(idx), enc.target),
+                                                 {max(qgrid): 100.0 + q_of(idx)}))
+    samples, chosen = enc.probe_all_gpu(shots, grid)
+    mapped = [i for i in chosen if i not in samples]
+    assert mapped, "nothing was mapped - the test would prove nothing"
+    for idx, crf in chosen.items():
+        assert 22.0 <= crf <= 23.0, (idx, crf)
+        assert crf == pytest.approx(min(max(crf_of(idx), 22.0), 23.0), abs=0.01)
+
+
 def test_gpu_probe_gives_up_on_the_whole_job_when_the_line_does_not_hold(
         settings, info, plan, tmp_path, monkeypatch):
     """A line always fits its own points, so the leave-one-out residual is what

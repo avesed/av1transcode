@@ -3307,8 +3307,12 @@ class ShotEncoder:
         return sorted({order[round(j * (n - 1) / (k - 1))] for j in range(k)})
 
     def _map_crf(self, q: float, fit: Dict[str, float], grid: List[int]) -> float:
+        """The CRF a bulk shot ships with in qsv mode, clamped the way
+        pick_all_crfs clamps a probed one. The ceiling was the top of the grid
+        rather than _crf_ceiling, so max_crf held for the anchors and not for
+        every mapped shot around them."""
         crf = fit["a"] * q + fit["b"] + float(self.opt.probe_crf_offset or 0.0)
-        return max(self._crf_floor(min(grid)), min(crf, float(max(grid))))
+        return max(self._crf_floor(min(grid)), min(crf, self._crf_ceiling(max(grid))))
 
     def probe_all_gpu(self, shots: List[Shot],
                       grid: List[int]) -> Tuple[ProbeSamples, Dict[int, float]]:
