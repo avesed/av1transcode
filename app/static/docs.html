@@ -226,7 +226,7 @@
 <section id="sec-flow">
 <h2>工作流程</h2>
 <p><b>默认不会自动入队任何文件</b>（<code>watcher.enabled: false</code>）：只有通过首页表单 / API <code>POST /api/jobs</code> / CLI（<code>process</code>、<code>scan</code>）手动指定的文件或目录才会被转码。如需恢复自动监视，在 config.yaml 中设置 <code>watcher.enabled: true</code>。</p>
-<p>提交的文件会分析（Dolby Vision P5/P7/P8 → HDR10（RPU 默认另存为 <code>.rpu.bin</code>，成品本身不带 DV），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
+<p>提交的文件会分析（Dolby Vision P5 → HDR10，P7/P8 编码基底层、按基底层的 HDR10/HLG/SDR 标记（RPU 默认另存为 <code>.rpu.bin</code>，成品本身不带 DV），HDR10/HLG/SDR 直接编码），随后按预设的码率/质量参数编码输出为 AV1（SVT-AV1）。</p>
 <ul>
   <li>已是 AV1 的源默认跳过（<code>skip_existing_av1</code>）。</li>
   <li>成功后源文件<b>默认保留</b>在原位置。可选：在<a href="/static/settings.html#sec-safety">设置页</a>开启「转码成功后删除源文件」（需要二次确认，危险操作）。</li>
@@ -762,11 +762,12 @@
 </div>
 <div class="def" id="dv-p7-p8">
   <h3 class="def__name">P7 / P8</h3>
-  <div class="def__body"><p>解码器直接返回基底层、自行忽略 EL/RPU，和旧的 <code>dovi_split=bl</code> remux 逐帧一致；那一步已删除（每集 4K 省约三分钟和一次 27GB 写）。RPU 单独保存为 <code>.rpu.bin</code>。</p></div>
+  <div class="def__body"><p>解码器直接返回基底层、自行忽略 EL/RPU，和旧的 <code>dovi_split=bl</code> remux 逐帧一致；那一步已删除（每集 4K 省约三分钟和一次 27GB 写）。RPU 单独保存为 <code>.rpu.bin</code>。</p>
+    <p>成品按基底层本来的信号标记，以 DV 配置里的兼容 id（<code>dv_bl_signal_compatibility_id</code>）为准：1、6（8.1、7）是 HDR10，4（8.4，手机和广播常见）是 HLG，2（8.2）是 SDR。没有这个 id 时看视频流自己的传输特性，都没有时按 HDR10。</p></div>
 </div>
 <div class="def" id="dv-hdr10-hlg">
   <h3 class="def__name">HDR10 / HLG</h3>
-  <div class="def__body"><p>编码完用 mkvpropedit 在 mkv 视频轨上写色彩标签（AV1 码流头默认按 BT.709，不写播放器会显示错色）。HDR10 另写 mastering display / CLL：取源里的，源里没有就用 <a href="#c-transcode-hdr-default_master_display"><code>default_master_display</code> / <code>default_max_cll</code></a>。HLG 只写 BT.2020 + HLG 标签，不写 mastering display / CLL。Dolby Vision 源的输出一律按 HDR10 标。整步由 <code>hdr.preserve</code> 控制。</p></div>
+  <div class="def__body"><p>编码完用 mkvpropedit 在 mkv 视频轨上写色彩标签（AV1 码流头默认按 BT.709，不写播放器会显示错色）。HDR10 另写 mastering display / CLL：取源里的，源里没有就用 <a href="#c-transcode-hdr-default_master_display"><code>default_master_display</code> / <code>default_max_cll</code></a>。HLG 只写 BT.2020 + HLG 标签，不写 mastering display / CLL。Dolby Vision 源：P5 转成了 HDR10，按 HDR10 标；P7/P8 按基底层标（见 <a href="#dv-p7-p8">P7 / P8</a>），SDR 基底层和普通 SDR 源一样不写。整步由 <code>hdr.preserve</code> 控制。</p></div>
 </div>
 <div class="def" id="dv-sdr">
   <h3 class="def__name">SDR</h3>
@@ -1082,7 +1083,7 @@
 <div class="def" id="c-transcode-hdr-preserve">
   <h3 class="def__name"><code>preserve</code></h3>
   <p class="def__dflt">配置段 <code>transcode.hdr</code> · 默认 <code>true</code></p>
-  <div class="def__body"><p>输出保留 mastering display / CLL 元数据。做法是编码完用 mkvpropedit 写到 mkv 视频轨上（HDR10、HLG、DV 源），色彩标签也是这一步写的；关掉就整步不做。见 <a href="#dv-hdr10-hlg">HDR10 / HLG</a>。</p></div>
+  <div class="def__body"><p>输出保留 mastering display / CLL 元数据。做法是编码完用 mkvpropedit 写到 mkv 视频轨上（成品是 HDR10 或 HLG 时），色彩标签也是这一步写的；关掉就整步不做。见 <a href="#dv-hdr10-hlg">HDR10 / HLG</a>。</p></div>
 </div>
 <div class="def" id="c-transcode-hdr-default_master_display">
   <h3 class="def__name"><code>default_master_display / default_max_cll</code></h3>

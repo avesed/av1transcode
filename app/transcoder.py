@@ -537,7 +537,11 @@ def run_full_transcode(
             raise
 
         # --- optional HDR metadata tag on the mkv ---
-        if settings.transcode.hdr.preserve and (info.is_hdr or info.is_hlg or info.dovi.present):
+        # Keyed on what the plan tags, not on the source: a DV 8.2 source has
+        # an SDR base and nothing to write (see decisions.dv_base_signal).
+        if settings.transcode.hdr.preserve and (
+                plan.color_trc in ("smpte2084", "arib-std-b67")
+                or plan.master_display or plan.max_cll):
             _colorpropedit_hdr(settings, output, plan)
     finally:
         # NB: a finally, not the tail of the happy path. Every intermediate

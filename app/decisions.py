@@ -32,6 +32,35 @@ class TranscodePlan:
     notes: List[str] = field(default_factory=list)
 
 
+# dv_bl_signal_compatibility_id -> what the base layer is
+_DV_BL_SIGNAL = {1: "pq", 6: "pq", 4: "hlg", 2: "sdr"}
+
+
+def dv_base_signal(info: MediaInfo) -> str:
+    """What a Dolby Vision stream's base layer carries: "pq", "hlg" or "sdr".
+
+    Outside P5 the base layer IS what gets encoded - the decoder returns it
+    and ignores EL and RPU - so it is what the output has to be tagged as.
+    Profile 8 comes in three: 8.1 is HDR10 (PQ), 8.4 is HLG (phones,
+    broadcast) and 8.2 is SDR BT.709; 7 is HDR10. Everything used to be tagged
+    BT.2020+PQ, which makes an HLG or SDR picture play back at the wrong
+    brightness and gamut. The DV configuration's compatibility id is the
+    authority; the stream's own transfer is the fallback, and a stream that
+    says nothing keeps the old PQ answer.
+    """
+    known = _DV_BL_SIGNAL.get(info.dovi.compatible_id)
+    if known:
+        return known
+    if info.is_hdr:
+        return "pq"
+    if info.is_hlg:
+        return "hlg"
+    trc = (info.color.transfer or "").lower()
+    if trc and trc not in ("unknown", "unspecified", "reserved"):
+        return "sdr"
+    return "pq"
+
+
 def _color_tags_for(settings: Settings, info: MediaInfo, plan: TranscodePlan) -> None:
     """Determine color metadata tags for the encoded video, preserving HDR/DV target."""
     plan.color_primaries = "bt709"
@@ -39,8 +68,10 @@ def _color_tags_for(settings: Settings, info: MediaInfo, plan: TranscodePlan) ->
     plan.colorspace = "bt709"
     plan.color_range = info.color.range if info.color.range else "tv"
 
-    if plan.p5 or plan.dovi_present:
-        # DV always converts/encodes to HDR10 (BT.2020 + PQ)
+    # P5 has no backward-compatible base: libplacebo converts it to HDR10
+    # (BT.2020 + PQ) before the encode. Any other DV encodes its base layer.
+    base = "pq" if plan.p5 else dv_base_signal(info) if plan.dovi_present else None
+    if base == "pq" and plan.dovi_present:
         plan.color_primaries = "bt2020"
         plan.color_trc = "smpte2084"
         plan.colorspace = "bt2020nc"
@@ -52,6 +83,14 @@ def _color_tags_for(settings: Settings, info: MediaInfo, plan: TranscodePlan) ->
             plan.max_cll = info.color.max_cll or (
                 settings.transcode.hdr.default_max_cll if info.is_hdr else None
             )
+        return
+    if base == "hlg":
+        plan.color_primaries = "bt2020"
+        plan.color_trc = "arib-std-b67"
+        plan.colorspace = "bt2020nc"
+        plan.color_range = "tv"
+        return
+    if base == "sdr":
         return
 
     if info.is_hdr:
@@ -136,7 +175,9 @@ def decide_action(settings: Settings, info: MediaInfo, preset_name: str = "",
                 rpu_dir = _output_dir(settings, info, "rpu")
                 plan.rpu_path = rpu_dir / f"{info.path.stem}.rpu.bin"
                 rpu_note = " + RPU saved separately"
-            plan.notes.append(f"Dolby Vision P{info.dovi.profile}: -> HDR10{rpu_note}")
+            target = {"pq": "HDR10", "hlg": "HLG", "sdr": "SDR"}[
+                "pq" if info.dovi.profile == 5 else dv_base_signal(info)]
+            plan.notes.append(f"Dolby Vision P{info.dovi.profile}: -> {target}{rpu_note}")
             if info.dovi.profile == 5:
                 plan.p5 = True
                 plan.p5_method = settings.transcode.dovi.p5_method

@@ -77,6 +77,42 @@ def test_dv_p7_plan(settings):
     assert "base layer" in plan.notes[-1]
 
 
+@pytest.mark.parametrize("profile, compat, transfer, want", [
+    # the DV configuration's compatibility id decides
+    (8, 1, "smpte2084", ("bt2020", "smpte2084")),     # 8.1: HDR10 base
+    (8, 4, "arib-std-b67", ("bt2020", "arib-std-b67")),  # 8.4: HLG base (phones, broadcast)
+    (8, 2, "bt709", ("bt709", "bt709")),              # 8.2: SDR base
+    (7, 6, "smpte2084", ("bt2020", "smpte2084")),     # 7: Blu-ray HDR10 base
+    (8, 4, None, ("bt2020", "arib-std-b67")),         # the id holds without stream tags
+    # no id: the stream's own transfer; nothing at all keeps the old PQ answer
+    (8, 0, "arib-std-b67", ("bt2020", "arib-std-b67")),
+    (8, 0, "bt709", ("bt709", "bt709")),
+    (8, 0, None, ("bt2020", "smpte2084")),
+    # P5 has no compatible base: libplacebo makes it HDR10 whatever it says
+    (5, 0, None, ("bt2020", "smpte2084")),
+])
+def test_a_dv_output_is_tagged_as_its_base_layer(settings, profile, compat, transfer, want):
+    """Outside P5 the encode IS the base layer (the decoder returns it and
+    ignores EL/RPU), and the AV1 bitstream carries no colour of its own - the
+    mkv tags are all a player has. Every DV output used to be tagged
+    BT.2020+PQ, so an 8.4 (HLG) or 8.2 (SDR) source came out read with the
+    wrong curve and gamut."""
+    info = MediaInfo(path=Path("/tmp/dv.mkv"))
+    info.video_codec = "hevc"
+    info.color.transfer = transfer
+    info.is_hdr = transfer == "smpte2084"
+    info.is_hlg = transfer == "arib-std-b67"
+    info.dovi = DolbyVisionInfo(present=True, profile=profile, rpu_present=True,
+                                compatible_id=compat)
+    plan = decide_action(settings, info)
+    assert (plan.color_primaries, plan.color_trc) == want
+    if want[1] != "smpte2084":
+        # HLG and SDR carry no HDR10 mastering metadata, as without DV
+        assert plan.master_display is None and plan.max_cll is None
+    target = {"smpte2084": "HDR10", "arib-std-b67": "HLG", "bt709": "SDR"}[want[1]]
+    assert any(n.startswith(f"Dolby Vision P{profile}: -> {target}") for n in plan.notes)
+
+
 def test_hdr_passthrough_tags(settings):
     info = MediaInfo(path=Path("/tmp/hdr.mkv"))
     info.video_codec = "hevc"
