@@ -1309,13 +1309,11 @@ class ShotEncoder:
         purely from the stranding. With lp bounded by the CPU budget instead,
         the instances in flight cannot oversubscribe the cores by construction.
 
-        That holds for the SVT-AV1 encode, which is what this pins. It does
-        NOT hold for the decode side of a probe: nothing here passes -threads,
-        so ffmpeg sizes its own frame threads from the host core count, not
-        from the lp this task was admitted for. At 10 probes in flight on 40
-        cores that is a real oversubscription, and it is why the admission
-        accounting reads lower than the machine actually behaves. Measuring
-        before capping it, rather than capping it and hoping.
+        That holds for the SVT-AV1 encode, which is what this pins. The
+        decode side of a probe is bounded separately: _probe_input passes
+        -threads lp, the count the task was admitted for. Without that ffmpeg
+        sized its frame threads from the host core count, and 10 probes in
+        flight on 40 cores oversubscribed them.
         """
         cores = self._cores()
         if threads >= cores:
