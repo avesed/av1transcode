@@ -1028,7 +1028,8 @@ class ShotEncoder:
         # timeline slot each frame sits in (see _slots_from_pts / _slot)
         self._frame_pts: List[float] = []
         self._slots: List[int] = []
-        # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads)
+        # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads).
+        # Every probe phase must set it: left at 1, a score takes every core.
         self._probe_worker_count = 1
         # affinity slices currently taken (only used when encode_threads is set)
         self._slots_used: set[int] = set()
@@ -3317,6 +3318,8 @@ class ShotEncoder:
         outside the range the anchors actually cover."""
         qgrid = self._qsv_grid()
         ladder = self._lp_ladder()
+        # libvmaf threads for the CPU scores (see probe_all_verified)
+        self._probe_worker_count = self._probe_workers(len(shots) or 1)
         anchors = self._gpu_anchor_indices(shots)
         samples: ProbeSamples = {}
         chosen: Dict[int, float] = {}
@@ -3665,6 +3668,14 @@ class ShotEncoder:
         """
         qgrid = self._qsv_grid()
         ladder = self._lp_ladder()
+        # Sizes libvmaf's threads (_vmaf_threads), as probe_all does. Left at
+        # its initial 1, every CPU score asked for ALL the cores - production
+        # at 1080p (below vmaf_sycl_min_width, so no SYCL) ran ten scores at
+        # n_threads=40 on 40 cores. Measured, that cost no throughput (the
+        # idle libvmaf threads wait rather than spin: 105-111s against
+        # 109-119s for the same 1080p probe mix, scores identical), but it
+        # is not the count the pool was sized for.
+        self._probe_worker_count = self._probe_workers(len(shots) or 1)
         # The shots that start the line off, stratified by length the same way
         # the "qsv" path picks its anchors. They pay a QSV pass on top of a
         # full SVT bisection; at 16 of a 1400-shot episode that is ~1% of the

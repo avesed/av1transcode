@@ -328,6 +328,41 @@ def test_vmaf_threads_auto_sized_to_probe_pool(settings, info, plan, tmp_path, m
     assert enc._vmaf_threads() == 3
 
 
+@pytest.mark.parametrize("mode", ["svt", "qsv+svt", "qsv"])
+def test_every_probe_phase_sizes_libvmaf_threads_to_its_pool(
+        settings, info, plan, tmp_path, monkeypatch, mode):
+    """Only probe_all set the pool size _vmaf_threads divides by, so under
+    qsv+svt it stayed at 1 and every CPU score asked for all the cores.
+    Production at 1080p (CPU scoring, below vmaf_sycl_min_width) ran ten
+    scores at n_threads=40 each on a 40-core quota. Harmless in throughput
+    as measured, but not what the pool was sized for."""
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 40.0)
+    make = _verified_encoder if mode == "qsv+svt" else _gpu_encoder
+    enc, shots = make(settings, info, plan, tmp_path)
+    settings.transcode.optimizer.probe_encoder = mode
+    monkeypatch.setattr(enc, "_mem_budget_gb", lambda: 200.0)
+    grid = list(settings.transcode.optimizer.probe_crfs)
+    qgrid = enc._qsv_grid()
+    seen = []
+    _plant_svt(enc, monkeypatch, lambda i: 30.0, {})
+    svt_score = enc._probe_encode_and_score
+
+    def svt(*a):
+        seen.append(enc._vmaf_threads())
+        return svt_score(*a)
+
+    def card(idx, s0, s1, qg):
+        seen.append(enc._vmaf_threads())
+        return _curve(qgrid, 30.0, enc.target), {max(qgrid): 100.0}
+
+    monkeypatch.setattr(enc, "_probe_encode_and_score", svt)
+    monkeypatch.setattr(enc, "_probe_shot_qsv", card)
+    {"svt": enc.probe_all, "qsv+svt": enc.probe_all_verified,
+     "qsv": enc.probe_all_gpu}[mode](shots, grid)
+    # 40 cores / lp 4 = ten probes in flight, so four threads each
+    assert seen and set(seen) == {4}
+
+
 def test_probe_cost_never_under_reports(settings, info, plan, tmp_path, monkeypatch):
     """The probe prior has to bound BOTH resolutions from above.
 
