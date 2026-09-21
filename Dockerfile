@@ -403,13 +403,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libopus0 libvpx9 libx264-164 libx265-199 libmp3lame0 libvorbis0a \
         libvorbisenc2 \
         libass9 libfreetype6 libfontconfig1 libvulkan1 \
-        libgl1 libegl1 libopengl0 libdav1d7 mediainfo mkvtoolnix \
+        libgl1 libegl1 libopengl0 libdav1d7 mkvtoolnix \
         python3 python3-pip libpython3.12t64 \
         libzimg2 liblcms2-2 mesa-vulkan-drivers \
         libva2 libva-drm2 intel-media-va-driver libmfx-gen1 libvpl2 \
         libze1 libze-intel-gpu1 \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+
+# MediaInfo from MediaArea rather than Ubuntu's 24.01. Before 26.05 its AV1
+# parser skips initial_display_delay, which SVT-AV1 v4 always writes, loses its
+# place and drops the whole sequence header: every output then shows no Format
+# profile, Bit depth or Chroma subsampling (fixed in MediaInfoLib bd835a3c08).
+# Nothing in the app calls it - `cli check` only looks for it - so it is here
+# for reading an output by hand: docker exec av1transcode mediainfo FILE.
+# Pinned by version AND checksum, like the tessdata below; apt installs the
+# three packages' own dependencies (libmms0, libtinyxml2, ...) from Ubuntu.
+ARG MEDIAINFO_VERSION=26.05
+ARG LIBZEN_VERSION=0.4.41
+ARG MEDIAINFO_SHA256=00ef1b1b33f8b9cef72aebf912649273484c4708928d1aef6aab56f14c96dc1b
+ARG LIBMEDIAINFO_SHA256=4a5d2ce1304b67f54bd85a89cdbd80d78aacef6e44bce6c0b25d2b9e150fe2f1
+ARG LIBZEN_SHA256=56591441f8f475337ae3bbc2f8ceb76104ede84964fe9df8d0c1cc96460b37f0
+RUN mkdir /tmp/mediainfo && cd /tmp/mediainfo \
+    && base=https://mediaarea.net/download/binary \
+    && curl -fsSLO "$base/libzen0/${LIBZEN_VERSION}/libzen0v5_${LIBZEN_VERSION}-1_amd64.Ubuntu_24.04.deb" \
+    && curl -fsSLO "$base/libmediainfo0/${MEDIAINFO_VERSION}/libmediainfo0v5_${MEDIAINFO_VERSION}-1_amd64.Ubuntu_24.04.deb" \
+    && curl -fsSLO "$base/mediainfo/${MEDIAINFO_VERSION}/mediainfo_${MEDIAINFO_VERSION}-1_amd64.Ubuntu_24.04.deb" \
+    && printf '%s  %s\n' \
+        "${LIBZEN_SHA256}" "libzen0v5_${LIBZEN_VERSION}-1_amd64.Ubuntu_24.04.deb" \
+        "${LIBMEDIAINFO_SHA256}" "libmediainfo0v5_${MEDIAINFO_VERSION}-1_amd64.Ubuntu_24.04.deb" \
+        "${MEDIAINFO_SHA256}" "mediainfo_${MEDIAINFO_VERSION}-1_amd64.Ubuntu_24.04.deb" \
+        | sha256sum -c - \
+    && apt-get update && apt-get install -y --no-install-recommends ./*.deb \
+    && rm -rf /var/lib/apt/lists/* /tmp/mediainfo \
+    && mediainfo --Version | grep -q "v${MEDIAINFO_VERSION}"
 
 # OCR for the English image subtitles (transcode.optimizer.pgs_ocr_srt, see
 # app/pgsocr.py). tesseract-ocr is the engine; wamerican is the word list the
