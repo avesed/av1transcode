@@ -3229,7 +3229,8 @@ def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,
 
     monkeypatch.setattr(opt.subprocess, "run", fake_run)
     assert enc._mkvmerge_mux("mkvmerge", video_only, None) is True
-    assert seen["cmd"] == ["mkvmerge", "-o", str(enc.output), str(video_only)]
+    assert seen["cmd"] == ["mkvmerge", "-o", str(enc.output),
+                           *_video_in(enc, video_only, tags=False)]
 
 
 @pytest.mark.skipif(shutil.which("ffprobe") is None, reason="needs a real ffprobe")
@@ -3262,29 +3263,38 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
     assert enc._has_audio_or_subs(str(noisy)) is True
 
 
-# ---- attachments (the fonts styled subtitles name) through the final mux ----
+# ---- attachments (the fonts styled subtitles name), chapters and global
+# tags through the final mux ----
 _MKV, _MP4 = "matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2"
-_ATTACHMENT_PROBE = "format=format_name:stream=codec_type:stream_disposition=attached_pic"
+_CONTAINER_PROBE = "format=format_name"
 _SOURCE_ONLY = ["--no-video", "--no-audio", "--no-subtitles", "--no-buttons",
-                "--no-track-tags", "--no-chapters", "--no-global-tags"]
+                "--no-track-tags"]
+# audio_subs.mkv when the source hands mkvmerge its own
+_REMUX_TRACKS_ONLY = ["--no-attachments", "--no-chapters", "--no-global-tags"]
+
+
+def _video_in(enc, video_only=None, tags=True):
+    """The video input of the final mkvmerge: never video_only.mkv's global
+    tags, and the encoder tags when concat_shots made them."""
+    head = ["--no-global-tags"]
+    if tags:
+        head += ["--tags", f"0:{enc.tempdir / 'video_tags.xml'}"]
+    return head + [str(video_only or enc.tempdir / "video_only.mkv")]
 
 
 def _maps(cmd):
     return [cmd[i + 1] for i, a in enumerate(cmd) if a == "-map"]
 
 
-def _attachment_probe(format_name, *streams):
-    """ffprobe -of json for the attachment probe: (codec_type, attached_pic)
-    per stream, the way ffprobe prints them."""
-    return json.dumps({"programs": [], "streams": [
-        {"codec_type": kind, "disposition": {"attached_pic": pic}}
-        for kind, pic in streams], "format": {"format_name": format_name}}, indent=4)
+def _container_probe(format_name):
+    """ffprobe -of json for the container probe, the way ffprobe prints it."""
+    return json.dumps({"format": {"format_name": format_name}}, indent=4)
 
 
 def _concat_via_mkvmerge(enc, monkeypatch, streams, probe, rc=lambda cmd: 0,
                          srt=None):
     """concat_shots down the mkvmerge mux, with `streams` as what the one plan
-    probe prints and `probe` as what the attachment probe prints (raised
+    probe prints and `probe` as what the container probe prints (raised
     when an exception). `rc` gives each mkvmerge run its exit code, and `srt`
     what an extracted companion contains, as in _mux_with. Returns
     (the commands _run ran, the mkvmerge commands)."""
@@ -3298,7 +3308,7 @@ def _concat_via_mkvmerge(enc, monkeypatch, streams, probe, rc=lambda cmd: 0,
         if "ffprobe" in args[0]:
             if opt.ShotEncoder._PLAN_PROBE in args:
                 return streams
-            if _ATTACHMENT_PROBE in args:
+            if _CONTAINER_PROBE in args:
                 # the original file, as for the audio: a Dolby Vision job's
                 # enc.source is a stripped intermediate with no attachments
                 assert args[-1] == str(enc.info.path), args
@@ -3364,13 +3374,15 @@ def test_a_remux_that_fails_with_the_attachments_is_retried_without_them(
     assert any("without the source's attachments" in str(w[0]) for w in warnings)
 
 
-def test_mkvmerge_takes_only_the_attachments_from_the_source(settings, info, plan,
-                                                             tmp_path, monkeypatch):
-    """The source's tracks, chapters and tags are audio_subs.mkv's already.
-    audio_subs.mkv's attachments must be left out: they are ffmpeg's copies,
-    with new UIDs and no images, and mkvmerge keeps a first copy over a second
-    of the same name, description and size - measured, the source's UIDs were
-    lost without --no-attachments."""
+def test_mkvmerge_takes_the_attachments_chapters_and_tags_from_the_source(
+        settings, info, plan, tmp_path, monkeypatch):
+    """The source's tracks and track tags are audio_subs.mkv's already; its
+    attachments, chapters and global tags are taken from the source itself.
+    audio_subs.mkv's copies of those must be left out: its attachments have
+    new UIDs and no images, and mkvmerge keeps a first copy over a second of
+    the same name, description and size - measured, the source's UIDs were
+    lost without --no-attachments. Its chapters and tags would be merged in
+    next to the source's."""
     enc = make_encoder(settings, info, plan, tmp_path)
     enc._lead_of = lambda path: 0.5
     video_only = tmp_path / "video_only.mkv"
@@ -3385,35 +3397,32 @@ def test_mkvmerge_takes_only_the_attachments_from_the_source(settings, info, pla
 
     monkeypatch.setattr(opt.subprocess, "run", fake_run)
     assert enc._mkvmerge_mux("mkvmerge", video_only, audio_subs, "/m/movie.mkv") is True
-    assert seen[-1] == ["mkvmerge", "-o", str(enc.output), "--sync", "0:500",
-                        str(video_only), "--no-attachments", str(audio_subs),
-                        *_SOURCE_ONLY, "/m/movie.mkv"]
+    assert seen[-1] == ["mkvmerge", "-o", str(enc.output), "--no-global-tags",
+                        "--sync", "0:500", str(video_only), *_REMUX_TRACKS_ONLY,
+                        str(audio_subs), *_SOURCE_ONLY, "/m/movie.mkv"]
     # With no audio_subs.mkv, the source would be the first input with a segment
     # title, and mkvmerge would put it on an output that never had one. An
     # explicit empty title wins (measured, v82). With audio_subs.mkv the title is
     # the one it already carries, and the command above leaves it alone.
     assert enc._mkvmerge_mux("mkvmerge", video_only, None, "/m/movie.mkv") is True
     assert seen[-1] == ["mkvmerge", "-o", str(enc.output), "--title", "",
-                        str(video_only), *_SOURCE_ONLY, "/m/movie.mkv"]
+                        *_video_in(enc, video_only, tags=False), *_SOURCE_ONLY,
+                        "/m/movie.mkv"]
     assert enc._mkvmerge_mux("mkvmerge", video_only, None) is True
-    assert seen[-1] == ["mkvmerge", "-o", str(enc.output), str(video_only)]
+    assert seen[-1] == ["mkvmerge", "-o", str(enc.output),
+                        *_video_in(enc, video_only, tags=False)]
 
 
 @pytest.mark.parametrize("probe, takes", [
-    (_attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0),
-                       ("attachment", 0), ("attachment", 0)), True),
-    # matroskadec makes an image/jpeg attachment a video stream, attached_pic
-    (_attachment_probe(_MKV, ("video", 0), ("audio", 0), ("video", 1)), True),
-    (_attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)), False),
-    # an mp4's cover art is attached_pic too, and no attachment
-    (_attachment_probe(_MP4, ("video", 0), ("audio", 0), ("video", 1)), False),
-    ("[matroska,webm @ 0x55d0c0] Read error\n"
-     + _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("attachment", 0)), True),
+    (_container_probe(_MKV), True),
+    # an mp4's chapters have no language to lose, and its attached_pic is
+    # cover art, not an attachment
+    (_container_probe(_MP4), False),
+    ("[matroska,webm @ 0x55d0c0] Read error\n" + _container_probe(_MKV), True),
     ("Invalid data found when processing input\n", False),
     (opt.TranscodeError("ffprobe exploded"), False),
-], ids=["fonts", "image", "none", "mp4-cover", "past-error-lines", "no-json",
-        "ffprobe-failed"])
-def test_mkvmerge_reads_the_original_source_only_for_its_attachments(
+], ids=["mkv", "mp4", "past-error-lines", "no-json", "ffprobe-failed"])
+def test_mkvmerge_reads_a_matroska_source_for_its_attachments_chapters_and_tags(
         settings, info, plan, tmp_path, monkeypatch, probe, takes):
     enc = make_encoder(settings, info, plan, tmp_path)
     ran, merges = _concat_via_mkvmerge(
@@ -3425,36 +3434,52 @@ def test_mkvmerge_reads_the_original_source_only_for_its_attachments(
     # Dolby Vision encodes a stripped intermediate: attachments, like the
     # audio, come from the original file
     assert str(enc.source) != str(enc.info.path)
-    assert [a[-1] for a in ran if _ATTACHMENT_PROBE in a] == [str(enc.info.path)]
+    assert [a[-1] for a in ran if _CONTAINER_PROBE in a] == [str(enc.info.path)]
     assert any(a[-1] == audio_subs and "0:t?" in a for a in ran)
     if takes:
-        assert merge[1:] == ["-o", str(enc.output), str(enc.tempdir / "video_only.mkv"),
-                             "--no-attachments", audio_subs, *_SOURCE_ONLY,
+        assert merge[1:] == ["-o", str(enc.output), *_video_in(enc),
+                             *_REMUX_TRACKS_ONLY, audio_subs, *_SOURCE_ONLY,
                              str(enc.info.path)]
     else:
-        assert merge[1:] == ["-o", str(enc.output),
-                             str(enc.tempdir / "video_only.mkv"), audio_subs]
+        assert merge[1:] == ["-o", str(enc.output), *_video_in(enc), audio_subs]
 
 
 def test_an_mkvmerge_that_cannot_read_the_source_muxes_again_without_it(
         settings, info, plan, tmp_path, monkeypatch):
     """mkvmerge exits 2 on a file it cannot parse ("The type of file could not
     be recognized"). That must not cost the container rebuild Plex needs: the
-    fonts audio_subs.mkv carries still get through a second mkvmerge."""
+    fonts, chapters and tags audio_subs.mkv carries still get through a second
+    mkvmerge."""
     enc = make_encoder(settings, info, plan, tmp_path)
     warnings = []
     monkeypatch.setattr(opt.logger, "warning", lambda *a, **k: warnings.append(a))
     ran, merges = _concat_via_mkvmerge(
         enc, monkeypatch, _probe_json(("video", set()), ("audio", {"default"})),
-        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("attachment", 0)),
+        _container_probe(_MKV),
         rc=lambda cmd: 2 if str(enc.info.path) in cmd else 0)
     first, second = merges
     assert first[-1] == str(enc.info.path)
-    assert second[1:] == ["-o", str(enc.output), str(enc.tempdir / "video_only.mkv"),
+    assert second[1:] == ["-o", str(enc.output), *_video_in(enc, tags=False),
                           str(enc.tempdir / "audio_subs.mkv")]
     assert not any(a[-1] == str(enc.output) for a in ran)     # no ffmpeg mux
-    assert any("attachment source" in str(w[0]) for w in warnings)
+    assert any("attachments, chapters and tags" in str(w[0]) for w in warnings)
 
+
+
+def test_a_failed_mkvmerge_is_retried_without_the_encoder_tags(
+        settings, info, plan, tmp_path, monkeypatch):
+    """A tags file mkvmerge refused would otherwise send every job to the
+    ffmpeg mux - the one Plex's 4K AV1 transcode hangs on."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran, merges = _concat_via_mkvmerge(
+        enc, monkeypatch, _probe_json(("video", set()), ("audio", {"default"})),
+        _container_probe(_MP4),
+        rc=lambda cmd: 2 if "--tags" in cmd else 0)
+    first, second = merges
+    assert "--tags" in first
+    assert second[1:] == ["-o", str(enc.output), *_video_in(enc, tags=False),
+                          str(enc.tempdir / "audio_subs.mkv")]
+    assert not any(a[-1] == str(enc.output) for a in ran)     # no ffmpeg mux
 
 def test_a_video_only_source_keeps_its_attachments_without_a_remux(
         settings, info, plan, tmp_path, monkeypatch):
@@ -3468,12 +3493,11 @@ def test_a_video_only_source_keeps_its_attachments_without_a_remux(
         enc, monkeypatch,
         _probe_json(("video", set()), ("attachment", set()),
                     ("video", {"attached_pic"})),
-        _attachment_probe(_MKV, ("video", 0), ("attachment", 0), ("video", 1)))
+        _container_probe(_MKV))
     assert not any("audio_subs.mkv" in " ".join(a) for a in ran)
     merge, = merges
-    assert merge[1:] == ["-o", str(enc.output), "--title", "",
-                         str(enc.tempdir / "video_only.mkv"), *_SOURCE_ONLY,
-                         str(enc.info.path)]
+    assert merge[1:] == ["-o", str(enc.output), "--title", "", *_video_in(enc),
+                         *_SOURCE_ONLY, str(enc.info.path)]
     enc._run = (lambda self, args, timeout=None:
                 _probe_json(("video", set()), ("attachment", set()))).__get__(enc)
     assert enc._has_audio_or_subs("x.mkv") is False
@@ -3627,6 +3651,156 @@ def test_a_video_only_source_lends_mkvmerge_its_attachments_not_its_title(
     assert out["container"]["properties"].get("title") is None
     assert [t["type"] for t in out["tracks"]] == ["video"]
     assert attachments(out) == attachments(src) != []
+
+
+def test_the_svt_version_is_read_off_the_encode_banner(settings, info, plan, tmp_path):
+    """libsvtav1 prints its banner through SVT's own logger, which the shot
+    encode's -loglevel error does not silence. The first one named wins."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._note_svt_version(None)
+    enc._note_svt_version("Svt[info]: -------------------------------------------\n")
+    assert enc._svt_version is None
+    assert enc._encoder_tags()["ENCODER"] == "SVT-AV1"
+    enc._note_svt_version("Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v4.2.0\n"
+                          "Svt[info]: SVT [build]  :\tGCC 12.2.0\t 64 bit\n")
+    enc._note_svt_version("Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v9.9.9\n")
+    assert enc._encoder_tags()["ENCODER"] == "SVT-AV1 v4.2.0"
+
+
+def test_the_encoding_settings_give_the_crf_range_and_what_svt_was_told(
+        settings, info, tmp_path):
+    plan = TranscodePlan()
+    plan.params = VideoParams(engine="optimizer", target_quality="95-97",
+                              target_metric="vmaf", preset=4, film_grain=8,
+                              keyint=240)
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._final_crfs = {0: 33.0, 1: 21.0, 2: 27.0}
+    assert enc._encoder_tags()["ENCODER_SETTINGS"] == (
+        "preset=4 / crf=21-33 (per shot, 3 shots) / tune=0 / film-grain=8 / "
+        "film-grain-denoise=0 / keyint=240 / pix_fmt=yuv420p10le / "
+        "target=vmaf 95-97")
+    enc._final_crfs = {0: 30.0}
+    assert "crf=30 (per shot, 1 shots)" in enc._encoder_tags()["ENCODER_SETTINGS"]
+
+
+def test_the_encoder_tags_file_is_escaped_xml(settings, info, plan, tmp_path):
+    import xml.etree.ElementTree as ET
+    plan.params.additional_video_params = "--enable-qm 1 --qm-min 0 --x=<&>"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    tags = {s.findtext("Name"): s.findtext("String")
+            for s in ET.parse(enc._encoder_tags_file()).getroot().iter("Simple")}
+    assert tags == enc._encoder_tags()
+    assert "x=<&>" in tags["ENCODER_SETTINGS"]
+
+
+def test_the_ffmpeg_fallback_mux_carries_the_encoder_tags(
+        settings, info, plan, tmp_path, monkeypatch):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    ran = _mux_with(enc, monkeypatch, _probe_json(
+        ("video", {"default"}), ("audio", {"default"})))
+    final, = [a for a in ran if a[-1] == str(enc.output)]
+    tags = enc._encoder_tags()
+    assert final[final.index("-c"):][:2] == ["-c", "copy"]
+    for name, value in tags.items():
+        i = final.index(f"{name}={value}")
+        assert final[i - 1] == "-metadata:s:v:0" and i < final.index("-c")
+
+
+@pytest.mark.skipif(any(_REAL_WHICH(t) is None
+                        for t in ("ffmpeg", "ffprobe", "mkvmerge", "mkvextract")),
+                    reason="needs a real ffmpeg, ffprobe, mkvmerge and mkvextract")
+def test_the_final_mux_keeps_the_sources_chapters_and_tags_as_they_were(
+        settings, plan, tmp_path, monkeypatch):
+    """Through ffmpeg's remux, chapters lost their language and their UIDs,
+    and a remux's series, season and episode tags collapsed into one - two
+    PART_NUMBERs and two IMDB ids cannot share a dictionary. Measured on
+    Shameless S09E07: the season number 9 and the series' IMDB id were gone.
+    mkvmerge copies them from the source as they are. What the video track
+    gets instead of video_only.mkv's ffmpeg stamp is the encoder tags, next
+    to mkvmerge's own statistics."""
+    import subprocess as sp
+    import xml.etree.ElementTree as ET
+    monkeypatch.setattr(shutil, "which", _REAL_WHICH)
+    ffmpeg, mkvmerge = _REAL_WHICH("ffmpeg"), _REAL_WHICH("mkvmerge")
+    mkvextract = _REAL_WHICH("mkvextract")
+    shot = tmp_path / "enc_00000.ivf"
+    try:
+        sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc=size=160x120:rate=5:duration=2", "-c:v", "libsvtav1",
+                "-preset", "12", str(shot)], check=True)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with libsvtav1 to build the shot")
+    tone = tmp_path / "tone.flac"
+    sp.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+            "-i", "sine=duration=2", "-c:a", "flac", str(tone)], check=True)
+    chapters = tmp_path / "chapters.xml"
+    chapters.write_text(
+        '<?xml version="1.0"?><Chapters><EditionEntry>'
+        "<EditionUID>16116198168458289444</EditionUID>"
+        + "".join(f"<ChapterAtom><ChapterUID>{uid}</ChapterUID>"
+                  f"<ChapterTimeStart>00:00:0{i}.000000000</ChapterTimeStart>"
+                  f"<ChapterDisplay><ChapterString>Chapter {i + 1}</ChapterString>"
+                  "<ChapterLanguage>eng</ChapterLanguage></ChapterDisplay>"
+                  "</ChapterAtom>"
+                  for i, uid in enumerate((182801533824566823, 17965014610139902578)))
+        + "</EditionEntry></Chapters>")
+    tags = tmp_path / "tags.xml"
+    tags.write_text(
+        '<?xml version="1.0"?><Tags>' + "".join(
+            f"<Tag><Targets><TargetTypeValue>{level}</TargetTypeValue></Targets>"
+            + "".join(f"<Simple><Name>{k}</Name><String>{v}</String></Simple>"
+                      for k, v in simple) + "</Tag>"
+            for level, simple in (
+                (70, (("IMDB", "tt1586680"), ("TMDB", "tv/34307"))),
+                (60, (("PART_NUMBER", "9"), ("TOTAL_PARTS", "14"))),
+                (50, (("PART_NUMBER", "7"), ("IMDB", "tt8245470"))))) + "</Tags>")
+    source = tmp_path / "movie.mkv"
+    sp.run([mkvmerge, "-q", "-o", str(source), "--title", "Show - S09E07",
+            "--language", "0:eng", str(shot), "--language", "0:eng", str(tone),
+            "--chapters", str(chapters), "--global-tags", str(tags)], check=True)
+    info = MediaInfo(path=source)
+    info.fps = 5.0
+    info.duration = 2.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    enc._final_crfs = {0: 30.0}
+    enc.concat_shots([shot])
+
+    def extract(path, what):
+        out = tmp_path / f"{Path(path).stem}.{what}.xml"
+        sp.run([mkvextract, str(path), what, str(out)], check=True,
+               capture_output=True)
+        return ET.parse(out).getroot()
+
+    def chapter_atoms(path):
+        return [(a.findtext("ChapterUID"), a.findtext("ChapterDisplay/ChapterString"),
+                 a.findtext("ChapterDisplay/ChapterLanguage"))
+                for a in extract(path, "chapters").iter("ChapterAtom")]
+
+    def tag_groups(path):
+        """(target type, track or None, [(name, value), ...]) per Tag."""
+        return [(t.findtext("Targets/TargetTypeValue") or "50",
+                 t.findtext("Targets/TrackUID"),
+                 [(s.findtext("Name"), s.findtext("String"))
+                  for s in t.findall("Simple")])
+                for t in extract(path, "tags").iter("Tag")]
+
+    assert chapter_atoms(enc.output) == chapter_atoms(source) == [
+        ("182801533824566823", "Chapter 1", "eng"),
+        ("17965014610139902578", "Chapter 2", "eng")]
+    global_tags = [(level, simple) for level, track, simple in tag_groups(enc.output)
+                   if track is None]
+    assert global_tags == [(level, simple)
+                           for level, track, simple in tag_groups(source)
+                           if track is None]
+    assert not any(name == "ENCODER" for _, simple in global_tags
+                   for name, _ in simple)
+    video_uid = str(json.loads(sp.run(
+        [mkvmerge, "-J", str(enc.output)], check=True, capture_output=True,
+        text=True).stdout)["tracks"][0]["properties"]["uid"])
+    video = dict(pair for _, track, simple in tag_groups(enc.output)
+                 if track == video_uid for pair in simple)
+    assert {k: video[k] for k in ("ENCODER", "ENCODER_SETTINGS")} == enc._encoder_tags()
+    assert "BPS" in video and "NUMBER_OF_FRAMES" in video
 
 
 def test_scaled_size_derives_the_hw_scale_target(settings, info, plan, tmp_path):
@@ -6367,12 +6541,10 @@ def test_mkvmerge_takes_each_companion_as_an_input_of_its_own(
     enc = make_encoder(settings, info, plan, tmp_path)
     _, merges = _concat_via_mkvmerge(
         enc, monkeypatch, _ass_probe(),
-        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0),
-                          ("attachment", 0)))
+        _container_probe(_MKV))
     merge, = merges
-    assert merge[1:] == ["-o", str(enc.output),
-                         str(enc.tempdir / "video_only.mkv"), "--no-attachments",
-                         str(enc.tempdir / "audio_subs.mkv"),
+    assert merge[1:] == ["-o", str(enc.output), *_video_in(enc),
+                         *_REMUX_TRACKS_ONLY, str(enc.tempdir / "audio_subs.mkv"),
                          "--sub-charset", "0:UTF-8", "--language", "0:chi",
                          "--track-name", "0:简体 (SRT)",
                          "--default-track-flag", "0:yes",
@@ -6456,7 +6628,7 @@ def test_mkvmerge_is_told_nothing_about_the_ass_it_took_the_flag_from(
     enc = make_encoder(settings, info, plan, tmp_path)
     ran, merges = _concat_via_mkvmerge(
         enc, monkeypatch, _ass_probe(),
-        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)))
+        _container_probe(_MKV))
     remux, = _remuxes(ran)
     assert _dispositions(remux)[1:] == [("-disposition:s:0", "0"),
                                         ("-disposition:s:1", "0")]
@@ -6605,7 +6777,7 @@ def test_mkvmerge_is_told_to_put_a_lost_default_back(
                     ("subtitle", {"default"},
                      {"codec_name": "ass",
                       "tags": {"NUMBER_OF_FRAMES": "916"}})),
-        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)),
+        _container_probe(_MKV),
         srt="")
     merge, = merges
     audio_subs = merge.index(str(enc.tempdir / "audio_subs.mkv"))
@@ -6626,7 +6798,7 @@ def test_nothing_is_put_back_for_a_companion_that_took_nothing(
         _probe_json(("video", set()), ("audio", {"default"}),
                     ("subtitle", set(), {"codec_name": "ass",
                                          "tags": {"NUMBER_OF_FRAMES": "916"}})),
-        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)),
+        _container_probe(_MKV),
         srt="")
     merge, = merges
     assert "--default-track-flag" not in merge
@@ -7463,7 +7635,7 @@ def test_an_ocr_that_fails_hands_the_default_flag_back(
     _stub_ocr(monkeypatch, ok=False)
     _, merges = _concat_via_mkvmerge(
         enc, monkeypatch, _pgs_probe(),
-        _attachment_probe(_MKV, ("video", 0), ("audio", 0), ("subtitle", 0)))
+        _container_probe(_MKV))
     merge, = merges
     # audio at track 0, so the PGS (the output's s:1) is track 2
     assert "--default-track-flag" in merge

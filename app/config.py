@@ -745,6 +745,19 @@ class Hdr(BaseModel):
     default_max_cll: str = "1000,400"
 
 
+class Metadata(BaseModel):
+    # Take release groups' and sites' signatures out of the output's title,
+    # tags, track names and attachments (see app/release_ads.py).
+    strip_ads: bool = True
+    # What counts as a signature besides a URL: whole words, case-insensitive,
+    # a space also matching a dot or a dash ("Ben The Men" = "BEN.THE.MEN").
+    # The defaults are the groups and sites found signing files in the library.
+    ad_tokens: List[str] = Field(default_factory=lambda: [
+        "BTM", "Ben The Men", "RARBG", "PSA", "PSArips", "SWTYBLZ", "JAKET789",
+        "HSaber", "Z@X", "HHWEB", "3MWEB", "ZmWeb", "ZmPT", "AilMWeb", "bdys",
+        "哔嘀影视", "Rainbow Island"])
+
+
 class Transcode(BaseModel):
     video: VideoParams = Field(default_factory=VideoParams)
     # Presets named in config. Keys used by CLI/API as `--preset name`.
@@ -756,6 +769,7 @@ class Transcode(BaseModel):
     default_preset: str = "balanced"
     dovi: DolbyVision = Field(default_factory=DolbyVision)
     hdr: Hdr = Field(default_factory=Hdr)
+    metadata: Metadata = Field(default_factory=Metadata)
     optimizer: OptimizerSettings = Field(default_factory=OptimizerSettings)
     # config.yaml's optimizer settings before the user's overrides land on
     # them: what "restore defaults" restores, and what the settings page

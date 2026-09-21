@@ -998,6 +998,11 @@ class ShotEncoder:
         self._mkvmerge_ver: Optional[str] = None
         self.subtitles_dropped = 0
         self.subtitles_added = 0
+        # What the video track's encoder tags say (see _encoder_tags): the
+        # SVT-AV1 build as its own banner names it, and the CRF each shot
+        # went out at.
+        self._svt_version: Optional[str] = None
+        self._final_crfs: Dict[int, float] = {}
         nodes = _render_nodes()
         self._gpu_vram = VramBudget(self._vram_budget_mb(), self._gpu_workers(),
                                     _render_pdev(nodes[0]) if nodes else None)
@@ -5082,7 +5087,7 @@ class ShotEncoder:
             args += ["-g", str(self.video.keyint), "-keyint_min", str(self.video.keyint)]
         args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in svt.items())]
         args += ["-pix_fmt", self._pix_fmt(), "-f", "ivf", str(dst)]
-        self._run(args, timeout=7200)
+        self._note_svt_version(self._run(args, timeout=7200))
         if not dst.exists() or dst.stat().st_size == 0:
             raise TranscodeError(f"shot {idx} produced no output")
         self._assert_shot_length(idx, dst, s1 - s0)
@@ -5173,6 +5178,76 @@ class ShotEncoder:
         if self.opt.fractional_crf:
             return f"{crf:g}"
         return str(round(crf))
+
+    # libsvtav1 prints this through SVT's own logger, which -loglevel error
+    # does not silence: "Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v4.2.0"
+    _SVT_BANNER = re.compile(r"SVT-AV1 Encoder Lib (v[\w.+-]+)")
+
+    def _note_svt_version(self, output: object) -> None:
+        """Remember the SVT-AV1 version a shot encode's banner names.
+
+        Read off the encode itself rather than asked of SvtAv1EncApp, so it is
+        the library that actually wrote the bitstream.
+        """
+        if self._svt_version is None and isinstance(output, str):
+            m = self._SVT_BANNER.search(output)
+            if m:
+                self._svt_version = m.group(1)
+
+    def _encoder_tags(self) -> Dict[str, str]:
+        """ENCODER and ENCODER_SETTINGS for the output's video track.
+
+        An x264/x265 source shows its encoder and settings in MediaInfo
+        because those encoders write them into the bitstream (an SEI). AV1
+        has no such place and SVT-AV1 writes nothing of the kind, so the
+        output's video track said nothing about how it was made. MediaInfo
+        reads the Matroska track tags instead: ENCODER is its "Writing
+        library" and ENCODER_SETTINGS its "Encoding settings" (measured on
+        24.12 and 26.05).
+
+        The CRF is chosen per shot, so it is given as the range the shots
+        went out at. lp is left out: it is how many threads a shot had, which
+        says nothing about the bitstream.
+        """
+        parts = [f"preset={self.video.preset}"]
+        if self._final_crfs:
+            crfs = sorted(self._final_crfs.values())
+            lo, hi = self._fmt_crf(crfs[0]), self._fmt_crf(crfs[-1])
+            parts.append(f"crf={lo if lo == hi else f'{lo}-{hi}'} "
+                         f"(per shot, {len(crfs)} shots)")
+        parts += [f"{k}={v}" for k, v in _svt_params_dict(self.video).items()]
+        if self.video.keyint:
+            parts.append(f"keyint={self.video.keyint}")
+        parts.append(f"pix_fmt={self._pix_fmt()}")
+        parts.append(f"target={self.metric} {(self.video.target_quality or '').strip()}")
+        return {"ENCODER": (f"SVT-AV1 {self._svt_version}" if self._svt_version
+                            else "SVT-AV1"),
+                "ENCODER_SETTINGS": " / ".join(parts)}
+
+    def _encoder_tags_file(self) -> Optional[Path]:
+        """_encoder_tags as a tags file for mkvmerge's --tags, or None.
+
+        mkvmerge adds its statistics tags (BPS, DURATION, NUMBER_OF_FRAMES,
+        NUMBER_OF_BYTES) to the same track alongside these (measured, v82).
+        mkvpropedit could not add them afterwards: its --tags replaces a
+        track's tags whole, statistics included.
+        """
+        from xml.sax.saxutils import escape
+
+        simple = "".join(
+            f"<Simple><Name>{escape(k)}</Name><String>{escape(v)}</String></Simple>"
+            for k, v in self._encoder_tags().items())
+        path = self.tempdir / "video_tags.xml"
+        try:
+            path.write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n<Tags><Tag><Targets>'
+                f"<TargetTypeValue>50</TargetTypeValue></Targets>{simple}"
+                "</Tag></Tags>\n", encoding="utf-8")
+        except OSError as e:
+            logger.warning("could not write the encoder tags ({}); the video "
+                           "track goes out without them", e)
+            return None
+        return path
 
     # ---------- phase 4b: verify what was actually delivered ----------
     def _verify_sample(self, n_shots: int, want: int) -> List[int]:
@@ -6132,7 +6207,7 @@ class ShotEncoder:
             # to the input size. Under a container memory limit that is an
             # OOM kill at the very last step, after the whole encode is done.
             # Attachments alone do not need this pass: mkvmerge takes them from
-            # the source itself (see _source_attachments).
+            # the source itself (see _matroska_source).
             logger.info("optimizer: source has no audio or subtitle streams; "
                         "muxing video only")
             audio_subs = None
@@ -6236,25 +6311,38 @@ class ShotEncoder:
         # rebuilds the container so the same bitstream plays and seeks fine.
         mkvmerge = self.settings.tools.mkvmerge
         if shutil.which(mkvmerge):
-            # A Matroska source hands its attachments straight to mkvmerge,
-            # which copies every one exactly, UID included. The ffmpeg copy in
-            # audio_subs.mkv cannot: matroskadec turns an image/gif, jpeg, png
-            # or tiff attachment into an attached_pic video stream that no
-            # "-map 0:t" reaches, matroskaenc gives every attachment a new UID,
-            # and matroskadec's 256MB cap on a binary element (EBML_BIN) loses
-            # the attachment over it and every one after. Measured, mkvmerge
-            # reads only the header of such an input: 10MB of a 613MB file.
-            attachments_from = (audio_src if self._source_attachments(audio_src)
-                                else None)
+            # A Matroska source hands its attachments, chapters and global
+            # tags straight to mkvmerge, which copies them exactly. The ffmpeg
+            # copy in audio_subs.mkv cannot. For attachments: matroskadec turns
+            # an image/gif, jpeg, png or tiff attachment into an attached_pic
+            # video stream that no "-map 0:t" reaches, matroskaenc gives every
+            # attachment a new UID, and matroskadec's 256MB cap on a binary
+            # element (EBML_BIN) loses the attachment over it and every one
+            # after. For chapters: every ChapterLanguage came out "und" and
+            # the edition and chapter UIDs new. For tags: ffmpeg keeps one flat
+            # dictionary per file, so a remux's series (70), season (60) and
+            # episode (50) tags collapse into one, and where two share a name
+            # only one survives - measured on Shameless S09E07, the series'
+            # IMDB id and the season's PART_NUMBER 9 were lost to the
+            # episode's. Measured, mkvmerge reads only the header of such an
+            # input and seeks to its tags: 10MB of a 613MB file, 6MB of a
+            # 2.3GB one, the same with the chapters and tags as without.
+            meta_from = audio_src if self._matroska_source(audio_src) else None
+            video_tags = self._encoder_tags_file()
             if self._mkvmerge_mux(mkvmerge, video_only, audio_subs,
-                                  attachments_from, companions, restored):
+                                  meta_from, companions, restored, video_tags):
                 return
-            if attachments_from is not None:
+            if meta_from is not None or video_tags is not None:
                 # e.g. a source mkvmerge cannot parse (exit 2). What
-                # audio_subs.mkv carries still gets through, and the container
-                # rebuild Plex needs is kept.
-                logger.warning("mkvmerge failed with {} as an attachment source; "
-                               "muxing again without it", Path(audio_src).name)
+                # audio_subs.mkv carries still gets through, its flattened
+                # chapters and tags included, and the container rebuild Plex
+                # needs is kept. The encoder tags stay out of it too: the
+                # retry is the mux as it was before either, so that neither
+                # can send a job to the ffmpeg mux below.
+                logger.warning("mkvmerge failed with {} as the source of its "
+                               "attachments, chapters and tags, or with the "
+                               "encoder tags; muxing again without them",
+                               Path(audio_src).name)
                 if self._mkvmerge_mux(mkvmerge, video_only, audio_subs,
                                       None, companions, restored):
                     return
@@ -6288,6 +6376,8 @@ class ShotEncoder:
         # the companions come last, carrying the language, title and flags of
         # the ASS track each was made from
         base += self._companion_metadata(audio_src, companions)
+        for name, value in self._encoder_tags().items():
+            base += ["-metadata:s:v:0", f"{name}={value}"]
         base += ["-c", "copy"]
         try:
             self._run(base + [str(self.output)], timeout=1800)
@@ -6316,7 +6406,7 @@ class ShotEncoder:
         """Whether `source` has audio, or a subtitle the remux will keep.
 
         Attachments do not count. mkvmerge takes every one of them from the
-        source itself (see _source_attachments), images and UIDs included,
+        source itself (see _matroska_source), images and UIDs included,
         which the remux's copy could not; for attachments alone that copy
         would serve only the ffmpeg fallback mux.
 
@@ -6335,35 +6425,28 @@ class ShotEncoder:
             return True
         return bool(plan.audio) or bool(plan.kept)
 
-    def _source_attachments(self, source: str) -> bool:
-        """Whether `source` is a Matroska file with attachments, for the final
-        mkvmerge mux to take straight from it.
+    def _matroska_source(self, source: str) -> bool:
+        """Whether `source` is a Matroska file, for the final mkvmerge mux to
+        take its attachments, chapters and global tags straight from it.
 
-        ffprobe lists one as an "attachment" stream - except that matroskadec
-        makes an image/gif, jpeg, png or tiff attachment a video stream flagged
-        attached_pic. Both count. Only Matroska is taken this way: it is the
-        case measured, and elsewhere an attached_pic is cover art such as an
-        mp4's covr, not an attachment.
+        Only Matroska is taken this way: it is the case measured, an mp4's
+        chapters have no language to lose, and elsewhere an attached_pic is
+        cover art such as an mp4's covr, not an attachment.
 
-        Taken as none when ffprobe cannot say: the remux's copy still carries
-        the fonts, where there is a remux.
+        Taken as not Matroska when ffprobe cannot say: the remux's copy still
+        carries the fonts, chapters and tags, flattened, where there is a
+        remux.
         """
         try:
             out = self._run([self.settings.tool_path("ffprobe"), "-v", "error",
-                             "-show_entries",
-                             "format=format_name:stream=codec_type"
-                             ":stream_disposition=attached_pic",
+                             "-show_entries", "format=format_name",
                              "-of", "json", source], timeout=120)
             # _run folds stderr in: start at the JSON, past any error lines
             data, _ = json.JSONDecoder().raw_decode(out, out.index("{"))
-            if "matroska" not in data["format"]["format_name"].split(","):
-                return False
-            return any(stream["codec_type"] == "attachment"
-                       or stream["disposition"]["attached_pic"]
-                       for stream in data["streams"])
+            return "matroska" in data["format"]["format_name"].split(",")
         except (TranscodeError, FileNotFoundError, ValueError, KeyError,
                 TypeError, AttributeError) as e:
-            logger.warning("could not probe {} for attachments ({}); carrying "
+            logger.warning("could not probe the container of {} ({}); carrying "
                            "only what the remux copies", Path(source).name, e)
             return False
 
@@ -6385,9 +6468,10 @@ class ShotEncoder:
 
     def _mkvmerge_mux(self, mkvmerge: str, video_only: Path,
                       audio_subs: Optional[Path],
-                      attachments_from: Optional[str] = None,
+                      meta_from: Optional[str] = None,
                       companions: Optional[List[SubStream]] = None,
-                      remux_flags: Optional[List[str]] = None) -> bool:
+                      remux_flags: Optional[List[str]] = None,
+                      video_tags: Optional[Path] = None) -> bool:
         """Final mux with mkvmerge. Returns True on a valid output file.
 
         `companions` are sanitised .srt files to add as tracks of their own,
@@ -6400,41 +6484,51 @@ class ShotEncoder:
         _restored_defaults). An mkvmerge option applies to the file that
         FOLLOWS it, so they go with that input and not with the companions.
 
-        `attachments_from` is a source to take every attachment from, and
-        nothing else: its tracks, chapters and tags are audio_subs.mkv's
-        already. audio_subs.mkv's own attachments are then left out. They are
-        ffmpeg's copies of the same files, and mkvmerge keeps the first of two
-        with the same name, description and size from different files
-        (add_attachment) - measured, the source's UIDs were lost without
-        --no-attachments. The source also offers mkvmerge its segment title,
-        which the first input to have one sets (maybe_set_segment_title). With
-        audio_subs.mkv that is the title it already carries. Without it, a
-        video-only source would add its title (e.g. "DV.HDR10.PLUS") to an
-        output that never had one. An explicit empty --title prevents that:
-        measured with v82, the output has no title and keeps the attachments
-        and their UIDs.
+        `meta_from` is a Matroska source to take every attachment, the
+        chapters and the global tags from, and nothing else: its tracks are
+        audio_subs.mkv's already, and so are its track tags. audio_subs.mkv's
+        own attachments, chapters and global tags are then left out. They are
+        ffmpeg's copies of the same things. For attachments, mkvmerge keeps
+        the first of two with the same name, description and size from
+        different files (add_attachment) - measured, the source's UIDs were
+        lost without --no-attachments. For chapters and tags, mkvmerge would
+        merge both copies into the output. The source also offers mkvmerge
+        its segment title, which the first input to have one sets
+        (maybe_set_segment_title). With audio_subs.mkv that is the title it
+        already carries. Without it, a video-only source would add its title
+        (e.g. "DV.HDR10.PLUS") to an output that never had one. An explicit
+        empty --title prevents that: measured with v82, the output has no
+        title and keeps the attachments and their UIDs.
+
+        video_only.mkv's global tags are always left out: all it has is
+        ffmpeg's own ENCODER stamp, which MediaInfo appended to the output's
+        "Writing library" ("... / Lavf63.1.101"). `video_tags` are the video
+        track's own tags instead (see _encoder_tags_file).
         """
         try:
             if self.output.exists():
                 self.output.unlink()
             inputs: List[str] = []
-            if audio_subs is None and attachments_from is not None:
+            if audio_subs is None and meta_from is not None:
                 inputs += ["--title", ""]
+            inputs.append("--no-global-tags")
+            if video_tags is not None:
+                inputs += ["--tags", f"0:{video_tags}"]
             lead_ms = int(round(self._mux_lead(audio_subs) * 1000))
             if lead_ms > 0:
                 # --sync applies to the track of the input that FOLLOWS it
                 inputs += ["--sync", f"0:{lead_ms}"]
             inputs.append(str(video_only))
             if audio_subs is not None:
-                if attachments_from is not None:
-                    inputs.append("--no-attachments")
+                if meta_from is not None:
+                    inputs += ["--no-attachments", "--no-chapters",
+                               "--no-global-tags"]
                 inputs += remux_flags or []
                 inputs.append(str(audio_subs))
                 inputs += self._companion_inputs(companions or [])
-            if attachments_from is not None:
+            if meta_from is not None:
                 inputs += ["--no-video", "--no-audio", "--no-subtitles",
-                           "--no-buttons", "--no-track-tags", "--no-chapters",
-                           "--no-global-tags", attachments_from]
+                           "--no-buttons", "--no-track-tags", meta_from]
             proc = subprocess.run(
                 [mkvmerge, "-o", str(self.output), *inputs],
                 capture_output=True, text=True, timeout=1800,
@@ -6483,6 +6577,7 @@ class ShotEncoder:
             # encoded at, which is not always what its own probes picked
             self._dataset_write({"type": "crfs",
                                  "final": {str(i): chosen[i] for i in sorted(chosen)}})
+            self._final_crfs = dict(chosen)
 
             self._stage("encoding", 0.0)
             ivf_paths = self.encode_all(shots, chosen)

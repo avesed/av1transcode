@@ -253,6 +253,48 @@ def cancel(
 
 
 @app.command()
+def retag(
+    paths: List[Path] = typer.Argument(..., help="finished .mkv files, or directories to search"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Write an existing output's header again, the way a new encode's is.
+
+    What finish_metadata writes, for files made before it did: the video
+    track's default flag, bit depth, chroma subsampling and siting, colour
+    description, and the HDR10 metadata the AV1 bitstream actually carries in
+    place of a configured default; and the release groups' signatures taken
+    out of the title, tags, track names and attachments. Header only, in
+    place, and only on files whose video is AV1 - a directory can hold sources
+    too. Without the source there is no language, chapters or tags to take
+    back."""
+    from app.analyzer import analyze
+    from app.transcoder import finish_metadata
+
+    settings = load_settings(config)
+    files: List[Path] = []
+    for p in paths:
+        if p.is_dir():
+            files += sorted(p.rglob("*.mkv"))
+        elif p.is_file():
+            files.append(p)
+        else:
+            typer.echo(f"not found: {p}", err=True)
+    failed = 0
+    for f in files:
+        info = analyze(settings, str(f))
+        if info is None or not info.is_av1:
+            typer.echo(f"skipped (not AV1): {f}")
+            continue
+        if finish_metadata(settings, f):
+            typer.echo(f"retagged {f}")
+        else:
+            failed += 1
+            typer.echo(f"FAILED (see the log): {f}", err=True)
+    if failed:
+        raise typer.Exit(1)
+
+
+@app.command()
 def presets(config: Optional[Path] = typer.Option(None, "--config", "-c")) -> None:
     """Show current encode presets."""
     settings = load_settings(config)

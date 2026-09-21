@@ -411,6 +411,34 @@ transcode:
     default_master_display: "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
     default_max_cll: "1000,400"
 
+  metadata:
+    strip_ads: true            # 清掉压制组/网站在输出元数据里打的广告: 标题、全局 tags、
+                               # 轨道名、附件(字体永远不删)。标题是发布名(无空格、带 2160p/
+                               # WEB-DL/x265 这类词)也删, 那本来就不是 AV1 输出该有的信息。
+                               # 全局 tags 里 COMMENT/COPYRIGHT/UPLOADER/GROUP/MUXER/ENCODER
+                               # 按名字删 —— 库里扫到的这些字段全是签名或封装器戳。
+                               # IMDB/TMDB/TVDB、季/集编号、简介、章节都不动。
+    ad_tokens:                 # 除网址外算作广告的词: 整词匹配、不分大小写, 空格也匹配点和
+                               # 横杠("Ben The Men" 同时匹配 "BEN.THE.MEN")。默认值是
+                               # 2026-09-21 在库里(每部剧抽 2 个源)实际扫到的组名和站名。
+      - BTM
+      - Ben The Men
+      - RARBG
+      - PSA
+      - PSArips
+      - SWTYBLZ
+      - JAKET789
+      - HSaber
+      - Z@X
+      - HHWEB
+      - 3MWEB
+      - ZmWeb
+      - ZmPT
+      - AilMWeb
+      - bdys
+      - 哔嘀影视
+      - Rainbow Island
+
 web:
   enabled: true
   host: 0.0.0.0

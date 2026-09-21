@@ -64,6 +64,7 @@ python -m app.cli process x.mkv # 投递单文件
 python -m app.cli status        # 查看进度
 python -m app.cli check         # 检查工具齐全度
 python -m app.cli presets
+python -m app.cli retag DIR    # 按新规则重写已有 AV1 输出的元数据(只改 header, 跳过非 AV1)
 ```
 
 ### 测试

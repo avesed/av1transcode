@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from loguru import logger
 
-from app.analyzer import MediaInfo, analyze
+from app.analyzer import MediaInfo, _mastering_display, _max_cll, analyze
 from app.config import Settings, VideoParams
 from app.decisions import TranscodePlan
 
@@ -536,13 +538,9 @@ def run_full_transcode(
                     pass
             raise
 
-        # --- optional HDR metadata tag on the mkv ---
-        # Keyed on what the plan tags, not on the source: a DV 8.2 source has
-        # an SDR base and nothing to write (see decisions.dv_base_signal).
-        if settings.transcode.hdr.preserve and (
-                plan.color_trc in ("smpte2084", "arib-std-b67")
-                or plan.master_display or plan.max_cll):
-            _colorpropedit_hdr(settings, output, plan)
+        # --- the header: the video track's flags, language, colour and HDR,
+        # and no release group's advertising ---
+        finish_metadata(settings, output, info, plan)
     finally:
         # NB: a finally, not the tail of the happy path. Every intermediate
         # here is source-sized or larger (the per-shot encodes under tempdir,
@@ -751,58 +749,220 @@ def _parse_master_display(md: str) -> Optional[dict]:
     return fields
 
 
-def _colorpropedit_hdr(settings: Settings, output: Path, plan: TranscodePlan) -> None:
-    """Write HDR10 colour + display metadata onto the MKV container.
+# ffmpeg's colour names -> the ISO/IEC 23091-2 numbers Matroska's Colour
+# element takes (the same numbers an AV1 sequence header carries)
+_MKV_PRIMARIES = {"bt709": 1, "bt470m": 4, "bt470bg": 5, "smpte170m": 6,
+                  "smpte240m": 7, "film": 8, "bt2020": 9, "smpte428": 10,
+                  "smpte431": 11, "smpte432": 12, "ebu3213": 22, "jedec-p22": 22}
+_MKV_TRANSFER = {"bt709": 1, "gamma22": 4, "gamma28": 5, "smpte170m": 6,
+                 "smpte240m": 7, "linear": 8, "log100": 9, "log316": 10,
+                 "iec61966-2-4": 11, "bt1361e": 12, "iec61966-2-1": 13,
+                 "bt2020-10": 14, "bt2020-12": 15, "smpte2084": 16,
+                 "smpte428": 17, "arib-std-b67": 18}
+_MKV_MATRIX = {"gbr": 0, "bt709": 1, "fcc": 4, "bt470bg": 5, "smpte170m": 6,
+               "smpte240m": 7, "ycgco": 8, "bt2020nc": 9, "bt2020c": 10,
+               "smpte2085": 11, "chroma-derived-nc": 12, "chroma-derived-c": 13,
+               "ictcp": 14}
+_MKV_RANGE = {"tv": 1, "pc": 2}
+# chroma_location -> ChromaSitingHorz, ChromaSitingVert (1 = collocated with
+# the left / top luma sample, 2 = half-way): the conversion matroskaenc makes
+_MKV_SITING = {"left": (1, 2), "center": (2, 2), "topleft": (1, 1), "top": (2, 1)}
+# a pix_fmt's subsampling -> ChromaSubsamplingHorz, ChromaSubsamplingVert
+_MKV_SUBSAMPLING = {"420": (1, 1), "422": (1, 0), "444": (0, 0)}
 
-    AV1 sequence headers default to BT.709, so for a BT.2020/PQ encode we must
-    tag primaries/transfer/matrix at container level or players will show wrong
-    colors. Uses the ISO colour numbers mkvmerge/mkvpropedit expect. Note that
-    mkvtoolnix >= 74 dropped the legacy 'master-display' property in favour of
-    individual chromaticity/luminance fields.
+
+def _first_frame(settings: Settings, output: Path) -> Optional[dict]:
+    """The output's first video frame as ffprobe decodes it, or None.
+
+    Decoded rather than read off the stream header, because the stream header
+    is the container, and the container is what gets written from this. A
+    decoded frame carries the AV1 sequence header's colour description and
+    the HDR metadata OBUs SVT-AV1 wrote, and libavcodec prefers those to the
+    container's: measured on Stranger Things S01E01, the frame reports MaxCLL
+    338/80 where the stream header reports the container's 1000/400. One
+    packet is decoded.
     """
-    md = plan.master_display
-    cll = plan.max_cll
-    cmd = [settings.tool_path("mkvpropedit"), str(output), "--edit", "track:v1"]
-
-    # ISO 23091-2 values for HDR10 (BT.2020, PQ, non-constant luminance)
-    if "smpte2084" in plan.color_trc or "arib-std-b67" in plan.color_trc:
-        cmd += [
-            "--set", "colour-primaries=9",      # BT.2020
-            "--set", "colour-transfer-characteristics="
-            + ("18" if "arib-std-b67" in plan.color_trc else "16"),  # HLG=18, PQ=16
-            "--set", "colour-matrix-coefficients=9",  # BT.2020 non-constant
-            "--set", "colour-range=1",          # limited range
-        ]
-    if md:
-        fields = _parse_master_display(md)
-        if not fields:
-            # Don't ship an HDR10 file with no mastering display at all just
-            # because the source spelled it in a form we could not read: the
-            # configured default is a far better answer than nothing.
-            fallback = settings.transcode.hdr.default_master_display
-            logger.warning("Could not parse master-display string {!r}; "
-                           "falling back to the configured default", md)
-            fields = _parse_master_display(fallback) if fallback else None
-        if fields:
-            for name, value in fields.items():
-                cmd += ["--set", f"{name}={_md_fmt(value)}"]
-    if cll:
-        try:
-            max_cll, max_fall = (float(v) for v in str(cll).split(","))
-            cmd += ["--set", f"max-content-light={int(max_cll)}"]
-            cmd += ["--set", f"max-frame-light={int(max_fall)}"]
-        except ValueError:
-            logger.warning("Could not parse MaxCLL string: {}", cll)
     try:
-        # NB: mkvpropedit is all-or-nothing - one rejected --set value aborts
-        # the whole edit and the file keeps NO colour tags at all, so the
-        # result has to be checked rather than discarded.
-        proc = subprocess.run(cmd, check=False, capture_output=True, text=True,
-                              timeout=120)
-        if proc.returncode != 0:
-            logger.warning(
-                "mkvpropedit did not tag {} (rc={}): {} - the output keeps no "
-                "HDR colour metadata", output.name, proc.returncode,
-                ((proc.stdout or "") + (proc.stderr or "")).strip()[-300:])
-    except Exception as e:  # noqa: BLE001
-        logger.warning("mkvpropedit failed (ignored): {}", e)
+        proc = subprocess.run(
+            [settings.tool_path("ffprobe"), "-v", "error", "-select_streams", "v:0",
+             "-read_intervals", "%+#1", "-show_frames", "-show_entries",
+             "frame=pix_fmt,color_range,color_space,color_primaries,"
+             "color_transfer,chroma_location:frame_side_data",
+             "-of", "json", str(output)],
+            capture_output=True, text=True, timeout=120)
+        frames = json.loads(proc.stdout or "{}").get("frames") or []
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError) as e:
+        logger.warning("could not read the first frame of {} ({}); its colour "
+                       "comes from the plan alone", output.name, e)
+        return None
+    return frames[0] if frames and isinstance(frames[0], dict) else None
+
+
+def _colour_edits(frame: dict) -> Dict[str, int]:
+    """Matroska Colour fields for what the decoded `frame` says, leaving out
+    whatever it leaves unspecified."""
+    fields: Dict[str, int] = {}
+    for key, table, name in (
+            ("color_range", _MKV_RANGE, "colour-range"),
+            ("color_primaries", _MKV_PRIMARIES, "colour-primaries"),
+            ("color_transfer", _MKV_TRANSFER, "colour-transfer-characteristics"),
+            ("color_space", _MKV_MATRIX, "colour-matrix-coefficients")):
+        value = table.get(str(frame.get(key) or ""))
+        if value is not None:
+            fields[name] = value
+    m = re.match(r"yuvj?(420|422|444)p(\d+)?", str(frame.get("pix_fmt") or ""))
+    if m:
+        fields["colour-bits-per-channel"] = int(m.group(2) or 8)
+        horz, vert = _MKV_SUBSAMPLING[m.group(1)]
+        fields["chroma-subsample-horizontal"] = horz
+        fields["chroma-subsample-vertical"] = vert
+    siting = _MKV_SITING.get(str(frame.get("chroma_location") or ""))
+    if siting:
+        fields["chroma-siting-horizontal"], fields["chroma-siting-vertical"] = siting
+    return fields
+
+
+def finish_metadata(settings: Settings, output: Path,
+                    info: Optional[MediaInfo] = None,
+                    plan: Optional[TranscodePlan] = None) -> bool:
+    """Write the output's header in its final form, in one mkvpropedit run:
+    the video track in full (see _video_track_edits), and the source's
+    release group signatures taken out (see release_ads). True when every
+    edit took.
+
+    One run rather than two, because each is an in-place write to a file
+    that has already been verified.
+
+    mkvpropedit rewrites the header in place, and is all-or-nothing per
+    command: one rejected value aborts every edit in it. So the edits go in
+    groups, and when the whole command fails each group is tried on its own -
+    a bad mastering display then costs the mastering display, not the flags.
+    """
+    if output.suffix.lower() != ".mkv":
+        return True
+    groups = _video_track_edits(settings, output, info, plan)
+    if not settings.transcode.metadata.strip_ads:
+        return _propedit(settings, output, groups)
+    from app.release_ads import ad_edits
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="av1meta_") as scratch:
+            return _propedit(settings, output,
+                             groups + ad_edits(settings, output, Path(scratch)))
+    except Exception as e:  # noqa: BLE001 - never fail a verified output over this
+        logger.warning("could not take the release ads out of {} ({}); "
+                       "writing the video track only", output.name, e)
+        return _propedit(settings, output, groups)
+
+
+def _propedit(settings: Settings, output: Path, groups: List[List[str]]) -> bool:
+    """Apply every group of mkvpropedit arguments, each on its own when the
+    whole command fails. True when all of them took."""
+    def run(args: List[str]) -> Optional[str]:
+        """None on success, else what went wrong."""
+        try:
+            proc = subprocess.run(
+                [settings.tool_path("mkvpropedit"), str(output), *args],
+                check=False, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            return str(e)
+        if proc.returncode == 0:
+            return None
+        return (f"rc={proc.returncode}: "
+                + ((proc.stdout or "") + (proc.stderr or "")).strip()[-300:])
+
+    if not groups:
+        return True
+    error = run([arg for group in groups for arg in group])
+    if error is None:
+        return True
+    logger.warning("mkvpropedit did not edit {} ({}); retrying each group of "
+                   "edits on its own", output.name, error)
+    ok = True
+    for group in groups:
+        error = run(group)
+        if error is not None:
+            ok = False
+            logger.warning("mkvpropedit left {} without {} ({})", output.name,
+                           " ".join(a.split("=", 1)[0] for a in group), error)
+    return ok
+
+
+def _video_track_edits(settings: Settings, output: Path,
+                       info: Optional[MediaInfo] = None,
+                       plan: Optional[TranscodePlan] = None) -> List[List[str]]:
+    """mkvpropedit arguments writing the output's video track header in
+    full - flags, language, colour - one group per kind of edit.
+
+    The video track is a new one, encoded shots concatenated, so nothing of
+    the source's track header survives the mux unless it is written here.
+    Measured on Shameless S09E07 against its source: the track went out with
+    FlagDefault 0 where the source's was 1, language "und" where the
+    source's was eng, and a Colour element holding the range alone.
+
+    The colour description and the HDR static metadata come from the
+    output's own bitstream (see _first_frame), so the container says what
+    the video carries. The plan only fills in what the bitstream leaves out.
+    Before, an HDR plan was written over it, and its MaxCLL was never the
+    source's (see analyzer._max_cll): Stranger Things S01E01 carries 338/80
+    in its AV1 metadata OBUs and said 1000/400 in its container.
+
+    Bit depth and chroma subsampling are written too. MediaInfo before 26.05
+    shows neither for an SVT-AV1 v4 encode, whatever the container says: its
+    AV1 sequence header parser skipped initial_display_delay, which SVT-AV1 v4
+    always writes, lost its place and dropped the header (fixed in
+    MediaInfoLib bd835a3c08, first released in 26.05). Other readers take
+    them from here.
+
+    `info` and `plan` are the source and its plan, when there are any; without
+    them only the bitstream is written back.
+    """
+    frame = _first_frame(settings, output) or {}
+    hdr = settings.transcode.hdr
+    groups: List[List[str]] = [["flag-default=1"]]
+    language = info.video_language if info is not None else ""
+    if language and language != "und":
+        groups.append([f"language={language}"])
+
+    colour = _colour_edits(frame)
+    # The plan's HDR tags, for a bitstream that does not describe itself.
+    # Keyed on what the plan tags, not on the source: a DV 8.2 source has an
+    # SDR base and nothing to write (see decisions.dv_base_signal).
+    if (plan is not None and hdr.preserve
+            and plan.color_trc in ("smpte2084", "arib-std-b67")):
+        colour.setdefault("colour-primaries", 9)                   # BT.2020
+        colour.setdefault("colour-transfer-characteristics",
+                          18 if plan.color_trc == "arib-std-b67" else 16)
+        colour.setdefault("colour-matrix-coefficients", 9)         # BT.2020 NCL
+        colour.setdefault("colour-range", 1)                       # limited
+    if colour:
+        groups.append([f"{k}={v}" for k, v in colour.items()])
+
+    if hdr.preserve:
+        md = _mastering_display(frame)
+        fields = _parse_master_display(md) if md else None
+        if not fields and plan is not None and plan.master_display:
+            fields = _parse_master_display(plan.master_display)
+            if not fields:
+                # Don't ship an HDR10 file with no mastering display at all
+                # just because the source spelled it in a form we could not
+                # read: the configured default is a far better answer than
+                # nothing.
+                logger.warning("Could not parse master-display string {!r}; "
+                               "falling back to the configured default",
+                               plan.master_display)
+                fields = (_parse_master_display(hdr.default_master_display)
+                          if hdr.default_master_display else None)
+        if fields:
+            groups.append([f"{k}={_md_fmt(v)}" for k, v in fields.items()])
+        cll = _max_cll(frame) or (plan.max_cll if plan is not None else None)
+        if cll:
+            try:
+                max_cll, max_fall = (float(v) for v in str(cll).split(","))
+                groups.append([f"max-content-light={int(max_cll)}",
+                               f"max-frame-light={int(max_fall)}"])
+            except ValueError:
+                logger.warning("Could not parse MaxCLL string: {}", cll)
+
+    edit = ["--edit", "track:v1"]
+    return [edit + [a for e in group for a in ("--set", e)] for group in groups]

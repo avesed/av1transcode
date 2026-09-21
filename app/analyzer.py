@@ -60,6 +60,9 @@ class MediaInfo:
     # container start, not the video's.
     format_start: float = 0.0
     video_start: float = 0.0
+    # The video track's language tag, "" when it has none. The encode's video
+    # track is a new one, so this is the only way it gets the source's back.
+    video_language: str = ""
 
     @property
     def video_lead(self) -> float:
@@ -168,8 +171,12 @@ def _mastering_display(stream: dict) -> Optional[str]:
 
 
 def _max_cll(stream: dict) -> Optional[str]:
+    # ffprobe calls it "Content light level metadata". An exact match on
+    # "Content light level" never matched, so every HDR plan fell back to
+    # hdr.default_max_cll and outputs were tagged 1000,400 whatever the
+    # source said.
     for sd in stream.get("side_data_list", []) or []:
-        if sd.get("side_data_type") == "Content light level":
+        if (sd.get("side_data_type") or "").startswith("Content light level"):
             return f"{sd.get('max_content', 0)},{sd.get('max_average', 0)}"
     return None
 
@@ -202,6 +209,7 @@ def analyze(settings: Settings, path: str) -> Optional[MediaInfo]:
             info.height = int(st.get("height") or 0)
             info.video_codec = st.get("codec_name") or ""
             info.is_av1 = info.video_codec == "av1"
+            info.video_language = (st.get("tags") or {}).get("language") or ""
             info.video_start = _seconds(st.get("start_time"))
             info.color.pix_fmt = st.get("pix_fmt")
             info.color.primaries = st.get("color_primaries")

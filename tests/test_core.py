@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -282,29 +283,234 @@ def test_md_fmt_never_uses_scientific_notation():
         assert "e" not in _md_fmt(v).lower(), v
 
 
-def test_colorpropedit_falls_back_when_display_unparseable(settings, monkeypatch, tmp_path):
+def _fake_tagging(monkeypatch, frame, refuse=lambda edits: False):
+    """finish_metadata against a fake ffprobe that decodes `frame`, a file
+    with no release ads to find, and a fake mkvpropedit refusing whatever
+    `refuse` picks. Returns the --set edits of every mkvpropedit run."""
+    import json as _json
+    from app import transcoder
+
+    runs = []
+
+    def fake_run(cmd, **kw):
+        if cmd[0].endswith("ffprobe"):
+            body = _json.dumps({"frames": [frame] if frame else []})
+            return type("R", (), {"returncode": 0, "stdout": body, "stderr": ""})()
+        if cmd[0].endswith(("mkvmerge", "mkvextract")):
+            return type("R", (), {"returncode": 0, "stdout": "{}", "stderr": ""})()
+        edits = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--set"]
+        runs.append(edits)
+        rc = 2 if refuse(edits) else 0
+        return type("R", (), {"returncode": rc, "stdout": "", "stderr": "nope"})()
+
+    monkeypatch.setattr(transcoder.subprocess, "run", fake_run)
+    monkeypatch.setattr(transcoder.Settings, "tool_path", lambda self, n: f"/usr/bin/{n}")
+    return runs
+
+
+# What ffprobe decodes out of Stranger Things S01E01's first frame: SVT-AV1
+# kept the source's HDR10 metadata, MaxCLL 338/80.
+_ST_FRAME = {
+    "pix_fmt": "yuv420p10le", "color_range": "tv", "color_space": "bt2020nc",
+    "color_primaries": "bt2020", "color_transfer": "smpte2084",
+    "chroma_location": "topleft",
+    "side_data_list": [
+        {"side_data_type": "Mastering display metadata",
+         "red_x": "44564/65536", "red_y": "20972/65536",
+         "green_x": "17367/65536", "green_y": "45220/65536",
+         "blue_x": "9830/65536", "blue_y": "3932/65536",
+         "white_point_x": "20493/65536", "white_point_y": "21561/65536",
+         "min_luminance": "2/16384", "max_luminance": "256000/256"},
+        {"side_data_type": "Content light level metadata",
+         "max_content": 338, "max_average": 80}]}
+
+
+def test_finish_metadata_writes_what_the_bitstream_carries(settings, monkeypatch, tmp_path):
+    """The container repeats the bitstream: its MaxCLL of 338/80, not the
+    plan's 1000,400 that went out before."""
+    from app import transcoder
+    from app.decisions import TranscodePlan
+
+    runs = _fake_tagging(monkeypatch, _ST_FRAME)
+    out = tmp_path / "o.mkv"
+    out.touch()
+    info = MediaInfo(path=tmp_path / "src.mkv")
+    info.video_language = "eng"
+    plan = TranscodePlan()
+    plan.color_trc = "smpte2084"
+    plan.master_display = settings.transcode.hdr.default_master_display
+    plan.max_cll = "1000,400"
+    transcoder.finish_metadata(settings, out, info, plan)
+    edits, = runs
+    assert edits[:2] == ["flag-default=1", "language=eng"]
+    assert edits[2:11] == [
+        "colour-range=1", "colour-primaries=9", "colour-transfer-characteristics=16",
+        "colour-matrix-coefficients=9", "colour-bits-per-channel=10",
+        "chroma-subsample-horizontal=1", "chroma-subsample-vertical=1",
+        "chroma-siting-horizontal=1", "chroma-siting-vertical=1"]
+    values = dict(e.split("=", 1) for e in edits)
+    assert float(values["chromaticity-coordinates-red-x"]) == pytest.approx(0.68, abs=1e-4)
+    assert float(values["white-coordinates-x"]) == pytest.approx(0.3127, abs=1e-4)
+    assert values["max-luminance"] == "1000.0"
+    assert edits[-2:] == ["max-content-light=338", "max-frame-light=80"]
+
+
+def test_finish_metadata_says_nothing_the_bitstream_leaves_unspecified(
+        settings, monkeypatch, tmp_path):
+    """An SDR source with no colour description (Shameless S09E07's AVC has
+    none) keeps none: BT.709 would be a guess."""
+    from app import transcoder
+    from app.decisions import TranscodePlan
+
+    runs = _fake_tagging(monkeypatch, {
+        "pix_fmt": "yuv420p10le", "color_range": "tv", "color_space": "unknown",
+        "color_primaries": "unknown", "color_transfer": "unknown",
+        "chroma_location": "left"})
+    out = tmp_path / "o.mkv"
+    out.touch()
+    info = MediaInfo(path=tmp_path / "src.mkv")
+    info.video_language = "und"
+    transcoder.finish_metadata(settings, out, info, TranscodePlan())
+    assert runs == [["flag-default=1", "colour-range=1", "colour-bits-per-channel=10",
+                     "chroma-subsample-horizontal=1", "chroma-subsample-vertical=1",
+                     "chroma-siting-horizontal=1", "chroma-siting-vertical=2"]]
+
+
+def test_finish_metadata_falls_back_to_the_plan_for_a_silent_bitstream(
+        settings, monkeypatch, tmp_path):
     """An unreadable source string must not cost the file its mastering
     display: the configured default is better than nothing."""
     from app import transcoder
     from app.decisions import TranscodePlan
 
-    seen = {}
-
-    def fake_run(cmd, **kw):
-        seen["cmd"] = cmd
-        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
-    monkeypatch.setattr(transcoder.subprocess, "run", fake_run)
-    monkeypatch.setattr(transcoder.Settings, "tool_path", lambda self, n: f"/usr/bin/{n}")
+    runs = _fake_tagging(monkeypatch, None)
     out = tmp_path / "o.mkv"
     out.touch()
     plan = TranscodePlan()
     plan.color_trc = "smpte2084"
     plan.master_display = "totally unparseable"
-    transcoder._colorpropedit_hdr(settings, out, plan)
-    joined = " ".join(seen["cmd"])
-    assert "chromaticity-coordinates-green-x=0.265" in joined
-    assert "max-luminance=1000.0" in joined
+    plan.max_cll = "1000,400"
+    transcoder.finish_metadata(settings, out, None, plan)
+    edits, = runs
+    assert edits[:5] == ["flag-default=1", "colour-primaries=9",
+                         "colour-transfer-characteristics=16",
+                         "colour-matrix-coefficients=9", "colour-range=1"]
+    assert "chromaticity-coordinates-green-x=0.265" in edits
+    assert "max-luminance=1000.0" in edits
+    assert edits[-2:] == ["max-content-light=1000", "max-frame-light=400"]
+
+
+def test_finish_metadata_retries_each_group_when_one_is_refused(
+        settings, monkeypatch, tmp_path):
+    """mkvpropedit is all-or-nothing: one refused value aborts every edit in
+    the command. Tried again group by group, the refusal costs its group."""
+    from app import transcoder
+
+    runs = _fake_tagging(monkeypatch, _ST_FRAME,
+                         refuse=lambda edits: "language=xx-bogus" in edits)
+    out = tmp_path / "o.mkv"
+    out.touch()
+    info = MediaInfo(path=tmp_path / "src.mkv")
+    info.video_language = "xx-bogus"
+    transcoder.finish_metadata(settings, out, info, None)
+    whole, *groups = runs
+    assert [e for g in groups for e in g] == whole
+    assert groups[0] == ["flag-default=1"] and groups[1] == ["language=xx-bogus"]
+    assert len(groups) == 5         # flags, language, colour, mastering, light level
+    assert transcoder.finish_metadata(settings, out, info, None) is False
+
+
+def test_finish_metadata_leaves_hdr_metadata_alone_when_told_to(
+        settings, monkeypatch, tmp_path):
+    from app import transcoder
+
+    settings.transcode.hdr.preserve = False
+    runs = _fake_tagging(monkeypatch, _ST_FRAME)
+    out = tmp_path / "o.mkv"
+    out.touch()
+    transcoder.finish_metadata(settings, out)
+    edits, = runs
+    assert not any(e.startswith(("max-", "chromaticity", "white-")) for e in edits)
+    assert "colour-transfer-characteristics=16" in edits
+    runs.clear()
+    assert transcoder.finish_metadata(settings, tmp_path / "o.mp4") is True
+    assert runs == []
+
+
+def test_analyze_reads_the_content_light_level_and_the_video_language(
+        settings, monkeypatch, tmp_path):
+    """ffprobe calls it "Content light level metadata"; matched against
+    "Content light level", no source's MaxCLL was ever read."""
+    from app import analyzer
+
+    f = tmp_path / "hdr.mkv"
+    f.write_bytes(b"x")
+    monkeypatch.setattr(analyzer, "_ffprobe", lambda s, p: {
+        "format": {"format_name": "matroska", "duration": "60.0"},
+        "streams": [{
+            "codec_type": "video", "codec_name": "hevc", "r_frame_rate": "24/1",
+            "color_transfer": "smpte2084", "tags": {"language": "eng"},
+            "side_data_list": [{"side_data_type": "Content light level metadata",
+                                "max_content": 338, "max_average": 80}]}]})
+    info = analyzer.analyze(settings, str(f))
+    assert info.color.max_cll == "338,80"
+    assert info.video_language == "eng"
+
+
+@pytest.mark.skipif(any(shutil.which(t) is None for t in
+                        ("ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit")),
+                    reason="needs a real ffmpeg, ffprobe, mkvmerge and mkvpropedit")
+def test_finish_metadata_against_the_real_tools(settings, tmp_path):
+    """An SVT-AV1 encode carrying HDR10 metadata, muxed by mkvmerge the way the
+    final mux does - so the container starts out saying nothing but what
+    mkvmerge knows - and tagged against a plan with the configured default
+    MaxCLL, as every HDR plan had."""
+    import json as _json
+    import subprocess as sp
+    from app import transcoder
+    from app.decisions import TranscodePlan
+
+    ivf = tmp_path / "hdr.ivf"
+    try:
+        sp.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc2=size=320x180:rate=24:duration=0.5",
+                "-pix_fmt", "yuv420p10le", "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+                "-color_range", "tv", "-c:v", "libsvtav1", "-preset", "12",
+                "-svtav1-params",
+                "mastering-display=G(0.265,0.690)B(0.150,0.060)R(0.680,0.320)"
+                "WP(0.3127,0.3290)L(1000,0.0001):content-light=338,80",
+                str(ivf)], check=True, capture_output=True)
+    except sp.CalledProcessError:
+        pytest.skip("needs an ffmpeg with libsvtav1")
+    out = tmp_path / "out.mkv"
+    sp.run(["mkvmerge", "-q", "-o", str(out), str(ivf)], check=True)
+    info = MediaInfo(path=tmp_path / "src.mkv")
+    info.video_language = "eng"
+    plan = TranscodePlan()
+    plan.color_trc = "smpte2084"
+    plan.master_display = settings.transcode.hdr.default_master_display
+    plan.max_cll = "1000,400"
+    transcoder.finish_metadata(settings, out, info, plan)
+
+    ident = _json.loads(sp.run(["mkvmerge", "-J", str(out)], check=True,
+                               capture_output=True, text=True).stdout)
+    props = ident["tracks"][0]["properties"]
+    assert props["default_track"] is True and props["language"] == "eng"
+    stream = _json.loads(sp.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(out)],
+        check=True, capture_output=True, text=True).stdout)["streams"][0]
+    assert (stream["color_primaries"], stream["color_transfer"],
+            stream["color_space"], stream["color_range"]) == (
+        "bt2020", "smpte2084", "bt2020nc", "tv")
+    side = {sd["side_data_type"]: sd for sd in stream.get("side_data_list", [])}
+    cll = side["Content light level metadata"]
+    assert (cll["max_content"], cll["max_average"]) == (338, 80)
+    assert "Mastering display metadata" in side
+    if shutil.which("mkvinfo"):
+        header = sp.run(["mkvinfo", str(out)], check=True, capture_output=True,
+                        text=True).stdout
+        assert "Bits per channel: 10" in header
 
 
 def test_optimizer_settings_put_merges_partial_body(settings, monkeypatch):
@@ -936,3 +1142,32 @@ def test_a_truncated_rpu_is_a_failure_however_clean_the_exit(settings, tmp_path,
     # and a short source with the same file is fine - the check is a rate
     monkeypatch.setattr(dovi, "_duration_seconds", lambda s, p: 10.0)
     assert dovi.extract_rpu(settings, src, dest, 7) is True
+
+
+def test_retag_walks_directories_and_touches_only_av1(settings, monkeypatch, tmp_path):
+    """A season directory holds the sources as well as av1/: only AV1 files
+    are rewritten, and a file whose edits did not all take is reported."""
+    from typer.testing import CliRunner
+    from app import analyzer, cli, transcoder
+
+    season = tmp_path / "S1"
+    (season / "av1").mkdir(parents=True)
+    for name in ("av1/E01.mkv", "av1/E02.mkv", "E01.mkv", "E01.rpu", "notes.txt"):
+        (season / name).write_bytes(b"x")
+    single = tmp_path / "movie.mkv"
+    single.write_bytes(b"x")
+
+    def fake_analyze(s, path):
+        info = MediaInfo(path=Path(path))
+        info.is_av1 = "/av1/" in path or path.endswith("movie.mkv")
+        return info
+
+    seen = []
+    monkeypatch.setattr(analyzer, "analyze", fake_analyze)
+    monkeypatch.setattr(transcoder, "finish_metadata",
+                        lambda s, path, *a, **k: seen.append(path) or path.name != "E02.mkv")
+    result = CliRunner().invoke(cli.app, ["retag", str(season), str(single),
+                                          str(tmp_path / "missing.mkv")])
+    assert seen == [season / "av1" / "E01.mkv", season / "av1" / "E02.mkv", single]
+    assert "skipped (not AV1)" in result.output and "not found" in result.output
+    assert "FAILED" in result.output and result.exit_code == 1
