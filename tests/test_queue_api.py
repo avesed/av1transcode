@@ -488,6 +488,18 @@ def _client(settings, store, api_key=""):
     return TestClient(create_app(settings, store, manager))
 
 
+def test_static_files_are_revalidated(settings, store):
+    """A deploy's new fields.js must reach a browser that cached the old one:
+    no-cache on the file, and still on the 304 that answers a revalidation."""
+    client = _client(settings, store)
+    r = client.get("/static/fields.js")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "no-cache"
+    again = client.get("/static/fields.js", headers={"If-None-Match": r.headers["etag"]})
+    assert again.status_code == 304
+    assert again.headers["cache-control"] == "no-cache"
+
+
 def test_optimizer_settings_save_round_trips(settings, store, tmp_path):
     """Saving from the settings page must actually persist.
 

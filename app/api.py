@@ -16,6 +16,23 @@ from app.queue import TranscodeManager
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+class _RevalidatedStatic(StaticFiles):
+    """StaticFiles whose responses say Cache-Control: no-cache.
+
+    Starlette sends ETag and Last-Modified but no Cache-Control, which leaves
+    a browser free to reuse a cached file by heuristic - a tenth of its age
+    since Last-Modified, so days for a file an image build left untouched for
+    a week. That is how a deploy's new settings field stayed invisible behind
+    a cached fields.js until a hard refresh. no-cache still caches; it only
+    makes the browser ask first, and an unchanged file answers with a 304.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeManager") -> FastAPI:
     app = FastAPI(title="AV1 Transcode Archive", version="0.1.0")
     router = APIRouter(prefix="/api")
@@ -388,5 +405,5 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         return HTMLResponse(html.read_text() if html.exists() else "")
 
     app.include_router(router)
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.mount("/static", _RevalidatedStatic(directory=str(STATIC_DIR)), name="static")
     return app
