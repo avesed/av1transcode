@@ -165,7 +165,34 @@ def test_smooth_crfs_disabled_and_single():
     assert opt.smooth_crfs([30.0], max_delta=4.0) == [30.0]
 
 
+def test_smooth_crfs_never_raises_a_crf():
+    # a hard shot between two easy ones: the old two-sided clip gave
+    # [31, 27, 31], shipping the middle shot 5 CRF under its target
+    assert opt.smooth_crfs([31.0, 22.0, 31.0], max_delta=4.0) == [26.0, 22.0, 26.0]
+
+
+def test_smooth_crfs_does_not_follow_the_first_shot():
+    # an episode opening on an easy logo: the forward sweep used to drag the
+    # next shot from 24 up to 46
+    assert opt.smooth_crfs([50.0, 24.0, 25.0, 27.0], max_delta=4.0) == [28.0, 24.0, 25.0, 27.0]
+
+
+def test_smooth_crfs_is_order_independent():
+    crfs = [40.0, 20.0, 45.0, 33.0, 18.0, 50.0, 29.0]
+    fwd = opt.smooth_crfs(crfs, max_delta=4.0)
+    assert opt.smooth_crfs(crfs[::-1], max_delta=4.0) == fwd[::-1]
+    assert all(o <= c for o, c in zip(fwd, crfs))
+    assert all(abs(a - b) <= 4.0 + 1e-9 for a, b in zip(fwd, fwd[1:]))
+
+
+def test_smooth_crfs_pinned_shots_do_not_pull_neighbours():
+    crfs = [30.0, 18.0, 30.0]
+    assert opt.smooth_crfs(crfs, max_delta=4.0) == [22.0, 18.0, 22.0]
+    assert opt.smooth_crfs(crfs, max_delta=4.0, pinned=[False, True, False]) == crfs
+
+
 def test_smooth_chosen(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.crf_smoothing = True
     settings.transcode.optimizer.max_crf_delta = 4.0
     enc = make_encoder(settings, info, plan, tmp_path)
     out = enc.smooth_chosen({0: 22.0, 1: 31.0, 2: 22.0})
@@ -175,9 +202,34 @@ def test_smooth_chosen(settings, info, plan, tmp_path):
 
 
 def test_smooth_chosen_disabled(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.crf_smoothing = True
     settings.transcode.optimizer.max_crf_delta = 0.0
     enc = make_encoder(settings, info, plan, tmp_path)
     assert enc.smooth_chosen({0: 22.0, 1: 31.0}) == {0: 22.0, 1: 31.0}
+
+
+def test_smooth_chosen_needs_the_toggle(settings, info, plan, tmp_path):
+    # a bound on its own does nothing: the toggle is what turns it on
+    settings.transcode.optimizer.crf_smoothing = False
+    settings.transcode.optimizer.max_crf_delta = 4.0
+    enc = make_encoder(settings, info, plan, tmp_path)
+    assert enc.smooth_chosen({0: 22.0, 1: 31.0}) == {0: 22.0, 1: 31.0}
+
+
+def test_smoothing_and_cut_defaults():
+    from app.config import OptimizerSettings
+    o = OptimizerSettings()
+    assert o.crf_smoothing is False
+    assert o.max_crf_delta == 8.0
+    assert o.scdet_threshold == 1.5
+    assert o.scdet_settle == 0.6
+
+
+def test_smooth_chosen_default_bound_is_8(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.crf_smoothing = True
+    enc = make_encoder(settings, info, plan, tmp_path)
+    out = enc.smooth_chosen({0: 24.0, 1: 40.0, 2: 44.0})    # grid 20..44
+    assert out == {0: 24.0, 1: 32.0, 2: 40.0}
 
 
 # ---- svt params ----
@@ -620,12 +672,22 @@ def test_pick_all_crfs_applies_probe_crf_offset(settings, info, plan, tmp_path):
 
 
 def test_smooth_chosen_respects_min_crf(settings, info, plan, tmp_path):
+    settings.transcode.optimizer.crf_smoothing = True
     settings.transcode.optimizer.max_crf_delta = 4.0
     settings.transcode.optimizer.min_crf = 28
     settings.transcode.optimizer.probe_crfs = [20, 24, 28, 32, 36]
     enc = make_encoder(settings, info, plan, tmp_path)
     out = enc.smooth_chosen({0: 28.0, 1: 36.0, 2: 28.0})
     assert min(out.values()) >= 28.0
+    # both neighbours sit on the floor, i.e. already miss the target: they
+    # must not pull shot 1 down to 32
+    assert out == {0: 28.0, 1: 36.0, 2: 28.0}
+
+
+def test_smooth_chosen_is_off_by_default(settings, info, plan, tmp_path):
+    enc = make_encoder(settings, info, plan, tmp_path)
+    chosen = {0: 50.0, 1: 24.0, 2: 38.0}
+    assert enc.smooth_chosen(chosen) == chosen
 
 
 # ---- probe command construction ----
@@ -3936,6 +3998,68 @@ def test_cuts_from_scores_honours_threshold_and_min_scene_len(
     assert enc._cuts_from_scores(scores) == []
 
 
+def _settle_enc(settings, info, plan, tmp_path, settle=0.6):
+    settings.transcode.optimizer.scdet_threshold = 1.5
+    settings.transcode.optimizer.scdet_settle = settle
+    settings.transcode.optimizer.min_scene_len = 5
+    return make_encoder(settings, info, plan, tmp_path)
+
+
+def test_settle_keeps_a_cut_the_picture_holds_after(settings, info, plan, tmp_path):
+    enc = _settle_enc(settings, info, plan, tmp_path)
+    scores, mafd = [0.1] * 30, [0.3] * 30
+    scores[10], mafd[10] = 7.7, 8.0
+    assert enc._cuts_from_scores(scores, mafd) == [10]
+
+
+def test_settle_rejects_a_pan_and_a_flash(settings, info, plan, tmp_path):
+    enc = _settle_enc(settings, info, plan, tmp_path)
+    scores, mafd = [0.1] * 30, [0.3] * 30
+    # a pan starting: the change carries on after the candidate
+    scores[8], mafd[8] = 3.0, 3.3
+    mafd[9:12] = [3.0, 2.9, 3.1]
+    # a flash: in on one frame, out on the next
+    scores[20], mafd[20] = 4.7, 5.0
+    mafd[21] = 5.0
+    assert enc._cuts_from_scores(scores, mafd) == []
+    # with the check off both are cuts, as before
+    settings.transcode.optimizer.scdet_settle = 0.0
+    assert enc._cuts_from_scores(scores, mafd) == [8, 20]
+
+
+def test_settle_lets_the_real_change_a_frame_later_be_the_cut(settings, info, plan, tmp_path):
+    # a blended frame at a cut in a frame-rate-converted source: the
+    # threshold fires on the blend, the picture actually changes next frame
+    enc = _settle_enc(settings, info, plan, tmp_path)
+    scores, mafd = [0.1] * 30, [0.3] * 30
+    scores[10], mafd[10] = 2.7, 3.0
+    scores[11], mafd[11] = 5.0, 8.0
+    assert enc._cuts_from_scores(scores, mafd) == [11]
+
+
+def test_settle_looks_three_frames_ahead_for_animation_on_twos(settings, info, plan, tmp_path):
+    enc = _settle_enc(settings, info, plan, tmp_path)
+    scores, mafd = [0.1] * 30, [0.0] * 30
+    # a new drawing every second frame: each one "settles" for one frame
+    for i in range(10, 20, 2):
+        scores[i], mafd[i] = 4.0, 4.0
+    # none of the drawings that another follows within three frames is a
+    # cut (after the last one, 18, the picture really does hold)
+    assert [c for c in enc._cuts_from_scores(scores, mafd) if c < 18] == []
+    settings.transcode.optimizer.scdet_settle = 0.0
+    assert enc._cuts_from_scores(scores, mafd)[0] == 10
+
+
+def test_settle_needs_the_mafd_of_every_frame(settings, info, plan, tmp_path):
+    enc = _settle_enc(settings, info, plan, tmp_path)
+    scores = [0.1] * 30
+    scores[8] = 3.0
+    # nothing to judge by (a fake pass, or a count that does not line up):
+    # the threshold decides alone rather than refusing every cut
+    assert enc._cuts_from_scores(scores) == [8]
+    assert enc._cuts_from_scores(scores, [0.3] * 29) == [8]
+
+
 def _cfr_pts(n, fps=30.0, jitter_ms=True):
     """Timestamps of n frames at fps, rounded to whole milliseconds the way
     Matroska stores them (so consecutive intervals alternate around 1/fps)."""
@@ -4046,6 +4170,7 @@ def test_scdet_pass_collects_every_frames_pts(settings, info, plan, tmp_path, mo
     scores = enc._run_scdet(["ffmpeg"])
     assert len(scores) == 5
     assert enc._frame_pts == pytest.approx([0.0, 0.042, 0.084, 0.126, 0.168])
+    assert enc._frame_mafd == pytest.approx([0.1] * 5)
 
 
 def test_scdet_builds_shots_covering_every_frame(settings, info, plan, tmp_path,

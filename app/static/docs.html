@@ -395,7 +395,7 @@
 <ol>
   <li><b>分镜</b>：默认用 ffmpeg 的 <code>scdet</code> 滤镜单趟扫描源，不落任何中间文件（<code>scenedetect_engine: scdet</code>）。实测对三个 4K 源，切点与旧的 PySceneDetect 路径一处完全一致、另两处各多一个；整个阶段从 44.7s / 255s CPU 降到 12.2s / 8s。<code>scenedetect_engine: pyscenedetect</code> 可切回旧路径（写一份降采样副本再用 OpenCV 逐帧读）。切出来的镜头再按 <code>min_shot_frames</code>、<code>max_shots</code> 合并。</li>
   <li><b>并行探测</b>：所有镜头按内存和 CPU 预算尽量多地同时探测（<code>probe_workers</code> 只是可选的硬上限，见<a href="#sec-opt-res">并发与内存</a>）。每个镜头先探 <code>probe_crfs</code> 网格的两端和中间点，再在夹住目标的区间里二分，区间窄到 <code>probe_bracket_width</code> 就停（设 0 则整张网格全探）。每个探测点按<b>源分辨率、与正式编码相同的像素格式和编码参数</b>（仅 preset 更快）编码，再按 <code>target_metric</code> 打分（VMAF、SSIMULACRA2 或 XPSNR）。用 VMAF 时，源宽低于 <code>vmaf_4k_min_width</code>（默认 2560）的，送进 libvmaf 前两路统一缩到 <code>vmaf_width</code>（默认 1920，只缩不放、保持比例），因为 vmaf_v0.6.1 是按 1080p 训练的；达到这个宽度的改用 <code>vmaf_model_4k</code> 按原生分辨率打分。镜头过长时按 <code>probe_max_frames</code> 取中间一段<b>连续</b>帧。<code>probe_encoder</code> 选 <code>qsv</code> 或 <code>qsv+svt</code> 时显卡也参与探测。</li>
-  <li><b>选 CRF</b>：对每个镜头在 (CRF, 分数) 曲线上插值，取命中 <code>target_quality</code> 下限的 CRF（区间超出探测范围时钳制到边界）。然后加上 <code>probe_crf_offset</code>，按 <code>min_crf</code> / <code>max_crf</code> 钳制，再用 <code>max_crf_delta</code> 平滑相邻镜头。</li>
+  <li><b>选 CRF</b>：对每个镜头在 (CRF, 分数) 曲线上插值，取命中 <code>target_quality</code> 下限的 CRF（区间超出探测范围时钳制到边界）。然后加上 <code>probe_crf_offset</code>，按 <code>min_crf</code> / <code>max_crf</code> 钳制。每个镜头用自己的 CRF；只有开启 <code>crf_smoothing</code> 才会为了相邻镜头压低部分 CRF（差上限 <code>max_crf_delta</code>）。</li>
   <li><b>并行编码</b>：所有镜头按各自 CRF 并行正式编码，最后拼接并重新复用源音频/字幕。</li>
   <li><b>校验</b>：按 <code>verify_shots</code> 从成品里抽几个镜头重新打分，对账探测预测和实际交付（见<a href="#sec-verify">成品校验</a>）。</li>
 </ol>
@@ -411,9 +411,20 @@
 </div>
 <div class="def" id="p-scdet_threshold">
   <h4 class="def__name"><code>scdet_threshold</code></h4>
-  <p class="def__dflt">默认 2.0</p>
-  <div class="def__body"><p>仅 <code>scenedetect_engine=scdet</code> 时生效。一帧的 scdet 分数（0-100）达到它才算切点，越低越敏感。ffmpeg 自己的默认 10 对电影电视太高：在一段 4K 样片上只找到 21 个切点中的 1 个。2.0 与旧检测器的结果很接近，0.8-1.5 还会抓到较软的转场；低于约 0.5 多出来的多半是镜头运动或光线变化，而且会挤掉正确的切点。</p>
+  <p class="def__dflt">默认 1.5</p>
+  <div class="def__body"><p>仅 <code>scenedetect_engine=scdet</code> 时生效。一帧的 scdet 分数（0-100）达到它才算候选切点，越低越敏感。ffmpeg 自己的默认 10 对电影电视太高：在一段 4K 样片上只找到 21 个切点中的 1 个。低于约 0.5 多出来的多半是镜头运动或光线变化，而且会挤掉正确的切点。</p>
+    <p><b>不要为了去掉误切把它调高。</b>暗场里的真换镜头分数只有 1.6-3.9：Westworld 4K 上门限 3.0 只保住了 76 个标注真切点里的 52 个。低门限放进来的误切由 <a href="#p-scdet_settle"><code>scdet_settle</code></a> 处理。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scdet_threshold">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-scdet_settle">
+  <h4 class="def__name"><code>scdet_settle</code></h4>
+  <p class="def__dflt">默认 0.6</p>
+  <div class="def__body"><p>候选切点之后画面要“稳住”：后 3 帧的 MAFD（相邻两帧的平均像素差）都不超过切点帧的这个比例，才算切点；0 = 关闭，门限以上的候选全算切点。</p>
+    <p>为什么需要它：scdet 的分数只往前看（切点帧和前一帧的差），镜头平移起步、闪光、前景有人经过和真正的换镜头，在切点那一帧上长得一样。区别在后面几帧：真换镜头之后新镜头是稳的，其余几种还在变。这些误切会让 CRF 在同一个镜头中途跳变，门限 1.5 时一集 1080p 蓝光上最多从 24.6 跳到 50。</p>
+    <p>实测（五种片源，逐帧看切点前后的画面标注）：1080p 蓝光和 4K 暗场蓝光两集共 180 个标注切点，只用门限 1.5 保住全部 138 个真切点，但 42 个误切放进了 40 个；加上它保住 136 个、误切剩 6 个；把门限提到 3.0 只保住 105 个；按前后 6 帧最高分的倍数判断，会在动作段落里丢 10 个真切点。在没参与调参的 4K 动作剧、4K 情景喜剧、动画上，它去掉的多是闪光、动态模糊、前景遮挡、动画特效，补回来的几乎都是真切点——原本被前一两帧的误切占住了 <code>min_scene_len</code> 的间隔。</p>
+    <p>仍会错的两种：切进一个本身运动极快的镜头（动作剧每集 2-3 个，这两个镜头会共用一个 CRF）；画面里烧录的字幕换行（字幕一换、画面随即稳住，和切点无法区分）。看后 3 帧而不是 1 帧，是因为动画一拍二、一拍三时每张画后面都会“稳”一帧：只看 1 帧时 21 个动画误切放进 15 个，看 3 帧放进 4 个。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scdet_settle">去设置页 ›</a></p></div>
+</div>
 </div>
 <div class="def" id="p-scenedetect_threshold">
   <h4 class="def__name"><code>scenedetect_threshold</code></h4>
@@ -537,10 +548,17 @@
   <div class="def__body"><p>交付 CRF 的硬上限，0 = <code>probe_crfs</code> 的顶端；<code>min_crf</code> 的镜像。它让“探测范围”和“交付范围”成为两件事：<code>probe_crfs</code> 管去哪看，<code>min_crf</code>/<code>max_crf</code> 管能发什么，探到极端值不等于会用极端值。它只能往下压：高于 <code>probe_crfs</code> 顶端时不起作用。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#f-max_crf">去设置页 ›</a></p></div>
 </div>
+<div class="def" id="p-crf_smoothing">
+  <h4 class="def__name"><code>crf_smoothing</code></h4>
+  <p class="def__dflt">默认 <code>false</code>（关闭）</p>
+  <div class="def__body"><p>相邻镜头 CRF 平滑，开启后相邻镜头的 CRF 差不超过 <code>max_crf_delta</code>。<b>建议保持关闭</b>：每个镜头命中的是同一个质量目标，CRF 22 和 CRF 38 的两个相邻镜头质量是一样的，这个差正是分镜头自适应本身；镜头边界又都是检测出的剪辑点，画质变化在那里最不显眼。旧默认 4 在 261 个生产作业（23.7 万个镜头）上改写了 58% 帧的 CRF：28% 被抬高、平均 6.4（9.5% 的帧预测低于目标 1 VMAF 以上），30% 被压低、平均 6.7，换来没人要的约 +1 VMAF。整集实测（1080p 蓝光 Remux，1006 个镜头，生产 1080p 预设、目标 95，两边用同一份探测结果）：开平滑（4）体积反而<b>大 0.5%</b>，最差 1% 镜头 VMAF 87.74 对 89.79，最差镜头 77.00 对 85.84，低于目标 2 分以上的帧 15.1% 对 10.0%。被抬高的镜头省下的 550MB，全花在了本来就达标的镜头上（+583MB）。</p>
+    <p>开启后只会<b>压低</b> CRF（每个镜头取自己和“邻居 CRF + 距离 × 上限”中的最小值），任何镜头都不会低于目标，结果也不取决于从哪一头扫；卡在 CRF 下限的镜头（本来就够不到目标）不会拉低邻居。代价是体积：同样这批作业重放，上限 8 会压低 28% 帧的 CRF、平均 6.5；上限 4 约压低一半的帧、平均 8。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-crf_smoothing">去设置页 ›</a></p></div>
+</div>
 <div class="def" id="p-max_crf_delta">
   <h4 class="def__name"><code>max_crf_delta</code></h4>
-  <p class="def__dflt">默认 4.0</p>
-  <div class="def__body"><p>相邻镜头 CRF 差上限（0=关闭）。每个镜头独立命中目标可能导致相邻镜头 CRF 跳变（如 22→31）造成观感不连续；平滑后限制差值。代价是部分镜头可能略低于目标。</p>
+  <p class="def__dflt">默认 8</p>
+  <div class="def__body"><p><code>crf_smoothing</code> 开启时，相邻镜头 CRF 差的上限；关闭时不起作用。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#f-max_crf_delta">去设置页 ›</a></p></div>
 </div>
 <div class="def" id="p-fractional_crf">

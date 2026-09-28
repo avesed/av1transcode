@@ -227,39 +227,41 @@ def predict_score(samples: List[Tuple[int, float]], crf: float) -> Optional[floa
     return float(pts[-1][1])
 
 
-def smooth_crfs(crfs: List[float], max_delta: float, iterations: int = 32) -> List[float]:
-    """Bound the CRF jump between adjacent shots to <= max_delta.
+def smooth_crfs(crfs: List[float], max_delta: float,
+                pinned: Optional[List[bool]] = None) -> List[float]:
+    """Bound the CRF jump between adjacent shots to <= max_delta by LOWERING
+    CRFs only: shot i gets min(own, min over j of crfs[j] + max_delta*|i-j|).
 
-    Each shot is independently picked to hit the target metric, so two
-    neighbouring shots can land far apart (e.g. CRF 22 then CRF 31) and look
-    discontinuous even though both meet the target. This runs alternating
-    forward/backward projections: every shot is clipped to within +/- max_delta
-    of its neighbours, repeated until stable. Shots already within the bound
-    are left untouched. Returns a copy; max_delta <= 0 disables smoothing.
+    One-sided because the target is a floor. Raising a shot's CRF to meet an
+    easier neighbour ships it below target, and the old two-sided clip did
+    exactly that. It also swept forward from shot 0, so which side of a jump
+    gave way depended on position rather than content: an episode opening on
+    a CRF-50 logo pulled the next shot from its CRF 24 up to 46. Across 261
+    production jobs (237k shots) it moved 58% of the frames, half of them up
+    by 6.4 CRF on average - 9.5% of all frames predicted more than 1 VMAF
+    under target, 1.4% more than 3.
+
+    The lower envelope has none of that: it never lowers quality, it does not
+    depend on the order shots are visited, and two passes compute it exactly.
+    What it costs is bits, and at the old default of 4 the cost is large -
+    replayed over the same jobs it lowers ~half the frames by ~8 CRF, because
+    neighbouring shots at the same quality routinely sit 10-20 CRF apart.
+
+    `pinned` shots (those clamped to the CRF floor, which already miss the
+    target) do not pull their neighbours down: spending bits on a neighbour
+    widens the quality step to a shot below target rather than closing it.
+    Returns a copy; max_delta <= 0 disables smoothing.
     """
-    n = len(crfs)
-    if n <= 1 or max_delta <= 0:
-        return [float(c) for c in crfs]
     s = [float(c) for c in crfs]
-    for _ in range(max(1, iterations)):
-        moved = False
-        for i in range(1, n):
-            lo = s[i - 1] - max_delta
-            hi = s[i - 1] + max_delta
-            new = min(max(s[i], lo), hi)
-            if new != s[i]:
-                s[i] = new
-                moved = True
-        for i in range(n - 2, -1, -1):
-            lo = s[i + 1] - max_delta
-            hi = s[i + 1] + max_delta
-            new = min(max(s[i], lo), hi)
-            if new != s[i]:
-                s[i] = new
-                moved = True
-        if not moved:
-            break
-    return s
+    n = len(s)
+    if n <= 1 or max_delta <= 0:
+        return s
+    env = [math.inf if pinned and pinned[i] else s[i] for i in range(n)]
+    for i in range(1, n):
+        env[i] = min(env[i], env[i - 1] + max_delta)
+    for i in range(n - 2, -1, -1):
+        env[i] = min(env[i], env[i + 1] + max_delta)
+    return [min(c, e) for c, e in zip(s, env)]
 
 
 def merge_short_shots(shots: List[Shot], min_frames: int) -> List[Shot]:
@@ -1033,6 +1035,8 @@ class ShotEncoder:
         # timeline slot each frame sits in (see _slots_from_pts / _slot)
         self._frame_pts: List[float] = []
         self._slots: List[int] = []
+        # and every frame's MAFD from the same pass (see _cuts_from_scores)
+        self._frame_mafd: List[float] = []
         # probe pool size, used to auto-size libvmaf threads (see _vmaf_threads).
         # Every probe phase must set it: left at 1, a score takes every core.
         self._probe_worker_count = 1
@@ -1902,6 +1906,7 @@ class ShotEncoder:
     # "frame:123 pts:... " and "lavfi.scd.score=1.234" from metadata=print
     _SCD_FRAME = re.compile(r"^frame:(\d+)(?:\s+pts:\S+\s+pts_time:(-?[\d.]+))?")
     _SCD_SCORE = re.compile(r"^lavfi\.scd\.score=([\d.]+)")
+    _SCD_MAFD = re.compile(r"^lavfi\.scd\.mafd=([\d.]+)")
 
     def _scdet_cmds(self) -> List[Tuple[str, List[str]]]:
         """(label, ffmpeg args) to try for a scdet pass over the source.
@@ -1953,6 +1958,7 @@ class ShotEncoder:
         # that sees the whole timeline, and what _assert_constant_frame_rate
         # judges it by
         self._frame_pts = []
+        self._frame_mafd = []
         total = max(self.total_frames, 1)
         last_pct = -1.0
         try:
@@ -1961,6 +1967,10 @@ class ShotEncoder:
                 m = self._SCD_SCORE.match(line)
                 if m:
                     scores.append(float(m.group(1)))
+                    continue
+                m = self._SCD_MAFD.match(line)
+                if m:
+                    self._frame_mafd.append(float(m.group(1)))
                     continue
                 m = self._SCD_FRAME.match(line)
                 if m:
@@ -2104,14 +2114,40 @@ class ShotEncoder:
             return slots[frame]
         return slots[-1] + (frame - (len(slots) - 1))
 
-    def _cuts_from_scores(self, scores: List[float]) -> List[int]:
-        """Frames whose score clears the threshold, min_scene_len apart."""
+    # Frames after a candidate cut that have to settle (see scdet_settle).
+    # Three, not one: animation drawn on twos or threes holds each drawing for
+    # 2-3 frames, so every new drawing spikes and then "settles" for a frame.
+    _SETTLE_FRAMES = 3
+
+    def _cuts_from_scores(self, scores: List[float],
+                          mafd: Optional[List[float]] = None) -> List[int]:
+        """Frames whose score clears the threshold, min_scene_len apart, and -
+        given the pass's per-frame MAFD - after which the picture settles.
+
+        scdet's score is min(MAFD, MAFD - previous MAFD): it only looks back.
+        A cut and the start of a pan look the same from there; they differ in
+        what comes next. After a cut the new shot is steady, so the next few
+        frames differ from each other far less than the cut frame differed
+        from its predecessor; a pan, a flash or someone crossing the
+        foreground keeps changing. A candidate is kept only when the MAFD of
+        each of the next _SETTLE_FRAMES frames is at most scdet_settle times
+        its own. A rejected candidate does not start the min_scene_len gap,
+        so when the real change lands a frame later - a blended frame at a
+        cut in a frame-rate-converted source - that frame can still be it.
+        """
         th = float(self.opt.scdet_threshold)
         gap = max(1, int(self.opt.min_scene_len))
+        settle = float(self.opt.scdet_settle or 0)
+        if mafd is None or len(mafd) != len(scores):
+            settle = 0.0
         cuts: List[int] = []
         last = -gap
         for i, v in enumerate(scores):
             if i > 0 and v >= th and i - last >= gap:
+                if settle > 0:
+                    after = mafd[i + 1:i + 1 + self._SETTLE_FRAMES]
+                    if after and max(after) > settle * mafd[i]:
+                        continue
                 cuts.append(i)
                 last = i
         return cuts
@@ -2129,7 +2165,11 @@ class ShotEncoder:
         8s on a 2160p source, and writes nothing to disk.
 
         Threshold: 2.0 tracks the old detector closely. 0.8-1.5 picks up softer
-        transitions (measured peak 1.5-4.5 over a single frame). Below ~0.5 the
+        transitions (measured peak 1.5-4.5 over a single frame) - but on a
+        full episode many of those split one camera shot rather than mark a
+        cut, and raising the threshold cannot tell them apart from real cuts
+        in dark scenes; the settle check in _cuts_from_scores does (see
+        scdet_settle in config.py). Below ~0.5 the
         extra hits are broad and shallow - peak ~0.5 spread over 4-5 frames,
         which is camera motion or a lighting change rather than a cut - and
         they also start displacing correct boundaries, because min_scene_len
@@ -2155,7 +2195,10 @@ class ShotEncoder:
                       f"fps x duration estimated {self.total_frames}")
         self._assert_constant_frame_rate(self._frame_pts)
         self._slots = self._slots_from_pts(self._frame_pts)
-        cuts = self._cuts_from_scores(scores)
+        cuts = self._cuts_from_scores(scores, self._frame_mafd)
+        if float(self.opt.scdet_settle or 0) > 0:
+            self._log(f"scdet: {len(cuts)} cut(s) kept by the settle check, "
+                      f"{len(self._cuts_from_scores(scores))} on the threshold alone")
         bounds = [0] + cuts + [len(scores)]
         return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
 
@@ -4964,16 +5007,24 @@ class ShotEncoder:
                       f"{self.metric} {self.target:g} at CRF {lo}")
         return chosen
 
+    def _smoothing_delta(self) -> float:
+        """The CRF bound smoothing enforces; 0 when crf_smoothing is off."""
+        if not self.opt.crf_smoothing:
+            return 0.0
+        return max(0.0, float(self.opt.max_crf_delta or 0))
+
     def smooth_chosen(self, chosen: Dict[int, float]) -> Dict[int, float]:
-        """Bound adjacent-shot CRF jumps (see smooth_crfs) to keep the picture
-        visually continuous. max_crf_delta <= 0 disables smoothing."""
-        max_delta = float(self.opt.max_crf_delta or 0)
+        """Bound adjacent-shot CRF jumps by lowering CRFs (see smooth_crfs),
+        when crf_smoothing is on. Shots sitting on the CRF floor are pinned:
+        they are there because they miss the target anyway."""
+        max_delta = self._smoothing_delta()
         if max_delta <= 0 or len(chosen) <= 1:
             return chosen
-        ordered_idx = sorted(chosen)
-        smoothed = smooth_crfs([chosen[i] for i in ordered_idx], max_delta)
         grid = self._probe_grid()
         lo, hi = self._crf_floor(min(grid)), self._crf_ceiling(max(grid))
+        ordered_idx = sorted(chosen)
+        smoothed = smooth_crfs([chosen[i] for i in ordered_idx], max_delta,
+                               pinned=[chosen[i] <= lo + 1e-9 for i in ordered_idx])
         out = {}
         for i, crf in zip(ordered_idx, smoothed):
             out[i] = max(lo, min(crf, hi))
@@ -6565,12 +6616,10 @@ class ShotEncoder:
                 samples = (self.probe_all_verified(shots, grid)
                            if mode == "qsv+svt" else self.probe_all(shots, grid))
                 chosen = self.pick_all_crfs(samples, grid)
-            if float(self.opt.max_crf_delta or 0) > 0:
+            if self._smoothing_delta() > 0:
                 ideal = ", ".join(f"{i}:{chosen[i]:g}" for i in sorted(chosen))
                 chosen = self.smooth_chosen(chosen)
                 self._log(f"ideal per-shot CRFs -> {ideal}")
-            else:
-                chosen = self.smooth_chosen(chosen)
             crf_line = ", ".join(f"{i}:{chosen[i]:g}" for i in sorted(chosen))
             self._log(f"chosen per-shot CRFs -> {crf_line}")
             # the training target, after smoothing: what each shot is really

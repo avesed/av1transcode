@@ -331,7 +331,40 @@ class OptimizerSettings(BaseModel):
     # camera motion or a lighting change rather than a cut - and they start
     # displacing correct boundaries too, because the min_scene_len merge takes
     # the first candidate rather than the strongest.
-    scdet_threshold: float = 2.0
+    #
+    # 1.5 and not higher, because a higher bar does not separate the two
+    # things it would have to. On a 4K Blu-ray (Westworld) the real cuts in
+    # dark scenes score 1.6-3.9: 3.0 kept 52 of 76 labelled real cuts there.
+    # What does separate them is scdet_settle below, which is where the
+    # false cuts this low threshold lets in are dealt with.
+    scdet_threshold: float = 1.5
+    # Keep a candidate cut only if the picture settles after it: the MAFD of
+    # each of the next 3 frames must be at most this share of the cut
+    # frame's own. 0 = off (every candidate over scdet_threshold is a cut).
+    #
+    # scdet's score only looks back (it is min(MAFD, MAFD - previous MAFD)),
+    # so the start of a pan, a camera flash, someone crossing the foreground
+    # and a real cut all look alike from the cut frame. They differ in what
+    # comes next: a new shot holds still relative to the jump into it, the
+    # others keep changing. Measured by looking at the frames either side of
+    # labelled cuts on five sources (1080p Blu-ray drama, 4K Blu-ray dark
+    # drama, 4K WEB action, 4K WEB sitcom, 1080p anime):
+    #   - 180 labelled cuts on the first two, threshold alone at 1.5 kept all
+    #     138 real cuts and 40 of 42 same-shot splits; with the settle check
+    #     at 0.6, 136 real and 6 splits. Fixed 3.0 instead: 105 real, 2
+    #     splits. A ratio against the neighbouring scores (2.5x the max
+    #     within +-6 frames) lost the cuts inside action sequences, 10 of 138.
+    #   - on the three sources it was not tuned on, what it removed was mostly
+    #     same-shot splits - flashes, motion blur, foreground wipes, animation
+    #     effects - and what it added was almost all real cuts that a false
+    #     candidate one or two frames earlier had been blocking through
+    #     min_scene_len. What it still gets wrong: a cut straight into a very
+    #     fast shot (2-3 per action episode), and burnt-in subtitle changes,
+    #     which settle exactly like a cut.
+    # Three frames rather than one because animation drawn on twos or threes
+    # "settles" for a frame after every drawing: 15 of 21 anime splits passed
+    # a one-frame check, 4 a three-frame one.
+    scdet_settle: float = 0.6
     # PySceneDetect ContentDetector threshold (higher = fewer/split less).
     # Only used by scenedetect_engine=pyscenedetect.
     scenedetect_threshold: float = 27.0
@@ -567,12 +600,35 @@ class OptimizerSettings(BaseModel):
     min_shot_frames: int = 0
     # Cap on the number of shots; shortest adjacent shots are merged past this.
     max_shots: int = 3000
-    # Bound the per-shot CRF jump between neighbouring shots (0 = disable).
-    # Each shot independently hits target_quality, which can leave adjacent
-    # shots with very different CRFs and a visible quality step; smoothing
-    # keeps |CRF[i] - CRF[i+1]| <= max_crf_delta. May lower some shots a
-    # little below target to keep the picture continuous.
-    max_crf_delta: float = 4.0
+    # Bound the CRF jump between neighbouring shots to max_crf_delta. Off by
+    # default.
+    #
+    # Off because a CRF step is not a quality step. Every shot is picked to
+    # land on the same target score, so two neighbours at CRF 22 and CRF 38
+    # are at the SAME quality - that spread is the per-shot adaptation this
+    # engine exists for, and every boundary is a detected cut, where a change
+    # is least visible anyway. Over 261 production jobs (237k shots) the old
+    # default of 4 rewrote the CRF of 58% of the frames: 28% raised by 6.4
+    # on average (9.5% of all frames predicted >1 VMAF under target, 1.4%
+    # >3) and 30% lowered by 6.7 for about +1 VMAF nobody asked for.
+    #
+    # Measured end to end on a full episode (1080p Blu-ray remux, 1006 shots,
+    # production's 1080p preset at target 95, the same probes both ways):
+    # smoothing at 4 came out 0.5% BIGGER and worse where it matters - 1st
+    # percentile shot VMAF 87.74 against 89.79, worst shot 77.00 against
+    # 85.84, frames more than 2 under target 15.1% against 10.0%. What it
+    # took from the shots it raised (-550MB, -1.26 VMAF) it spent on the
+    # shots it lowered (+583MB, +1.60 VMAF on shots already at target).
+    #
+    # When on, CRFs are only ever LOWERED (see smooth_crfs), so no shot drops
+    # below its target, and shots pinned to the CRF floor do not pull their
+    # neighbours. The price is bits: replayed over the same 261 jobs, a bound
+    # of 8 lowers 28% of the frames by 6.5 CRF on average (a bound of 4:
+    # about half the frames by 8). Treat it as a deliberate size-for-evenness
+    # trade, not a safety net.
+    crf_smoothing: bool = False
+    # The bound crf_smoothing enforces, in CRF. Ignored while it is off.
+    max_crf_delta: float = 8.0
     # Hard floor on the CRF any shot may be assigned (0 = the bottom of
     # probe_crfs). When target_quality is out of reach - which is easy to do at
     # 4K against an already-compressed source - every such shot otherwise falls
