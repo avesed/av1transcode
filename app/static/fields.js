@@ -115,7 +115,7 @@ const OPT_GROUPS = [
 const GPU_FIELDS = [
   F("vmaf_sycl_device", "VMAF 打分设备", "用 libvmaf 的 SYCL 后端在 GPU 上打分。关闭 = CPU。作业开始时会先自检一次，设备不可用则整个作业退回 CPU。", { type: "sycl" }),
   F("vmaf_sycl_min_width", "GPU 打分的最小宽度", "源窄于此仍用 CPU。1080p 实测：零拷贝打分让探测阶段快一半、CPU 省七成；1920 以下没测过。", { min: 0, max: 7680, unit: "px" }),
-  F("scenedetect_hwaccel", "分镜解码", "auto = 有 QSV 就用它解码分镜那一趟；off = 一律软解。", { type: "select", options: [["auto", "auto：有 QSV 就用"], ["off", "off：一律软解"]] }),
+  F("scenedetect_hwaccel", "分镜解码", "auto = 有显卡就用 VA-API 解码并缩放分镜那一趟；off = 一律软解。", { type: "select", options: [["auto", "auto：有显卡就用"], ["off", "off：一律软解"]] }),
   F("gpu_vram_budget_mb", "显存预算 (MB)", "0 = 自动（6000）：给 12GB 的卡留一半，因为看不见 Plex 占的那份。", {
     min: 0, max: 65536,
     summary: "展开：DRM fdinfo 看不到 Plex 那份",

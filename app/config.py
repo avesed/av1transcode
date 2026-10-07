@@ -388,15 +388,20 @@ class OptimizerSettings(BaseModel):
     # is 5-10x faster. e.g. "-2:540". Empty = detect on the source directly.
     scenedetect_scale: str = "-2:540"
     # Decode the source on a GPU for that downscale pass ("auto") or never
-    # ("off"). Auto tries Intel QSV first and falls back to software when there
-    # is no usable device, when the codec is one the card cannot decode (AV1 on
-    # a B580 exits 0 having written nothing), or when scenedetect_scale is not
-    # a plain W:H that a fixed size can be derived from.
+    # ("off"); the scdet pass uses the same switch. Auto tries VA-API on the
+    # first render node and falls back to software when there is no usable
+    # device, when the codec is one the card cannot decode (a decode that exits
+    # 0 having written nothing counts as failed), or when scenedetect_scale is
+    # not a plain W:H that a fixed size can be derived from. VA-API rather than
+    # QSV: QSV's scaler re-stamped frames by the container's nominal rate, and
+    # on a file whose header rate is off from its real timestamps (Hardcore
+    # Henry, any mkvmerge --timestamps remux) that came out as duplicated pts
+    # and a refused source. Same speed, same cuts on four sources.
     #
     # The decode and the scale move to the GPU; the copy is still encoded with
     # x264. This does not reproduce the software copy exactly - the GPU scaler
-    # is not swscale - so borderline cuts can land differently. Measured end to
-    # end on three 90-second 4K clips: 46.4s -> 17.2s and 29.5s -> 20.1s on
+    # is not swscale - so borderline cuts can land differently. Measured (on
+    # QSV) end to end on three 90-second 4K clips: 46.4s -> 17.2s and 29.5s -> 20.1s on
     # 2160p, shot lists identical on two of them and 33 -> 34 on the third.
     # That is the same order as the 540p downscale this pass already does (2
     # cuts of 59 against native resolution). Below 2160p the x264 pass

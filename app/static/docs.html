@@ -662,7 +662,7 @@
 <h2>GPU 与硬件</h2>
 <p>GPU 在这里只做加速：每一步都有 CPU / 软解的路径，GPU 让其中几步更快、更省 CPU。除 Dolby Vision P5 转换外，用到 GPU 的都在 optimizer 引擎（<code>engine=optimizer</code>）里。开关在<a href="/static/settings.html#sec-gpu">设置 → GPU</a>，共八项：七项是优化器参数（<code>transcode.optimizer</code>），每个作业开工时读一次，所以保存不影响正在跑的作业；<code>vulkan_device</code> 属于 <code>transcode.dovi</code>，每次 P5 转换时现读。</p>
 <ol>
-  <li id="gpu-scenedetect"><b>分镜解码</b>（<code>scenedetect_hwaccel</code>）：分镜那一趟用 QSV 解码，并在显卡上缩到 <code>scenedetect_scale</code> 的尺寸，再下载回内存做检测。QSV 打不开、卡解不了这种编码（B580 解 AV1 会正常退出却一帧不出）、或 <code>scenedetect_scale</code> 为空或不是纯 <code>W:H</code> 时，自动改用软解。</li>
+  <li id="gpu-scenedetect"><b>分镜解码</b>（<code>scenedetect_hwaccel</code>）：分镜那一趟用 VA-API 解码，并在显卡上缩到 <code>scenedetect_scale</code> 的尺寸，再下载回内存做检测。没有显卡、卡解不了这种编码（正常退出却一帧不出也算失败）、或 <code>scenedetect_scale</code> 为空或不是纯 <code>W:H</code> 时，自动改用软解。不用 QSV：QSV 的缩放会按文件头标称帧率重排时间戳，文件头帧率和真实帧时间对不上的片源（如 Hardcore Henry）会因此出现重复时间戳而被拒；VA-API 一样快、切点和 QSV 一致。</li>
   <li id="gpu-sycl"><b>VMAF 打分</b>（<code>vmaf_sycl_device</code>、<code>vmaf_sycl_min_width</code>）：探测打分和成品校验的 libvmaf 改走它的 SYCL 后端（滤镜参数 <code>sycl_device=N</code>），需要镜像里带 SYCL 的 libvmaf 和一块 Level Zero 设备（Intel Arc）。只对 <code>target_metric=vmaf</code> 且源宽不小于 <code>vmaf_sycl_min_width</code> 的作业生效；SSIMULACRA2 和 XPSNR 始终在 CPU 上算。作业第一次打分前先自检：同一对测试画面在 GPU 和 CPU 上各打一次，后端必须自报 SYCL、两边相差不超过 1e-3，不过就整个作业在 CPU 上打分，不再重试。之后单次 GPU 打分出错或超时（60 秒加每帧 1 秒；探测编码也在显卡上跑时翻倍），这个窗口改在 CPU 上重打；连续 3 次，本作业改用 CPU，300 秒后再自检一次，过了回到 GPU，再不过就一直用 CPU。</li>
   <li id="gpu-vram"><b>显存与并发</b>（<code>vmaf_sycl_workers</code>、<code>gpu_vram_budget_mb</code>）：显卡只有一块显存，GPU 打分、零拷贝打分和显卡上的探测编码从同一份预算里放行：同时进行的不超过 <code>vmaf_sycl_workers</code> 个，新操作的显存估算要放得进 <code>gpu_vram_budget_mb</code> 减去当前占用（占用取估算总和与 DRM fdinfo 实测中较大的那个）。GPU 打分等 120 秒还放不进，就改在 CPU 上打。</li>
   <li id="gpu-zero-copy"><b>零拷贝打分</b>（<code>vmaf_zero_copy</code>）：探测打分时源窗口和探测文件两路都在 VA-API 上解码，帧直接交给 libvmaf 的 SYCL 后端，不回传内存。前提：SYCL 打分已生效；按原生分辨率打分（4K 模型，或源宽不超过 <code>vmaf_width</code> 的 1080p 模型，都不缩放）；没设 <code>probe_scale</code>；没设 <code>probing_vmaf_features</code>（只导入亮度）；源位深不高于探测编码（8-bit 源配 10-bit 探测时，两路都在显卡上用 <code>scale_vaapi</code> 转成 P010，对应常规读取里的 <code>format=yuv420p10le</code>）；镜像里的 libvmaf 带 libva、ffmpeg 带配套补丁。每个作业先预检：定位后的 VA-API 读取要和软解逐帧一致（与 <code>reference_hwaccel</code> 同一个预检），再用一个窗口两种方式各打一次分，libvmaf 必须报告是在显卡上原地导入的、两个分数相差不超过 1e-3，否则整个作业走常规读取。单个窗口失败就用常规读取重打并记住它，连续 8 次失败本作业关掉零拷贝。Dolby Vision P5 作业的参考是逐镜头预先转好的分片，不走零拷贝；成品校验也不走。</li>
@@ -678,7 +678,7 @@
 <p>上面这些退回都不让作业失败：作业照常完成，只是更慢、更吃 CPU。整个作业退回 CPU 或软解时，说明原因的那一行只写进程序日志（<code>dirs.logs</code> 下的 <code>av1transcode.log</code>），队列页能看的作业日志里没有。所以「现在的设置会怎么用」按已保存的设置和刚探到的硬件解析出四条路径，会退回的标成琥珀色：</p>
 <ul>
   <li>VMAF 打分：「设置为设备 N，但现在不可用 → 作业会退回 CPU」。</li>
-  <li>分镜解码：「auto，但 QSV 不可用 → 软解」。</li>
+  <li>分镜解码：「auto，但 VA-API 不可用 → 软解」。</li>
   <li>打分参考解码：「auto，但 VA-API 不可用 → 软解」。</li>
   <li>P5 转换：「自动，但没有设备」。这一条不是退回：P5 没有 Vulkan 以外的路，建不了 Vulkan 设备时 P5 转换直接失败。</li>
 </ul>
@@ -700,7 +700,7 @@
 <div class="def" id="p-scenedetect_hwaccel">
   <h4 class="def__name"><code>scenedetect_hwaccel</code></h4>
   <p class="def__dflt">默认 <code>auto</code></p>
-  <div class="def__body"><p>分镜那一趟是否用 GPU 解码：<code>auto</code> = 有 QSV 就用，用不了自动软解；<code>off</code> = 一律软解。默认的 <a href="#p-scenedetect_engine">scdet 引擎</a>下，硬解和软解切出的镜头列表完全一致（三个 4K 源实测）；旧的 pyscenedetect 路径用的 GPU 缩放器不是 swscale，边界上的切点可能挪动，低于 2160p 时墙钟反而变慢。用 pyscenedetect 又要切点和软解完全一样时，设 <code>off</code>。</p>
+  <div class="def__body"><p>分镜那一趟是否用 GPU 解码：<code>auto</code> = 有显卡就用 VA-API，用不了自动软解；<code>off</code> = 一律软解。默认的 <a href="#p-scenedetect_engine">scdet 引擎</a>下，硬解和软解切出的镜头列表完全一致（三个 4K 源实测）；旧的 pyscenedetect 路径用的 GPU 缩放器不是 swscale，边界上的切点可能挪动，低于 2160p 时墙钟反而变慢。用 pyscenedetect 又要切点和软解完全一样时，设 <code>off</code>。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#f-scenedetect_hwaccel">去设置页 ›</a></p></div>
 </div>
 <div class="def" id="p-gpu_vram_budget_mb">

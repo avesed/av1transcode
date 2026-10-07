@@ -489,8 +489,8 @@ function renderGpu(data, scope) {
   else if (vk.length) rows.push(["P5 转换", h`自动 → <span class="mono">${vk[0]}</span>`]);
   else rows.push(["P5 转换", "自动，但没有设备", "warn"]);
   if (g.scenedetect_hwaccel === "off") rows.push(["分镜解码", "软解"]);
-  else if (s.qsv) rows.push(["分镜解码", "QSV"]);
-  else rows.push(["分镜解码", "auto，但 QSV 不可用 → 软解", "warn"]);
+  else if (s.vaapi) rows.push(["分镜解码", "VA-API"]);
+  else rows.push(["分镜解码", "auto，但 VA-API 不可用 → 软解", "warn"]);
   if (g.reference_hwaccel === "off") rows.push(["打分参考解码", "软解"]);
   else if (s.vaapi) rows.push(["打分参考解码", "VA-API（探测文件和成品仍软解）"]);
   else rows.push(["打分参考解码", "auto，但 VA-API 不可用 → 软解", "warn"]);

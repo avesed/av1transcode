@@ -1703,11 +1703,11 @@ class ShotEncoder:
     def _scaled_size(self, spec: str) -> Optional[Tuple[int, int]]:
         """Explicit (w, h) that a `W:H` scale spec produces, or None.
 
-        The hardware path has to be told the size outright: scale_qsv's own
-        `w=-1` rounds to its surface alignment rather than to the value the
-        software `scale` filter would pick, and a detection copy of a different
-        size is a different copy - which for a detector reading it frame by
-        frame means different cuts.
+        The hardware path has to be told the size outright: a GPU scaler's own
+        `w=-1` (measured on scale_qsv) rounds to its surface alignment rather
+        than to the value the software `scale` filter would pick, and a
+        detection copy of a different size is a different copy - which for a
+        detector reading it frame by frame means different cuts.
         """
         m = self._SCALE_WH.match(spec or "")
         sw, sh = (self.info.width or 0), (self.info.height or 0)
@@ -1737,7 +1737,9 @@ class ShotEncoder:
         than decoding them on the CPU did - measured 53.6s against software's
         23.0s. Scaling on the GPU keeps the readback small and is the only
         variant that actually wins, and its scaler is not swscale, so borderline
-        cuts can land differently. Measured end to end on 90-second clips:
+        cuts can land differently. Measured end to end on 90-second clips (on
+        QSV then; VA-API's scaler has since picked the same cuts as QSV's on
+        four sources):
 
             hevc 3840x2160 SDR   46.4s -> 17.2s   22 shots, identical
             hevc 3840x2160 HDR   29.5s -> 20.1s   33 -> 34 shots
@@ -1765,16 +1767,15 @@ class ShotEncoder:
               "-f", "matroska", str(out)]
         cmds: List[Tuple[str, List[str]]] = []
         size = self._scaled_size(scale)
-        if (self.opt.scenedetect_hwaccel or "auto").lower() != "off" and size:
+        hw = self._hwdec_args()
+        if (self.opt.scenedetect_hwaccel or "auto").lower() != "off" and size and hw:
             w, h = size
-            # No -qsv_device: with one render node passed into the container
-            # ffmpeg picks it, and naming a fixed /dev/dri/renderDNN here would
-            # be wrong on any other host.
-            cmds.append(("qsv", [
+            # VA-API on the container's render node, as the scdet pass (see
+            # _scdet_cmds for why not QSV)
+            cmds.append(("vaapi", [
                 self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
-                "-i", str(self.source),
-                "-vf", f"scale_qsv=w={w}:h={h}:format=p010le,"
+                *hw, "-i", str(self.source),
+                "-vf", f"scale_vaapi=w={w}:h={h}:format=p010,"
                        f"hwdownload,format=p010le",
                 "-c:v", "libx264", "-preset", "ultrafast", *keyint,
                 "-pix_fmt", "yuv420p10le", "-an", "-sn",
@@ -1801,8 +1802,8 @@ class ShotEncoder:
                                         tag=f"downscale for detection ({label})")
                 if out.exists() and out.stat().st_size > 0:
                     return out
-                # ffmpeg can exit 0 having written nothing - a QSV decode the
-                # card cannot do (AV1 on this one) ends exactly that way.
+                # ffmpeg can exit 0 having written nothing - a hardware decode
+                # the card cannot do (QSV AV1 on this one) ended exactly that way.
                 reason = "produced no output"
             except TranscodeError as e:
                 reason = str(e).splitlines()[0]
@@ -1930,13 +1931,22 @@ class ShotEncoder:
               "-i", str(self.source), "-map", "0:v:0",
               "-vf", ",".join(chain_sw), "-f", "null", "-"]
         cmds: List[Tuple[str, List[str]]] = []
-        if (self.opt.scenedetect_hwaccel or "auto").lower() != "off" and size:
+        hw = self._hwdec_args()
+        if (self.opt.scenedetect_hwaccel or "auto").lower() != "off" and size and hw:
             w, h = size
-            cmds.append(("qsv", [
+            # VA-API, not QSV: QSV's scaler re-stamped the frames by the
+            # container's nominal rate, and where that is off from the real
+            # timestamps (Hardcore Henry: a 16.8 ms default duration on 16.683 ms
+            # frames, or any mkvmerge --timestamps remux) the drift came out as
+            # a duplicated pts every ~143 frames - 55 in its first minute - and
+            # the timeline check refused the source. Decoding was never the
+            # problem: QSV and VA-API both hand over the software decoder's
+            # pictures and timestamps. VA-API's scaler keeps them; same speed
+            # (187 vs 182 fps on 4K60) and the same cuts as QSV on four sources.
+            cmds.append(("vaapi", [
                 self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
-                "-i", str(self.source), "-map", "0:v:0",
-                "-vf", f"scale_qsv=w={w}:h={h}:format=nv12,hwdownload,"
+                *hw, "-i", str(self.source), "-map", "0:v:0",
+                "-vf", f"scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,"
                        f"format=nv12,scdet=threshold=100,metadata=print:file=-",
                 "-f", "null", "-"]))
         cmds.append(("software", sw))

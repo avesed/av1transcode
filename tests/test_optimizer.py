@@ -3866,7 +3866,7 @@ def test_the_final_mux_keeps_the_sources_chapters_and_tags_as_they_were(
 
 
 def test_scaled_size_derives_the_hw_scale_target(settings, info, plan, tmp_path):
-    """scale_qsv has to be told the size outright.
+    """A GPU scaler has to be told the size outright.
 
     Its own w=-1 rounds to the card's surface alignment, not to what the
     software `scale` filter picks - measured on a 3840x1606 source, -2:540 gives
@@ -3887,18 +3887,20 @@ def test_scaled_size_derives_the_hw_scale_target(settings, info, plan, tmp_path)
     assert enc._scaled_size("-2:540") is None
 
 
-def test_detection_copy_tries_the_gpu_first(settings, info, plan, tmp_path):
+def test_detection_copy_tries_the_gpu_first(settings, info, plan, tmp_path, monkeypatch):
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
     info.width, info.height = 3840, 2160
     enc = make_encoder(settings, info, plan, tmp_path)
     cmds = enc._detection_copy_cmds(tmp_path / "out.mkv", "-2:540")
-    assert [label for label, _ in cmds] == ["qsv", "software"]
-    qsv = " ".join(cmds[0][1])
-    # explicit size, and no -qsv_device: the container is given one render node
-    # and naming a fixed /dev/dri/renderDNN would be wrong on any other host
-    assert "scale_qsv=w=960:h=540" in qsv and "-qsv_device" not in qsv
+    assert [label for label, _ in cmds] == ["vaapi", "software"]
+    hw = " ".join(cmds[0][1])
+    # explicit size, on the render node the container was given; VA-API, not
+    # QSV, whose scaler re-stamps frames by the container's nominal rate
+    assert "-hwaccel vaapi -hwaccel_device /dev/dri/renderD129" in hw
+    assert "scale_vaapi=w=960:h=540" in hw and "qsv" not in hw
     # still encoded with x264: encoding on the GPU as well is barely faster and
     # its artefacts move more cuts than the scaler alone does
-    assert "libx264" in qsv and "hevc_qsv" not in qsv
+    assert "libx264" in hw
 
     settings.transcode.optimizer.scenedetect_hwaccel = "off"
     assert [label for label, _ in enc._detection_copy_cmds(tmp_path / "o.mkv", "-2:540")] \
@@ -3907,15 +3909,20 @@ def test_detection_copy_tries_the_gpu_first(settings, info, plan, tmp_path):
     settings.transcode.optimizer.scenedetect_hwaccel = "auto"
     assert [label for label, _ in enc._detection_copy_cmds(tmp_path / "o.mkv", "iw/2:-2")] \
         == ["software"]
+    # no render node, no hardware path
+    monkeypatch.setattr(opt, "_render_nodes", lambda: [])
+    assert [label for label, _ in enc._detection_copy_cmds(tmp_path / "o.mkv", "-2:540")] \
+        == ["software"]
 
 
 def test_detection_copy_falls_back_when_the_gpu_writes_nothing(
         settings, info, plan, tmp_path, monkeypatch):
-    """A QSV decode the card cannot do exits 0 having written nothing.
+    """A hardware decode the card cannot do exits 0 having written nothing.
 
-    That is how AV1 fails on a B580, so a zero-length output has to count as
-    failure rather than as a finished copy.
+    That is how AV1 failed on a B580 through QSV, so a zero-length output has
+    to count as failure rather than as a finished copy.
     """
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
     info.width, info.height = 3840, 2160
     settings.transcode.optimizer.scenedetect_scale = "-2:540"
     enc = make_encoder(settings, info, plan, tmp_path)
@@ -3923,19 +3930,20 @@ def test_detection_copy_falls_back_when_the_gpu_writes_nothing(
 
     def fake(args, timeout, total_seconds, tag):
         tags.append(tag)
-        if "qsv" in tag:
+        if "vaapi" in tag:
             return                       # exits cleanly, writes nothing
         (enc.probe_dir / "detect_copy.mkv").write_bytes(b"x")
 
     monkeypatch.setattr(enc, "_run_with_progress", fake)
     out = enc._make_detection_copy()
     assert out is not None and out.exists()
-    assert tags == ["downscale for detection (qsv)",
+    assert tags == ["downscale for detection (vaapi)",
                     "downscale for detection (software)"]
 
 
 def test_detection_copy_falls_back_when_the_gpu_errors(
         settings, info, plan, tmp_path, monkeypatch):
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
     info.width, info.height = 3840, 2160
     settings.transcode.optimizer.scenedetect_scale = "-2:540"
     enc = make_encoder(settings, info, plan, tmp_path)
@@ -3943,7 +3951,7 @@ def test_detection_copy_falls_back_when_the_gpu_errors(
 
     def fake(args, timeout, total_seconds, tag):
         tags.append(tag)
-        if "qsv" in tag:
+        if "vaapi" in tag:
             raise opt.TranscodeError("Device creation failed: -542398533.")
         (enc.probe_dir / "detect_copy.mkv").write_bytes(b"x")
 
@@ -4189,13 +4197,14 @@ def test_scdet_builds_shots_covering_every_frame(settings, info, plan, tmp_path,
     assert all(a[1] == b[0] for a, b in zip(shots, shots[1:]))
 
 
-def test_scdet_pass_stages_nothing(settings, info, plan, tmp_path):
+def test_scdet_pass_stages_nothing(settings, info, plan, tmp_path, monkeypatch):
     """The point of this engine: one pass over the source, no copy on disk."""
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
     info.width, info.height = 3840, 2160
     settings.transcode.optimizer.scenedetect_scale = "-2:540"
     enc = make_encoder(settings, info, plan, tmp_path)
     cmds = enc._scdet_cmds()
-    assert [label for label, _ in cmds] == ["qsv", "software"]
+    assert [label for label, _ in cmds] == ["vaapi", "software"]
     for _, args in cmds:
         joined = " ".join(args)
         assert "scdet=threshold=100" in joined    # thresholded in Python instead
@@ -4206,21 +4215,39 @@ def test_scdet_pass_stages_nothing(settings, info, plan, tmp_path):
     assert [label for label, _ in enc._scdet_cmds()] == ["software"]
 
 
+def test_scdet_hardware_path_is_vaapi_not_qsv(settings, info, plan, tmp_path, monkeypatch):
+    """QSV's scaler re-stamped frames by the container's nominal rate: on a file
+    whose header said 16.8 ms per frame over 16.683 ms frames (Hardcore Henry)
+    the scdet pass saw 55 duplicated timestamps in a minute and the timeline
+    check refused the source. VA-API's scaler keeps the decoder's timestamps."""
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
+    info.width, info.height = 3840, 2160
+    settings.transcode.optimizer.scenedetect_scale = "-2:540"
+    enc = make_encoder(settings, info, plan, tmp_path)
+    hw = " ".join(enc._scdet_cmds()[0][1])
+    assert "-hwaccel vaapi -hwaccel_device /dev/dri/renderD129 -hwaccel_output_format vaapi" in hw
+    assert "scale_vaapi=w=960:h=540:format=nv12,hwdownload,format=nv12,scdet" in hw
+    assert "qsv" not in hw
+    monkeypatch.setattr(opt, "_render_nodes", lambda: [])
+    assert [label for label, _ in enc._scdet_cmds()] == ["software"]
+
+
 def test_scdet_falls_back_then_gives_up(settings, info, plan, tmp_path, monkeypatch):
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
     info.width, info.height = 3840, 2160
     settings.transcode.optimizer.scenedetect_scale = "-2:540"
     enc = make_encoder(settings, info, plan, tmp_path)
     tried = []
 
     def fake(args):
-        tried.append("qsv" if "-hwaccel" in args else "software")
+        tried.append("vaapi" if "-hwaccel" in args else "software")
         if "-hwaccel" in args:
             return []                       # decodes nothing, like AV1 on a B580
         return [0.0] * 50 + [9.0] + [0.0] * 49
 
     monkeypatch.setattr(enc, "_run_scdet", fake)
     shots = enc._detect_shots_scdet()
-    assert tried == ["qsv", "software"]
+    assert tried == ["vaapi", "software"]
     assert shots == [(0, 50), (50, 100)]
 
     monkeypatch.setattr(enc, "_run_scdet", lambda args: [])
