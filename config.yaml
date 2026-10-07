@@ -93,6 +93,13 @@ transcode:
     # 那些已经设了 strip_rpu: false 并（正确地）观察到毫无影响的人的行为。
     # 旧配置里留着这一行也没关系，未知键会被忽略。
 
+  grain:                       # 自动颗粒处理(profile 的 grain_auto 开关)背后的降噪服务
+    url: http://grain:8790     # 服务地址；它要和本容器用同样的路径看到片源和工作目录
+    model: v3g                 # v3g = 盲测过的版本；v3s2 = 半宽学生模型，4K 快约 1.6 倍(B580 14 vs 9 fps)，
+                               # 去除量上限下暗部细节相同，平坦处多留一点颗粒，未盲测
+    timeout_hours: 12          # 单个服务步骤的超时(4K 一小时的降噪在 B580 上约 2-3 小时)
+    keep_intermediate: false   # 保留降噪中间文件(B580 AV1 QP 0，4K 每小时约 90GB)
+
   # Netflix-style shot-based encoding engine (select per preset via
   # VideoParams.engine = "optimizer"). Uses PySceneDetect for shot detection,
   # probes every shot in PARALLEL at a grid of CRFs, interpolates a fine-grained

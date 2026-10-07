@@ -526,7 +526,8 @@ def run_shot_transcode(
     enc = ShotEncoder(settings, info, plan, source, output, tempdir, log_path,
                       progress_cb, cancel_flag, stage_cb)
     enc.run()
-    return MuxReport(enc.subtitles_dropped, enc.subtitles_added)
+    return MuxReport(enc.subtitles_dropped, enc.subtitles_added,
+                     tuple(e - s for s, e in enc.final_shots))
 
 
 def _render_nodes() -> List[str]:
@@ -925,6 +926,9 @@ class MuxReport(NamedTuple):
     """
     dropped: int = 0
     added: int = 0
+    # the encoded shots' frame counts in timeline order: grain_auto builds its
+    # film grain table one segment per shot (app/grain.py)
+    shots: Tuple[int, ...] = ()
 
 
 class ShotEncoder:
@@ -1000,6 +1004,8 @@ class ShotEncoder:
         self._mkvmerge_ver: Optional[str] = None
         self.subtitles_dropped = 0
         self.subtitles_added = 0
+        # the shots run() encoded, for MuxReport (grain_auto's per-shot table)
+        self.final_shots: List[Shot] = []
         # What the video track's encoder tags say (see _encoder_tags): the
         # SVT-AV1 build as its own banner names it, and the CRF each shot
         # went out at.
@@ -6600,6 +6606,7 @@ class ShotEncoder:
                           f"source={self.info.duration:.1f}s @ {self.fps:g}fps "
                           f"~{self.total_frames} frames")
             shots = self.detect_shots()
+            self.final_shots = list(shots)
             self._log(f"{len(shots)} shot(s) from scene detection")
             # Probe the source's video lead once, here, rather than letting
             # the first few probe workers all discover it at the same time.

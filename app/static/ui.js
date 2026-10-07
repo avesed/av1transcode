@@ -160,10 +160,13 @@ var STATUS = {
 var STAGE = {
   "":          { cn: "",             short: "" },
   analyzing:   { cn: "分析中",       short: "分析" },
+  grain_analyse: { cn: "颗粒分析",     short: "颗粒" },
+  denoising:   { cn: "降噪中",       short: "降噪" },
   scenedetect: { cn: "场景检测",     short: "分镜" },
   probing:     { cn: "质量探测中",   short: "探测" },
   encoding:    { cn: "转码中",       short: "编码" },
   verifying:   { cn: "成品质量校验中", short: "校验" },
+  grain:       { cn: "合成颗粒",     short: "合成" },
   cancelling:  { cn: "取消中…",      short: "取消" },
   retry:       { cn: "准备重试",     short: "重试" },
   done:        { cn: "已完成",       short: "完成" },

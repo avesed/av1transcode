@@ -479,6 +479,18 @@ def run_full_transcode(
             else:
                 logger.warning("Unsupported DV profile {} - encoding BL directly", info.dovi.profile)
 
+    # --- automatic grain handling: the grain service may swap in a denoised
+    # intermediate here (or decide the source is not one to denoise) ---
+    grain_ctx = None
+    if video.grain_auto:
+        from app import grain as grain_auto  # the service client stays out of other jobs' imports
+        try:
+            encode_input, grain_ctx = grain_auto.prepare(
+                settings, info, video, bool(plan.p5), encode_input, work_dir, tmp_files,
+                stage_cb, progress_cb, cancel_flag)
+        except grain_auto.GrainError as e:   # only a cancel gets here: prepare() degrades everything else
+            raise TranscodeError("Job cancelled by user") from e
+
     # --- av1an encode ---
     tempdir = work_dir / f"av1an_{time.time_ns()}"
     tempdir.mkdir(parents=True, exist_ok=True)
@@ -513,6 +525,21 @@ def run_full_transcode(
             if mux is not None:
                 subs_dropped, subs_added = mux.dropped, mux.added
             logger.info("optimizer finished in {:.1f}s", time.monotonic() - t0)
+            if grain_ctx is not None:
+                try:
+                    grain_auto.finish(settings, grain_ctx, output, mux.shots if mux is not None else (),
+                                      work_dir, stage_cb, on_progress, cancel_flag)
+                except grain_auto.GrainError as e:
+                    # denoised and left without its grain, the output is not one to keep (and not one a
+                    # retry may mistake for a finished file)
+                    if output.exists():
+                        try:
+                            output.unlink()
+                        except OSError:
+                            pass
+                    if cancel_flag is not None and cancel_flag():
+                        raise TranscodeError("Job cancelled by user") from e
+                    raise TranscodeError(f"grain synthesis failed: {e}") from e
         else:
             cmd = build_av1an_cmd(
                 settings, video, encode_input, output, tempdir,

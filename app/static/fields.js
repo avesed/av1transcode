@@ -146,6 +146,10 @@ const PRESET_FIELDS = [
   F("preset", "SVT-AV1 速度", "0 最慢最好，13 最快。", { min: 0, max: 13, dflt: 4 }),
   F("film_grain", "胶片颗粒合成", "0 关；颗粒电影 8-10。", { min: 0, max: 50, dflt: 0 }),
   F("film_grain_denoise", "先去噪再合成颗粒", "", { type: "bool" }),
+  F("grain_auto", "自动颗粒处理", "optimizer 引擎。胶片颗粒片源自动降噪 + 实测颗粒合成，其余照常编码；需要 grain 降噪服务。", {
+    type: "bool",
+    summary: "展开：流程与盲测结果",
+    note: "先由降噪服务分析片源：噪点等级够高、颗粒是高斯型且逐帧新生成的胶片颗粒才开；干净片源、被编码器冻住或刻意做出来的颗粒质感一律关，和不开这个开关完全一样。开了之后：降噪（对齐前后各 3 帧的 v3 模型，去除量不超过这部片自己的颗粒强度），按降噪后的画面选 CRF，编码完再按镜头和亮度测出成片比原片少的颗粒，写进 AV1 的颗粒合成参数（不重新编码）。盲测 12 部剧（test-03 ~ test-09）全部胜出或持平，新片源码率比生产版少 33~44%。B580 上 4K 降噪约 9 fps，所以颗粒片源一集的总时间约翻倍。" }),
   F("luminance_qp_bias", "暗帧 QP 偏置", "0 关。实测 50：体积 +9~10%，够不到目标的镜头 6/23 → 2/23。", {
     min: 0, max: 100, dflt: 0,
     summary: "展开实测数据（偏置 50，23 个镜头）",
@@ -165,8 +169,9 @@ const PRESET_FIELDS = [
   F("additional_video_params", "SVT-AV1 额外参数", "", { type: "text", placeholder: "--sharpness 1 --enable-qm 1", wide: true }),
 ];
 
-// Which preset keys go to the server as integers. film_grain_denoise is the
-// one boolean; everything else is sent as the trimmed string it was typed as.
+// Which preset keys go to the server as integers. film_grain_denoise and
+// grain_auto are the booleans; everything else is sent as the trimmed string
+// it was typed as.
 const PRESET_INT = new Set(["crf", "preset", "film_grain", "luminance_qp_bias", "passes", "keyint", "extra_split_sec", "min_scene_len", "tune", "probes", "probing_rate", "vmaf_threads"]);
 
 // The settings page's sections in page order: the desktop rail and the phone

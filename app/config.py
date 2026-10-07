@@ -93,6 +93,18 @@ class VideoParams(BaseModel):
     # Whether that trade is worth taking is a judgement about the library,
     # which is why it is a per-preset switch and not a global default.
     luminance_qp_bias: int = 0
+    # Automatic grain handling (optimizer engine; needs the grain service, see
+    # GrainAuto). Off: the file is encoded as it is. On: the service first
+    # decides whether the source carries film grain a denoiser should take off
+    # (its noise level, and whether the grain is Gaussian and new every frame
+    # rather than frozen or deliberate texture). If it does, the source is
+    # denoised, the CRFs are chosen against the denoised picture, and the grain
+    # the encode lacks against the source is measured per shot and brightness
+    # and written into the AV1 stream as film grain synthesis. Anything else is
+    # encoded exactly as with the switch off. Blind-tested on 12 series
+    # (test-03 .. test-09): the grain path won or tied every one, at 33-44% less
+    # bitrate on new sources.
+    grain_auto: bool = False
     passes: int = 1
     keyint: int = 240
     # extra split in seconds: av1an will subdivide long scenes to keep chunks
@@ -793,6 +805,25 @@ class DolbyVision(BaseModel):
         return v
 
 
+class GrainAuto(BaseModel):
+    """The grain service behind VideoParams.grain_auto (av1transcode's grain/
+    directory, image av1t-grain): it analyses, denoises and puts the grain back,
+    on the GPU. Like the CVVDP scorer it must see the source and the work dir
+    under the same paths as this container."""
+    url: str = "http://grain:8790"
+    # The denoiser: v3g is the blind-tested model (aligned 7-frame U-Net with
+    # the removal cap); v3s2 is its half-width student, ~1.6x faster at 4K
+    # (B580: 14 vs 9 fps) with the same shadow detail under the cap but a
+    # little more grain left on flat areas, not blind-tested.
+    model: Literal["v3g", "v3s2"] = "v3g"
+    # How long one service step may run before the job fails, in hours (the
+    # denoise of a 4K hour on the B580 takes about 2-3 h with v3g).
+    timeout_hours: float = 12.0
+    # Keep the denoised intermediate (B580 AV1 at QP 0, ~90GB per 4K hour)
+    # after the job, for inspection.
+    keep_intermediate: bool = False
+
+
 class Hdr(BaseModel):
     # Preserve HDR10/HLG mastering display and CLL metadata on output.
     preserve: bool = True
@@ -824,6 +855,7 @@ class Transcode(BaseModel):
     # Which preset is the default (falls back to video defaults if unset)
     default_preset: str = "balanced"
     dovi: DolbyVision = Field(default_factory=DolbyVision)
+    grain: GrainAuto = Field(default_factory=GrainAuto)
     hdr: Hdr = Field(default_factory=Hdr)
     metadata: Metadata = Field(default_factory=Metadata)
     optimizer: OptimizerSettings = Field(default_factory=OptimizerSettings)

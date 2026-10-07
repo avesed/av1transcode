@@ -29,3 +29,5 @@ venv/
 # Test artifacts
 .pytest_cache/
 .playwright-mcp/
+# grain service weights (built into the image on the box, not kept in git)
+grain/weights/

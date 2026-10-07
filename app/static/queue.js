@@ -42,6 +42,11 @@
   // mark already says 分析中 while it runs.
   const LADDERS = {
     optimizer:  [["scenedetect", 1], ["probing", 3], ["encoding", 5], ["verifying", 1]],
+    // grain_auto: the grain service's analysis and denoise come first and its
+    // grain synthesis last (app/grain.py); a source it leaves off passes
+    // straight from 颗粒 to 分镜
+    optimizerGrain: [["grain_analyse", 1], ["denoising", 4], ["scenedetect", 1], ["probing", 3], ["encoding", 5],
+                     ["verifying", 1], ["grain", 1]],
     av1anProbe: [["scenedetect", 1], ["probing", 3], ["encoding", 6]],
     av1an:      [["scenedetect", 1], ["encoding", 9]],
   };
@@ -83,9 +88,10 @@
   const presetOf = (j) => S.presets[params(j).preset] || {};
   const engineOf = (j) => overrides(j).engine || presetOf(j).engine || "av1an";
   const targetQuality = (j) => overrides(j).target_quality || presetOf(j).target_quality || "";
+  const grainAuto = (j) => !!("grain_auto" in overrides(j) ? overrides(j).grain_auto : presetOf(j).grain_auto);
 
   function segmentsFor(j) {
-    if (engineOf(j) === "optimizer") return LADDERS.optimizer;
+    if (engineOf(j) === "optimizer") return grainAuto(j) ? LADDERS.optimizerGrain : LADDERS.optimizer;
     return targetQuality(j) ? LADDERS.av1anProbe : LADDERS.av1an;
   }
 

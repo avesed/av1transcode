@@ -557,6 +557,7 @@ function presetSummary(p) {
   if (p.engine === "optimizer") out.push(`engine=optimizer · metric=${p.target_metric}${p.target_quality ? ` · target=${p.target_quality}` : ""}`);
   else if (p.target_quality) out.push(`target_quality=${p.target_quality}`);
   if (p.film_grain) out.push(`film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
+  if (p.grain_auto) out.push("自动颗粒");
   if (p.luminance_qp_bias) out.push(`luminance_qp_bias=${p.luminance_qp_bias}`);
   if (p.vmaf_threads) out.push(`vmaf_threads=${p.vmaf_threads}`);
   if (p.additional_video_params) out.push(p.additional_video_params);
