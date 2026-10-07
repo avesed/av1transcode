@@ -219,6 +219,7 @@ def test_finish_puts_the_grain_stream_back_on_the_outputs_timestamps(settings, s
     assert res["flicker"]["auto"]["fine_swing"] == 0.033
     job = s.calls[-1]
     assert job["kind"] == "grain" and job["shots"] == [24, 24] and job["source"] == str(holey_source)
+    assert job["strength"] == 0.7                                # the owner's 30% less grain (test-10)
     assert tracks(av1_output) == ["video", "audio", "subtitles"]
     assert timestamps(av1_output) == pytest.approx(before, abs=1.0)
     assert rate(av1_output) == before_rate == "24/1"

@@ -307,7 +307,8 @@ def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[
               "-c", "copy", "-f", "ivf", str(vid)], "ffmpeg ivf")
         rate = _rate(settings, output)
         res = ctx.service.run("grain", {"source": str(ctx.source), "video": str(vid), "shots": list(shots),
-                                        "fps": rate or "24000/1001", "out": str(out_ivf), "work": str(gwork)},
+                                        "fps": rate or "24000/1001", "out": str(out_ivf), "work": str(gwork),
+                                        "strength": settings.transcode.grain.strength},
                               (lambda p: progress_cb(round(p * 100, 1), None)) if progress_cb else None, cancel_flag)
         if _frames(settings, out_ivf) != n_out:
             raise GrainError("the grain-synthesis stream lost frames")

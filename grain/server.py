@@ -4,7 +4,7 @@ av1transcode (profile switch grain_auto) asks it, in order, for:
   analyse  {"source"}                         -> {"class": grain|texture|clean, "on": bool, "why", "level", ...}
   denoise  {"source", "out", "model"?}        -> out: the denoised video alone (B580 AV1 at QP 0, constant frame rate;
                                                  the caller puts the source's timestamps back)
-  grain    {"source", "video", "shots", "fps", "out", "work"}
+  grain    {"source", "video", "shots", "fps", "out", "work", "strength"?}
                                               -> out: VIDEO (an AV1 ivf) with a measured film grain table written in
 API (JSON):
   GET  /health                       {"ok": true, "device", "busy": job id or null, "models": [...]}
@@ -137,7 +137,8 @@ def do_grain(job):
                 job.progress = max(job.progress, v)
         if line.startswith("RESULT "):
             result.update(json.loads(line[7:]))
-    run_proc(job, [sys.executable, f"{HERE}/grain_apply.py", src, video, sj, p["fps"], out, work, str(p.get("chroma", 1.0))],
+    run_proc(job, [sys.executable, f"{HERE}/grain_apply.py", src, video, sj, p["fps"], out, work, str(p.get("chroma", 1.0)),
+                   str(float(p.get("strength", 1.0)))],
              py_env(RENDER_NODE=os.environ.get("RENDER_NODE", "/dev/dri/renderD128")), on_line)
     return result
 

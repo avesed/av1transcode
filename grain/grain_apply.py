@@ -16,7 +16,8 @@ The steps grainauto's blind tests ran (grainauto.grain(), ga_bins.py, ga_table.p
 Bins are measured on the GPU (ga_bins.py's numpy cost about 0.3 s per 4K frame); the source is decoded on VA-API when
 RENDER_NODE is set (sequential reads only: no seek, so none of the hwaccel seek traps). Every frame is decoded, but
 only the frames a step needs (every STEP-th, and the flicker shots' every frame) leave ffmpeg, through select.
-  python3 grain_apply.py SRC VIDEO.ivf SHOTS.json FPS OUT.ivf WORKDIR [CHROMA]
+  6. strength  the corrected table's scaling times STRENGTH (the owner's 30% less, test-10)
+  python3 grain_apply.py SRC VIDEO.ivf SHOTS.json FPS OUT.ivf WORKDIR [CHROMA [STRENGTH]]
 SHOTS.json = {"shots": [{"frames": n}, ...]} in timeline order. Prints JSON {"target": ..., "applied": ...} summaries.
 """
 import json, os, subprocess, sys, time
@@ -292,7 +293,21 @@ def apply(tbl, src_ivf, out_ivf):
         raise RuntimeError(f"grav1synth apply failed: {(p.stderr or p.stdout)[-800:]}")
 
 
-def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0):
+def scaled(tbl_in, tbl_out, k):
+    """the table with every sY / sCb / sCr scaling value times k (each point's x kept): the grain's amplitude times k,
+    since AV1 adds scaling(y) * grain >> scaling_shift."""
+    out = []
+    for line in open(tbl_in):
+        t = line.split()
+        if t and t[0] in ("sY", "sCb", "sCr"):
+            pts = [int(x) for x in t[2:2 + 2 * int(t[1])]]
+            pts[1::2] = [min(255, int(round(v * k))) for v in pts[1::2]]
+            line = "\t" + " ".join([t[0], t[1]] + [str(x) for x in pts]) + "\n"
+        out.append(line)
+    open(tbl_out, "w").write("".join(out))
+
+
+def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0, strength=1.0):
     os.makedirs(work, exist_ok=True)
     shots = [s["frames"] for s in json.load(open(shots_json))["shots"]]
     log(f"target: {src} against {video}, {len(shots)} shots, {sum(shots)} frames")
@@ -316,9 +331,14 @@ def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0):
     json.dump(app, open(aj, "w"))
     os.remove(tmp)
     corr_log = table(shots_json, fps, tj, tbl, chroma, f"{tj}:{aj}")
+    if strength != 1.0:
+        # the measured grain times strength, on the corrected table: test-10 (2026-10-07), the owner picked 30% less
+        # grain on two clips of four and called the other two the same
+        scaled(tbl, f"{work}/grain_s.tbl", strength)
+        tbl = f"{work}/grain_s.tbl"
     apply(tbl, video, out_ivf)
     res = {"target": summary(tgt), "applied0": summary(app), "flicker": flick, "correction": corr_log.strip()[-400:],
-           "table": tbl}
+           "strength": strength, "table": tbl}
     log(f"flicker (logged only): {json.dumps(flick)}")
     log("done")
     return res
@@ -326,5 +346,5 @@ def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    r = run(a[0], a[1], a[2], a[3], a[4], a[5], float(a[6]) if len(a) > 6 else 1.0)
+    r = run(a[0], a[1], a[2], a[3], a[4], a[5], float(a[6]) if len(a) > 6 else 1.0, float(a[7]) if len(a) > 7 else 1.0)
     print("RESULT " + json.dumps(r), flush=True)
