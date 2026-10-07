@@ -285,7 +285,9 @@ def table(shots_json, fps, target_json, out_tbl, chroma, corr=None):
 
 
 def apply(tbl, src_ivf, out_ivf):
-    p = subprocess.run([GRAV1SYNTH, "apply", "-y", "-g", tbl, "-o", out_ivf, src_ivf], capture_output=True, text=True)
+    # --replace: without it grav1synth skips a stream that already has grain headers, exit 0 and no output
+    p = subprocess.run([GRAV1SYNTH, "apply", "-y", "--replace", "-g", tbl, "-o", out_ivf, src_ivf], capture_output=True,
+                       text=True)
     if p.returncode or not os.path.exists(out_ivf):
         raise RuntimeError(f"grav1synth apply failed: {(p.stderr or p.stdout)[-800:]}")
 

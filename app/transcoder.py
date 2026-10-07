@@ -484,6 +484,8 @@ def run_full_transcode(
     grain_ctx = None
     if video.grain_auto:
         from app import grain as grain_auto  # the service client stays out of other jobs' imports
+        # SVT-AV1's own film grain stays off with it (both engines read plan.params)
+        video = plan.params = grain_auto.without_film_grain(video)
         try:
             encode_input, grain_ctx = grain_auto.prepare(
                 settings, info, video, bool(plan.p5), encode_input, work_dir, tmp_files,

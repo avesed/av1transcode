@@ -265,3 +265,42 @@ def test_a_failed_grain_step_fails_the_job_and_drops_the_output(settings, monkey
         transcoder.run_full_transcode(settings, MediaInfo(path=holey_source), plan, holey_source, out)
     assert not out.exists()
     assert not base.exists()
+
+
+def test_svt_film_grain_is_taken_out_of_every_place_a_profile_can_set_it():
+    from app.config import VideoParams
+    v = VideoParams(engine="optimizer", grain_auto=True, film_grain=10, film_grain_denoise=True,
+                    additional_video_params="--sharpness 1 --film-grain 8 film-grain-denoise=1 --fgs-table /t/a.tbl "
+                                            "enable-overlays=1:film-grain=5:tune=0 --film-grain=4 --enable-qm 1")
+    out = grain.without_film_grain(v)
+    assert out.film_grain == 0 and not out.film_grain_denoise
+    assert out.additional_video_params == "--sharpness 1 enable-overlays=1:tune=0 --enable-qm 1"
+    assert out.grain_auto and v.film_grain == 10                 # a copy: the profile itself is untouched
+    clean = VideoParams(engine="optimizer", grain_auto=True, additional_video_params="--sharpness 1")
+    assert grain.without_film_grain(clean) is clean
+
+
+def test_grain_auto_jobs_encode_without_svt_film_grain(settings, monkeypatch, tmp_path, holey_source):
+    """Both engines read plan.params: with grain_auto on, it reaches them with SVT's film grain off, also when the
+    service says off for the source."""
+    from app import optimizer, transcoder
+    from app.analyzer import MediaInfo
+    from app.decisions import TranscodePlan
+    from app.optimizer import MuxReport
+
+    plan = TranscodePlan()
+    plan.params = _video().model_copy(update={"film_grain": 8, "additional_video_params": "--film-grain 8 --tune 0"})
+    seen = {}
+    monkeypatch.setattr(grain, "prepare", lambda *a, **_k: (a[4], None))
+
+    def encode(_s, _i, p, _src, output, _tempdir, **_kw):
+        seen["params"] = p.params
+        Path(output).write_bytes(b"encoded")
+        return MuxReport(shots=(48,))
+    monkeypatch.setattr(optimizer, "run_shot_transcode", encode)
+    try:
+        transcoder.run_full_transcode(settings, MediaInfo(path=holey_source), plan, holey_source, tmp_path / "o.mkv")
+    except Exception:                    # the stand-in output is not a real file; only what the engine got matters
+        pass
+    assert seen["params"].film_grain == 0
+    assert seen["params"].additional_video_params == "--tune 0"

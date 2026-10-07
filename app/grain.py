@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable, List, NamedTuple, Optional, Sequence
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -93,6 +93,51 @@ class GrainService:
             self._call("POST", f"/jobs/{jid}/cancel", {})
         except GrainError:
             pass
+
+
+# SVT-AV1's own film grain, which grain_auto replaces; in additional_video_params as "--film-grain 8",
+# "--film-grain=8", "film-grain=8" or inside an svtav1-params string ("enable-overlays=1:film-grain=8")
+_SVT_GRAIN_KEYS = ("film-grain", "film-grain-denoise", "fgs-table")
+
+
+def _strip_svt_grain(params: str) -> Tuple[str, List[str]]:
+    """additional_video_params without SVT-AV1's film grain options -> (what is left, what was taken out)."""
+    toks, keep, gone, i = (params or "").split(), [], [], 0
+    is_grain = lambda t: t.split("=", 1)[0].lstrip("-") in _SVT_GRAIN_KEYS
+    while i < len(toks):
+        t = toks[i]
+        if ":" in t and "=" in t and not t.startswith("-"):          # key=value:key=value
+            parts = t.split(":")
+            gone += [x for x in parts if is_grain(x)]
+            rest = [x for x in parts if not is_grain(x)]
+            if rest:
+                keep.append(":".join(rest))
+        elif is_grain(t):
+            if "=" not in t and i + 1 < len(toks) and not toks[i + 1].startswith("-"):
+                gone.append(f"{t} {toks[i + 1]}")
+                i += 1
+            else:
+                gone.append(t)
+        else:
+            keep.append(t)
+        i += 1
+    return " ".join(keep), gone
+
+
+def without_film_grain(video: VideoParams) -> VideoParams:
+    """grain_auto owns the grain: SVT-AV1's film grain stays off for its jobs, whatever the profile sets (film_grain,
+    film_grain_denoise, or the options in additional_video_params). Left on, the two would stack on a grain-on
+    source, the probes would pick CRFs with SVT's grain in them, and grav1synth will not write a table into a stream
+    that already carries one - the job would fail after the whole encode."""
+    extra, gone = _strip_svt_grain(video.additional_video_params)
+    if video.film_grain:
+        gone.insert(0, f"film_grain {video.film_grain}")
+    if video.film_grain_denoise:
+        gone.insert(0 if not video.film_grain else 1, "film_grain_denoise")
+    if not gone:
+        return video
+    logger.warning("grain_auto: SVT-AV1's own film grain stays off with it; ignoring {}", ", ".join(gone))
+    return video.model_copy(update={"film_grain": 0, "film_grain_denoise": False, "additional_video_params": extra})
 
 
 def _run(cmd: Sequence[str], what: str, timeout: float = 3 * 3600) -> str:
