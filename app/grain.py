@@ -286,6 +286,12 @@ def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[
         # logged, not acted on (the owner picked flicker-vetoed versions twice in blind tests, test-08 / test-09)
         logger.info("grain_auto: grain flicker (fine-band swing on flat static picture) {:.3f} against the source's "
                     "{:.3f} ({:.2f}x)", auto_sw, src_sw, auto_sw / src_sw)
+    hard = [r for r in fl.get("shots") or [] if r.get("fine_ratio")]
+    if hard:
+        # measured on the hardest shots only (most flat picture times grain to synthesise), highest ratio first
+        logger.info("grain_auto: flicker on the {} hardest shots, highest first: {}", len(hard), ", ".join(
+            f"shot {r['shot']} {r['fine_ratio']:.2f}x ({r['source'].get('fine_swing')} -> "
+            f"{r['auto'].get('fine_swing')})" for r in hard[:3]))
     return res
 
 

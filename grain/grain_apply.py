@@ -10,9 +10,12 @@ The steps grainauto's blind tests ran (grainauto.grain(), ga_bins.py, ga_table.p
   4. applied  what the grain synthesis actually adds: the result decoded with minus without film grain
   5. again    the table rebuilt with the target / applied correction (CORR), applied once more
   flicker     logged, not acted on (owner 2026-10-07): grainauto's flicker_gpu.py swing of the fine and mid bands on
-              flat static picture, source vs the first table's result, measured in step 4's decode pass
+              flat static picture, source vs the first table's result, measured in step 4's decode pass on the
+              FLICKER_SHOTS hardest shots only - most flat picture times grain to synthesise, from step 1 - and
+              reported per shot. Every frame of every shot cost the whole step 46 of its 75 min on a 1080p episode.
 Bins are measured on the GPU (ga_bins.py's numpy cost about 0.3 s per 4K frame); the source is decoded on VA-API when
-RENDER_NODE is set (sequential reads only: no seek, so none of the hwaccel seek traps).
+RENDER_NODE is set (sequential reads only: no seek, so none of the hwaccel seek traps). Every frame is decoded, but
+only the frames a step needs (every STEP-th, and the flicker shots' every frame) leave ffmpeg, through select.
   python3 grain_apply.py SRC VIDEO.ivf SHOTS.json FPS OUT.ivf WORKDIR [CHROMA]
 SHOTS.json = {"shots": [{"frames": n}, ...]} in timeline order. Prints JSON {"target": ..., "applied": ...} summaries.
 """
@@ -24,6 +27,9 @@ import torch.nn.functional as F
 HERE = os.path.dirname(os.path.abspath(__file__))
 EDGES = [0, 16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256]
 STEP = int(os.environ.get("GRAIN_STEP", "3"))
+FLICKER_SHOTS = int(os.environ.get("GRAIN_FLICKER_SHOTS", "10"))
+FLICKER_MIN_FRAMES = 24                       # a swing needs a run of frames; a 1 s shot is the shortest worth it
+FLICKER_BINS = (48, 64, 80, 96, 128, 160)     # the 8-bit brightness bins inside the flicker mask's 200-800 (10-bit)
 # the largest believable luma grain (std, 10-bit) a bin's median over shots may ask for: grainauto's sources measured
 # 3.6-10.4, Breaking Bad's 4K 23.4. A broken source read (VA-API nv12 surfaces downloaded as p010) measured 95-847,
 # the brightness itself: the source and the encode were not compared frame for frame, and the table built on it was
@@ -55,19 +61,33 @@ def pix_fmt(path):
                            "-of", "csv=p=0", path], capture_output=True, text=True).stdout.strip().split(",")[0]
 
 
-def reader(path, w, h, grain=True, hw=False):
+def keep(step, ranges=()):
+    """select expression for frame number n: every step-th frame (step 0: none) and every frame of the [a, b) ranges."""
+    terms = ([f"not(mod(n,{step}))"] if step else []) + [f"between(n,{a},{b - 1})" for a, b in ranges]
+    return "+".join(terms) or "0"
+
+
+def kept(total, step, ranges=()):
+    """the frame numbers keep(step, ranges) lets through, in order."""
+    f = set(range(0, total, step)) if step else set()
+    for a, b in ranges:
+        f.update(range(a, b))
+    return sorted(f)
+
+
+def reader(path, w, h, grain=True, hw=False, select=None):
     """raw 10-bit frames in decode order = display order (-fps_mode passthrough), as (Y, U, V) float tensors on dev.
     grain=False exports the film grain parameters instead of applying them; hw decodes on VA-API (4:2:0 8/10-bit;
-    anything else decodes in software)."""
+    anything else decodes in software). select: a keep() expression; only those frames are read out, in order."""
     fs = w * h * 3 // 2
     pre = ([] if grain else ["-export_side_data", "film_grain"])
     node = os.environ.get("RENDER_NODE")
     surf = HW_DOWNLOAD.get(pix_fmt(path)) if hw and node else None
+    chain = [f"select='{select}'"] if select else []      # before hwdownload: a dropped frame never crosses PCIe
     if surf:
         pre += ["-hwaccel", "vaapi", "-hwaccel_device", node, "-hwaccel_output_format", "vaapi"]
-        vf = ["-vf", f"hwdownload,format={surf},format=yuv420p10le"]
-    else:
-        vf = []
+        chain += ["hwdownload", f"format={surf}", "format=yuv420p10le"]
+    vf = ["-vf", ",".join(chain)] if chain else []
     p = subprocess.Popen(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *pre, "-i", path, "-map", "0:v:0", *vf,
                           "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-"], stdout=subprocess.PIPE)
     try:
@@ -97,75 +117,111 @@ def blur(x, sg):
 
 
 class Flicker:
-    """flicker_gpu.py: per frame, on the source's flat static mid-brightness pixels, the fine (|Y - g1.5|) and mid
-    (|g1.5 - g4|) band energy of the source and of a variant; swing = mean |E_t - E_t-1| / mean E within each shot,
-    pooled over shots by frames."""
-    def __init__(self, shots):
-        self.bounds = np.cumsum([0] + list(shots))
-        self.E = {"source": [], "auto": []}
-        self.prev = None
+    """flicker_gpu.py, per shot: per frame, on the source's flat static mid-brightness pixels, the fine (|Y - g1.5|)
+    and mid (|g1.5 - g4|) band energy of the source and of a variant; swing = mean |E_t - E_t-1| / mean E within the
+    shot (its first frame has no previous one to call the picture static against). Pooled over shots by frames."""
+    def __init__(self):
+        self.E = {}
+        self.prev, self.cur = None, None
 
-    def add(self, src, var):
+    def add(self, shot, src, var):
         b3 = blur(src, 3.0)
-        if self.prev is None:
-            self.prev = b3
-            for k in self.E:
-                self.E[k].append((np.nan, np.nan))
+        if shot != self.cur:
+            self.cur, self.prev = shot, b3
+            self.E[shot] = {"source": [], "auto": []}
             return
         gy, gx = torch.gradient(b3)
         struct = blur(torch.sqrt(gx * gx + gy * gy), 3.0)
         m = ((struct < 1.5) & ((b3 - self.prev).abs() < 0.5) & (src > 200) & (src < 800)).float()
         self.prev = b3
         if float(m.mean()) < 0.01:
-            for k in self.E:
-                self.E[k].append((np.nan, np.nan))
             return
         n = m.sum().clamp(min=1)
         for k, y in (("source", src), ("auto", var)):
             g1, g4 = blur(y, 1.5), blur(y, 4.0)
-            self.E[k].append((float(((y - g1).abs() * m).sum() / n), float(((g1 - g4).abs() * m).sum() / n)))
+            self.E[shot][k].append((float(((y - g1).abs() * m).sum() / n), float(((g1 - g4).abs() * m).sum() / n)))
 
-    def result(self):
-        res = {}
-        for k, e in self.E.items():
-            a = np.array(e, dtype=np.float64)
-            out = {}
-            for bi, band in enumerate(("fine", "mid")):
-                sw, w, lev = [], [], []
-                for s0, s1 in zip(self.bounds[:-1], self.bounds[1:]):
-                    x = a[s0 + 1:s1, bi] if len(a) else np.array([])
-                    x = x[~np.isnan(x)]
-                    if len(x) > 5:
-                        sw.append(np.mean(np.abs(np.diff(x))) / np.mean(x)); w.append(len(x)); lev.append(np.mean(x))
-                out[f"{band}_swing"] = round(float(np.average(sw, weights=w)), 4) if sw else None
-                out[f"{band}_level"] = round(float(np.average(lev, weights=w)), 3) if sw else None
-            res[k] = out
+    @staticmethod
+    def _bands(e):
+        a = np.array(e, dtype=np.float64).reshape(-1, 2)
+        out = {}
+        for bi, band in enumerate(("fine", "mid")):
+            x = a[:, bi]
+            if len(x) > 5:
+                out[f"{band}_swing"] = round(float(np.mean(np.abs(np.diff(x))) / np.mean(x)), 4)
+                out[f"{band}_level"] = round(float(np.mean(x)), 3)
+        return out, len(a)
+
+    def result(self, bounds, scores):
+        res = {"source": {}, "auto": {}, "shots": []}
+        pooled = {k: {} for k in ("source", "auto")}
+        for shot, e in self.E.items():
+            row = {"shot": shot, "frames": list(bounds[shot]), "score": round(scores.get(shot, 0.0), 1)}
+            for k in ("source", "auto"):
+                row[k], n = self._bands(e[k])
+                row["measured"] = n
+                for key, v in row[k].items():
+                    pooled[k].setdefault(key, []).append((v, n))
+            s_, a_ = row["source"].get("fine_swing"), row["auto"].get("fine_swing")
+            row["fine_ratio"] = round(a_ / s_, 3) if s_ and a_ else None
+            res["shots"].append(row)
+        for k in ("source", "auto"):
+            for key, vw in pooled[k].items():
+                res[k][key] = round(float(np.average([v for v, _ in vw], weights=[w for _, w in vw])), 4)
+        res["shots"].sort(key=lambda r: -(r["fine_ratio"] or 0))
         return res
 
 
-def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None):
-    """ga_bins.py on the GPU. mode target: A = source, B = the encode; applied: A = with grain, B = without. In applied
-    mode with flicker_src, every frame also feeds a Flicker of A against that source -> (bins, flicker result)."""
+def hardest(tgt, k=FLICKER_SHOTS):
+    """the k shots where flicker would show most: flat picture inside the flicker mask's brightness, per frame
+    measured, times the luma grain to synthesise there squared -> {shot: score}, at least FLICKER_MIN_FRAMES long."""
+    scores = {}
+    for s in tgt["shots"]:
+        s0, s1 = s["frames"]
+        sampled = len(range(s0 - s0 % STEP + (STEP if s0 % STEP else 0), s1, STEP)) or 1
+        if s1 - s0 < FLICKER_MIN_FRAMES:
+            continue
+        sc = sum(b["n"] / sampled * b["y"] ** 2 for lo, b in s["bins"].items() if int(lo) in FLICKER_BINS) / 1e3
+        if sc > 0:
+            scores[s["shot"]] = sc
+    return dict(sorted(scores.items(), key=lambda t: -t[1])[:k])
+
+
+def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker_shots=None):
+    """ga_bins.py on the GPU, on every STEP-th frame. mode target: A = source, B = the encode; applied: A = with
+    grain, B = without. In applied mode with flicker_src, every frame of the flicker_shots ({shot: score}) also feeds a
+    Flicker of A against that source -> (bins, flicker result)."""
     w, h = size(path_a)
     bounds, o = [], 0
     for s in shots:
         bounds.append((o, o + s))
         o += s
+    total = o
     nb = len(EDGES) - 1
     acc = torch.zeros(len(bounds), nb, 5, dtype=torch.float64, device=dev)    # y, ny, cb, cr, nc
-    ga = reader(path_a, w, h, True, hw_a)
-    gb = reader(path_b, w, h, True) if mode == "target" else reader(path_a, w, h, False)
-    fl = Flicker(shots) if flicker_src else None
-    gs = reader(flicker_src, w, h, True, True) if flicker_src else None
-    si, t0 = 0, time.time()
+    fl_ranges = [bounds[i] for i in sorted(flicker_shots or {})] if flicker_src else []
+    fl_frames = set(kept(total, 0, fl_ranges))
+    ga = reader(path_a, w, h, True, hw_a, keep(STEP, fl_ranges))
+    gb = reader(path_b, w, h, True, False, keep(STEP)) if mode == "target" else reader(path_a, w, h, False, False, keep(STEP))
+    fl = Flicker() if fl_ranges else None
+    gs = reader(flicker_src, w, h, True, True, keep(0, fl_ranges)) if fl is not None else None
+    si, fi, t0, done = 0, 0, time.time(), 0
     with torch.no_grad():
-        for f, (a, b) in enumerate(zip(ga, gb)):
-            if fl is not None:
+        for f in kept(total, STEP, fl_ranges):
+            a = next(ga, None)
+            if a is None:
+                break
+            if f in fl_frames:
                 s_ = next(gs, None)
+                while fi < len(fl_ranges) and f >= fl_ranges[fi][1]:
+                    fi += 1
                 if s_ is not None:
-                    fl.add(s_[0], a[0])
+                    fl.add(bounds.index(fl_ranges[fi]), s_[0], a[0])
             if f % STEP:
                 continue
+            b = next(gb, None)
+            if b is None:
+                break
             while si < len(bounds) and f >= bounds[si][1]:
                 si += 1
             if si >= len(bounds):
@@ -189,7 +245,8 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None):
             acc[si, :, 2] += torch.bincount(kc, weights=(ru[fl_c] ** 2).double(), minlength=nb)
             acc[si, :, 3] += torch.bincount(kc, weights=(rv[fl_c] ** 2).double(), minlength=nb)
             acc[si, :, 4] += torch.bincount(kc, minlength=nb).double()
-            if f and f % 3000 == 0:
+            done += 1
+            if done % 1000 == 0:
                 log(f"{mode}: {f} frames, {f / (time.time() - t0):.1f} fps")
     acc = acc.cpu().numpy()
     out = {"edges": EDGES, "mode": mode, "shots": []}
@@ -201,7 +258,9 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None):
                 bb[str(lo)] = {"y": round(float((y / ny) ** 0.5), 3), "cb": round(float((cb / nc) ** 0.5), 3),
                                "cr": round(float((cr / nc) ** 0.5), 3), "n": int(ny)}
         out["shots"].append({"shot": i, "frames": [s0, s1], "bins": bb})
-    return (out, fl.result()) if fl is not None else out
+    if not flicker_src:
+        return out
+    return out, (fl.result(bounds, flicker_shots) if fl is not None else {"source": {}, "auto": {}, "shots": []})
 
 
 def summary(b):
@@ -248,8 +307,9 @@ def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0):
     table(shots_json, fps, tj, tbl, chroma)
     tmp = f"{work}/grain0.ivf"
     apply(tbl, video, tmp)
-    log("applied: measuring the first table")
-    app, flick = bins("applied", shots, tmp, flicker_src=src)
+    hard = hardest(tgt)
+    log(f"applied: measuring the first table; flicker on the {len(hard)} hardest shots {sorted(hard)}")
+    app, flick = bins("applied", shots, tmp, flicker_src=src, flicker_shots=hard)
     aj = f"{work}/applied0.json"
     json.dump(app, open(aj, "w"))
     os.remove(tmp)
