@@ -65,17 +65,25 @@ dec = subprocess.Popen(["ffmpeg", "-nostdin", "-v", "error", "-i", SRC, "-map", 
 LIMIT = float(os.environ.get("LIMIT", "0"))
 curve = None
 if LIMIT:
-    nfr = int(json.loads(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
-                                         "stream=nb_read_packets", "-of", "json", SRC], capture_output=True, text=True).stdout)
-              ["streams"][0]["nb_read_packets"])
-    picks = sorted({p + d for p in np.linspace(2, nfr - 4, 24).astype(int) for d in (0, 1)})
-    sel = "+".join(f"eq(n\\,{p})" for p in picks)
-    raw = np.frombuffer(subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", SRC, "-map", "0:v:0", "-vf", f"select='{sel}'",
-                                        "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-"],
-                                       capture_output=True).stdout, np.uint16)
-    py = [torch.from_numpy(raw[i * fs:i * fs + w * h].astype(np.float32).reshape(h, w)).to(dev) for i in range(len(raw) // fs)]
-    curve = fill(fresh_curve([(py[i], py[i + 1]) for i in range(0, len(py) - 1, 2)]), default=[2.0] * 11)
-    del py, raw
+    # 24 pairs of consecutive frames spread over the file, each read with a seek: a select over a full decode cost a
+    # 4K episode ~10 min before the first frame (and counting its packets read the whole file once more)
+    from concurrent.futures import ThreadPoolExecutor
+    num, _, den = s["r_frame_rate"].partition("/")
+    rate = float(num) / float(den or 1)
+    dur = float(json.loads(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", SRC],
+                                          capture_output=True, text=True).stdout)["format"]["duration"])
+    nfr = max(int(dur * rate), 8)
+
+    def pair(p):
+        raw = np.frombuffer(subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{p / rate:.4f}", "-i", SRC, "-map", "0:v:0",
+                                            "-frames:v", "2", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt",
+                                            "yuv420p10le", "-"], capture_output=True).stdout, np.uint16)
+        return [raw[i * fs:i * fs + w * h].astype(np.float32).reshape(h, w) for i in range(len(raw) // fs)][:2]
+    with ThreadPoolExecutor(4) as ex:
+        got = [f for f in ex.map(pair, np.linspace(2, nfr - 4, 24).astype(int)) if len(f) == 2]
+    curve = fill(fresh_curve([(torch.from_numpy(a).to(dev), torch.from_numpy(b).to(dev)) for a, b in got]),
+                 default=[2.0] * 11)
+    del got
     print(f"{os.path.basename(SRC)}: removal capped at {LIMIT:g} x fresh grain std {curve}", flush=True)
 PREFIX = os.environ.get("DN_PREFIX")
 X265 = {"color_primaries": "colorprim", "color_transfer": "transfer", "color_space": "colormatrix"}
