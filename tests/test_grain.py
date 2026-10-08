@@ -335,3 +335,52 @@ def test_the_denoised_base_carries_the_sources_hdr10_metadata(settings, service,
                          "stream_side_data=side_data_type", "-of", "csv=p=0", str(out)], capture_output=True,
                         text=True).stdout
     assert "Mastering display metadata" in sd and "Content light level metadata" in sd
+
+
+class _Scripted(grain.GrainService):
+    """The client's waiting logic against scripted answers: "down" = no answer at all, a dict = the job's state."""
+    def __init__(self, script, **kw):
+        super().__init__("http://grain.invalid", 3600, **kw)
+        self.script, self.calls = list(script), []
+
+    def _call(self, method, path, body=None, timeout=30):
+        self.calls.append((method, path))
+        if path == "/jobs":
+            return {"id": "j1"}
+        if method == "POST":
+            return {}
+        step = self.script.pop(0)
+        if step == "down":
+            raise grain.GrainUnreachable("timed out")
+        return step
+
+
+def test_a_service_that_stops_answering_for_a_while_is_waited_for(monkeypatch):
+    """2026-10-08: a neighbour's build starved the service of CPU and memory; one 30 s poll timeout failed a job
+    four hours in. Silence now only ends the wait after unreachable_s, and the job is collected when it answers."""
+    monkeypatch.setattr(grain.time, "sleep", lambda s: None)
+    svc = _Scripted(["down", "down", {"state": "running", "progress": 0.5}, "down", {"state": "done", "result": {"ok": 1}}])
+    seen = []
+    assert svc.run("grain", {}, seen.append, poll=0) == {"ok": 1}
+    assert seen == [0.5, 0.0] or seen[0] == 0.5
+    assert ("POST", "/jobs/j1/cancel") not in svc.calls
+
+
+def test_a_job_given_up_or_cancelled_is_cancelled_in_the_service_too(monkeypatch):
+    """No step may keep running there that nobody will collect: that one held the GPU an hour and queued the
+    retry's analysis behind it."""
+    monkeypatch.setattr(grain.time, "sleep", lambda s: None)
+    gone = _Scripted(["down", "down"], unreachable_s=-1)
+    with pytest.raises(grain.GrainError, match="no answer"):
+        gone.run("grain", {}, poll=0)
+    assert gone.calls[-1] == ("POST", "/jobs/j1/cancel")
+
+    stop = _Scripted([{"state": "running"}] * 3)
+    with pytest.raises(grain.GrainError, match="cancelled"):
+        stop.run("grain", {}, cancel_flag=lambda: len(stop.calls) > 2, poll=0)
+    assert stop.calls[-1] == ("POST", "/jobs/j1/cancel")
+
+    failed = _Scripted([{"state": "failed", "error": "boom", "log": []}])
+    with pytest.raises(grain.GrainError, match="boom"):
+        failed.run("grain", {}, poll=0)
+    assert ("POST", "/jobs/j1/cancel") not in failed.calls             # it ended there: nothing to cancel

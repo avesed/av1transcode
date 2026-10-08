@@ -39,6 +39,10 @@ class GrainError(Exception):
     """The grain service failed, refused or could not be reached."""
 
 
+class GrainUnreachable(GrainError):
+    """No answer from the grain service at all (refused, reset, timed out) - possibly only for the moment."""
+
+
 class GrainContext(NamedTuple):
     """What finish() needs from prepare(): the service and the source the grain is measured against."""
     service: "GrainService"
@@ -47,8 +51,15 @@ class GrainContext(NamedTuple):
 
 
 class GrainService:
-    def __init__(self, url: str, timeout_s: float):
+    # How long a running job's service may go without answering before the job is given up. 2026-10-08, A Good
+    # Girl's Guide to Murder S01E03: a neighbour's build saturated the box's CPU and memory, the service (cpu
+    # weight 21) answered no poll for over 30 s, and the job failed four hours in - its retry starting from zero
+    # while the service kept running the grain step nobody would collect.
+    UNREACHABLE_S = 900.0
+
+    def __init__(self, url: str, timeout_s: float, unreachable_s: Optional[float] = None):
         self.url, self.timeout_s = url.rstrip("/"), timeout_s
+        self.unreachable_s = self.UNREACHABLE_S if unreachable_s is None else unreachable_s
 
     def _call(self, method: str, path: str, body: Optional[dict] = None, timeout: float = 30) -> dict:
         data = None if body is None else json.dumps(body).encode()
@@ -63,30 +74,51 @@ class GrainService:
             except ValueError:
                 msg = ""
             raise GrainError(f"grain service {method} {path}: HTTP {e.code} {msg}".strip()) from e
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            raise GrainError(f"grain service at {self.url} unreachable: {e}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise GrainUnreachable(f"grain service at {self.url} unreachable: {e}") from e
+        except ValueError as e:
+            raise GrainError(f"grain service {method} {path}: not JSON: {e}") from e
 
     def run(self, kind: str, params: dict, progress_cb: Optional[Callable[[float], None]] = None,
             cancel_flag: Optional[Callable[[], bool]] = None, poll: float = 2.0) -> dict:
-        """Submit a job and wait for it. progress_cb gets 0..1; a cancel cancels the service job too."""
+        """Submit a job and wait for it. progress_cb gets 0..1. A service that stops answering is waited for up to
+        unreachable_s (polls back off to 30 s); however the wait ends early - cancelled, failed, timed out, given
+        up - the service job is cancelled too, so no step keeps running that nobody will collect."""
         jid = self._call("POST", "/jobs", {"kind": kind, **params})["id"]
         deadline = time.monotonic() + self.timeout_s
-        while True:
-            if cancel_flag is not None and cancel_flag():
+        silent_since, wait = None, poll
+        try:
+            while True:
+                if cancel_flag is not None and cancel_flag():
+                    raise GrainError(f"{kind}: cancelled")
+                try:
+                    v = self._call("GET", f"/jobs/{jid}", timeout=60)
+                except GrainUnreachable as e:
+                    now = time.monotonic()
+                    silent_since = silent_since or now
+                    if now - silent_since > self.unreachable_s:
+                        raise GrainError(f"{kind}: no answer for {self.unreachable_s / 60:g} min ({e})") from e
+                    logger.warning("grain_auto: {} - the {} step keeps running there, asking again in {:.0f} s",
+                                   e, kind, wait)
+                    time.sleep(wait)
+                    wait = min(wait * 2, 30.0)
+                    continue
+                silent_since, wait = None, poll
+                if progress_cb is not None:
+                    progress_cb(float(v.get("progress") or 0.0))
+                if v["state"] == "done":
+                    jid = None                                     # nothing left to cancel
+                    return v.get("result") or {}
+                if v["state"] in ("failed", "cancelled"):
+                    jid = None
+                    tail = " | ".join((v.get("log") or [])[-3:])
+                    raise GrainError(f"{kind} {v['state']}: {v.get('error')}" + (f" ({tail})" if tail else ""))
+                if time.monotonic() > deadline:
+                    raise GrainError(f"{kind}: no result after {self.timeout_s / 3600:g} h")
+                time.sleep(poll)
+        finally:
+            if jid is not None:
                 self._cancel(jid)
-                raise GrainError(f"{kind}: cancelled")
-            v = self._call("GET", f"/jobs/{jid}")
-            if progress_cb is not None:
-                progress_cb(float(v.get("progress") or 0.0))
-            if v["state"] == "done":
-                return v.get("result") or {}
-            if v["state"] in ("failed", "cancelled"):
-                tail = " | ".join((v.get("log") or [])[-3:])
-                raise GrainError(f"{kind} {v['state']}: {v.get('error')}" + (f" ({tail})" if tail else ""))
-            if time.monotonic() > deadline:
-                self._cancel(jid)
-                raise GrainError(f"{kind}: no result after {self.timeout_s / 3600:g} h")
-            time.sleep(poll)
 
     def _cancel(self, jid: str) -> None:
         try:
