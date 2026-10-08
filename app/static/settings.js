@@ -556,8 +556,8 @@ function presetSummary(p) {
   const out = [`crf=${p.crf} · preset=${p.preset} · passes=${p.passes} · ${p.pixel_format}`];
   if (p.engine === "optimizer") out.push(`engine=optimizer · metric=${p.target_metric}${p.target_quality ? ` · target=${p.target_quality}` : ""}`);
   else if (p.target_quality) out.push(`target_quality=${p.target_quality}`);
-  if (p.film_grain) out.push(`film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
-  if (p.grain_auto) out.push("自动降噪");
+  if (p.grain_auto) out.push("自动降噪流程");
+  if (p.film_grain) out.push(`SVT film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
   if (p.luminance_qp_bias) out.push(`luminance_qp_bias=${p.luminance_qp_bias}`);
   if (p.vmaf_threads) out.push(`vmaf_threads=${p.vmaf_threads}`);
   if (p.additional_video_params) out.push(p.additional_video_params);

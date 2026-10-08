@@ -288,19 +288,19 @@
 <div class="def" id="p-film_grain">
   <h3 class="def__name"><code>film_grain</code> <span class="tag adv">进阶</span></h3>
   <p class="def__dflt">默认 0</p>
-  <div class="def__body"><p>胶片颗粒合成 0-50；0 关闭，8-10 适合有颗粒的电影源（能显著省码率）。</p>
+  <div class="def__body"><p>设置页里叫「SVT 颗粒合成强度」：SVT-AV1 自带的胶片颗粒合成 0-50；0 关闭，8-10 适合有颗粒的电影源（能显著省码率）。打开「自动降噪流程」（<a href="#p-grain_auto">grain_auto</a>）的 profile 里无效。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
 </div>
 <div class="def" id="p-film_grain_denoise">
   <h3 class="def__name"><code>film_grain_denoise</code></h3>
   <p class="def__dflt">默认 <code>false</code></p>
-  <div class="def__body"><p>合成颗粒前先对源去噪，配合 film_grain 使用。注意目前设成 <code>true</code> 不起作用：程序只在 <code>false</code> 时显式传 <code>film-grain-denoise=0</code>，<code>true</code> 时什么都不传、交给 SVT-AV1 自己的默认值，而镜像里的 SVT-AV1 v4.2.0 默认就是 0（不去噪）。</p>
+  <div class="def__body"><p>设置页里叫「SVT 颗粒：编码前去噪」：SVT 合成颗粒前先对源去噪，只在 film_grain &gt; 0 时起作用，和自动降噪流程无关。注意目前设成 <code>true</code> 不起作用：程序只在 <code>false</code> 时显式传 <code>film-grain-denoise=0</code>，<code>true</code> 时什么都不传、交给 SVT-AV1 自己的默认值，而镜像里的 SVT-AV1 v4.2.0 默认就是 0（不去噪）。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
 </div>
 <div class="def" id="p-grain_auto">
   <h3 class="def__name"><code>grain_auto</code> <span class="tag adv">进阶</span></h3>
   <p class="def__dflt">默认 <code>false</code></p>
-  <div class="def__body"><p>设置页里叫「自动降噪 + 颗粒合成」，只对 optimizer 引擎生效，需要 grain 降噪服务（仓库的 <code>grain/</code> 目录，镜像 av1t-grain，地址在 <code>transcode.grain.url</code>，要和本容器用同样的路径看到片源和工作目录）。和上面的 film_grain 不是一回事：那个是固定强度的颗粒合成，这个先分析、再降噪、最后按实测写回颗粒。打开它的 profile 里 SVT 自带的颗粒合成一律关闭：<code>film_grain</code>、<code>film_grain_denoise</code> 以及 <code>additional_video_params</code> 里的 <code>film-grain</code> / <code>film-grain-denoise</code> / <code>fgs-table</code> 都被忽略，作业日志写明忽略了什么。两套颗粒会叠加，探测会带着 SVT 的颗粒选 CRF，而且已带颗粒参数的码流 grav1synth 不肯再写。</p>
+  <div class="def__body"><p>设置页里叫「自动降噪流程」，只对 optimizer 引擎生效，需要 grain 降噪服务（仓库的 <code>grain/</code> 目录，镜像 av1t-grain，地址在 <code>transcode.grain.url</code>，要和本容器用同样的路径看到片源和工作目录）。和上面的 film_grain 不是一回事：那个是固定强度的颗粒合成，这个先分析、再降噪、最后按实测写回颗粒。打开它的 profile 里 SVT 自带的颗粒合成一律关闭：<code>film_grain</code>、<code>film_grain_denoise</code> 以及 <code>additional_video_params</code> 里的 <code>film-grain</code> / <code>film-grain-denoise</code> / <code>fgs-table</code> 都被忽略，作业日志写明忽略了什么。两套颗粒会叠加，探测会带着 SVT 的颗粒选 CRF，而且已带颗粒参数的码流 grav1synth 不肯再写。</p>
     <p>每个作业编码前先分析片源，结果只有开或关：</p>
     <ul>
       <li><b>开</b>：噪点等级 ≥ 12（主人的 1-50 标尺），颗粒是高斯型（帧差峰度 ≤ 3）且逐帧新生成（相邻帧颗粒相关 ≤ 0.35）——典型的胶片颗粒。片源先降噪（v3 模型：对齐前后各 3 帧；去除量不超过这部片在各亮度上实测颗粒强度的 1.3 倍，暗部细节和暗色妆容因此保得住），降噪结果由 B580 硬件编成 AV1（QP 0）作中间文件，带回原片的逐帧时间戳；引擎按降噪后的画面选 CRF 编码，音轨、字幕、章节照旧取自原片；编完再按镜头、按亮度测出成片比原片少的颗粒，写进 AV1 的颗粒合成参数（grav1synth，不重编码），实测一次后校正，再按 <code>transcode.grain.strength</code>（默认 0.7，test-10 里主人两次选了减弱 30%、两次说差不多）写入。</li>
