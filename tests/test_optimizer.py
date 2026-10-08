@@ -7966,3 +7966,39 @@ def test_the_ocr_companion_against_real_tools(settings, plan, tmp_path,
     got = (tmp_path / "out.srt").read_text(encoding="utf-8")
     assert "HELLO WORLD" in got
     assert "00:00:00,200 --> 00:00:01,500" in got
+
+
+def _fake_scdet(tmp_path, name, rebuilt, fps=30.0):
+    """an ffmpeg stand-in for the scdet pass: 6 frames of metadata=print on stdout, and on stderr ffmpeg's INFO line
+    for a filter graph rebuilt mid-run when `rebuilt`."""
+    lines = "".join(f"frame:{i} pts:{i} pts_time:{i / fps:.6f}\\nlavfi.scd.mafd=0.5\\n"
+                    f"lavfi.scd.score={9.0 if i == 3 else 0.1}\\n" for i in range(6))
+    err = "[vf#0:0 @ 0x55d0] Reconfiguring filter graph because hwaccel changed\\n" if rebuilt else \
+          "[hevc @ 0x55d0] Keeping hwaccel vaapi for a new SPS\\n"
+    script = tmp_path / name
+    script.write_text(f"#!/bin/sh\nprintf '{lines}'\nprintf '{err}' >&2\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_scdet_hardware_pass_with_a_rebuilt_graph_falls_back_to_software(settings, info, plan, tmp_path,
+                                                                         monkeypatch):
+    """An in-band SPS change can make ffmpeg rebuild the VA-API pass's filter graph: scdet starts over, and on H.264
+    or AV1 the old decoder context goes while frames are in flight (what crashed iHD under zero-copy scoring). The
+    hardware pass then counts as failed and the software pass reads the source again."""
+    enc = make_encoder(settings, info, plan, tmp_path)
+    hw = [_fake_scdet(tmp_path, "hw_rebuilt", True), "-hwaccel", "vaapi"]
+    with pytest.raises(opt.TranscodeError, match="rebuilt the filter graph.*hwaccel changed"):
+        enc._run_scdet(hw)
+    ok = [_fake_scdet(tmp_path, "hw_kept", False), "-hwaccel", "vaapi"]
+    assert enc._run_scdet(ok) == [0.1, 0.1, 0.1, 9.0, 0.1, 0.1]       # "Keeping hwaccel" is no rebuild
+    assert not list(tmp_path.glob("**/scdet_*.log"))                 # the info logs are cleaned up
+
+    sw = [_fake_scdet(tmp_path, "sw", True)]                          # a software pass is not judged by it
+    monkeypatch.setattr(enc, "_scdet_cmds", lambda: [("vaapi", hw), ("software", sw)])
+    tried = []
+    real = enc._run_scdet
+    monkeypatch.setattr(enc, "_run_scdet", lambda args: (tried.append(args[0]), real(args))[1])
+    enc.total_frames = 6
+    enc._detect_shots_scdet()
+    assert [Path(t).name for t in tried] == ["hw_rebuilt", "sw"]

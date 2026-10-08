@@ -1943,8 +1943,9 @@ class ShotEncoder:
             # problem: QSV and VA-API both hand over the software decoder's
             # pictures and timestamps. VA-API's scaler keeps them; same speed
             # (187 vs 182 fps on 4K60) and the same cuts as QSV on four sources.
+            # -loglevel info: what _run_scdet looks for a rebuilt graph in
             cmds.append(("vaapi", [
-                self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                self.ffmpeg, "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin",
                 *hw, "-i", str(self.source), "-map", "0:v:0",
                 "-vf", f"scale_vaapi=w={w}:h={h}:format=nv12,hwdownload,"
                        f"format=nv12,scdet=threshold=100,metadata=print:file=-",
@@ -1958,14 +1959,28 @@ class ShotEncoder:
         scdet is run wide open (threshold=100, which never fires) and the score
         is thresholded here instead, so the knob can be changed without another
         pass over the source.
+
+        A hardware pass whose filter graph ffmpeg rebuilt mid-run (an in-band
+        SPS change that gave the decoder a new frames context, see
+        graph_rebuilt) raises, so the software pass reads the source again:
+        the rebuilt scdet starts over without the frame before, the frames
+        it counts start over too, and on H.264 or AV1, which the keep-hwaccel
+        patch does not cover, the old decoder context is destroyed under
+        frames still in flight - what crashed iHD under zero-copy scoring.
+        Its info output goes to a file beside the job, read when it ends.
         """
         self._log("$ " + " ".join(args))
         self._check_cancel()
+        err_path = (self.tempdir / f"scdet_{time.time_ns()}.log") if "-hwaccel" in args else None
+        err = open(err_path, "w", errors="replace") if err_path else subprocess.DEVNULL
         try:
             proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True,
+                                    stderr=err, text=True,
                                     errors="replace", start_new_session=True)
         except FileNotFoundError:
+            if err_path:
+                err.close()
+                err_path.unlink(missing_ok=True)
             raise TranscodeError(f"command not found: {args[0]}")
         with self._proc_lock:
             self._procs.add(proc)
@@ -2003,8 +2018,19 @@ class ShotEncoder:
             with self._proc_lock:
                 self._procs.discard(proc)
             rc = proc.wait(timeout=60)
+            if err_path:
+                err.close()
+        why = None
+        if err_path:
+            try:
+                why = graph_rebuilt(err_path.read_text(errors="replace"))
+            except OSError:
+                pass
+            err_path.unlink(missing_ok=True)
         if rc != 0:
             raise TranscodeError(f"scdet pass failed (rc={rc})")
+        if why:
+            raise TranscodeError(f"ffmpeg rebuilt the filter graph of the hardware read ({why})")
         return scores
 
     # How far a frame interval may stray from 1/fps before it counts as a
