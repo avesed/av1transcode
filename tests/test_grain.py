@@ -305,3 +305,33 @@ def test_grain_auto_jobs_encode_without_svt_film_grain(settings, monkeypatch, tm
         pass
     assert seen["params"].film_grain == 0
     assert seen["params"].additional_video_params == "--tune 0"
+
+
+@pytest.fixture()
+def hdr10_source(tmp_path):
+    """An HDR10 HEVC source: its mastering display and MaxCLL in SEI, as WEB-DL and remux sources carry them."""
+    src = tmp_path / "hdr.mkv"
+    run("ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24", "-frames:v", "24",
+        "-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-x265-params",
+        "log-level=error:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:max-cll=1000,400:"
+        "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)", src)
+    return src
+
+
+def test_the_denoised_base_carries_the_sources_hdr10_metadata(settings, service, hdr10_source):
+    """The base is encoded from raw frames, so it has no HDR10 metadata of its own; the engine's encode takes it from
+    its input, and without it the output's AV1 stream had none (only its container did)."""
+    if not shutil.which("mkvpropedit"):
+        pytest.skip("needs mkvpropedit")
+    service()
+    out, ctx = grain.prepare(settings, _info(hdr10_source), _video(), False, hdr10_source, settings.dirs.work, [])
+    assert ctx is not None
+    p = next(t for t in json.loads(subprocess.run(["mkvmerge", "-J", str(out)], capture_output=True,
+                                                  text=True).stdout)["tracks"] if t["type"] == "video")["properties"]
+    assert p["max_content_light"] == 1000 and p["max_frame_light"] == 400
+    assert p["max_luminance"] == pytest.approx(1000) and p["min_luminance"] == pytest.approx(0.0001)
+    assert p["chromaticity_coordinates"].startswith("0.68")              # red x first, as mkvmerge lists them
+    sd = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                         "stream_side_data=side_data_type", "-of", "csv=p=0", str(out)], capture_output=True,
+                        text=True).stdout
+    assert "Mastering display metadata" in sd and "Content light level metadata" in sd

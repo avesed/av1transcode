@@ -195,6 +195,35 @@ def _set_frame_rate(settings: Settings, path: Path, rate: str) -> None:
          "mkvpropedit default duration")
 
 
+def _copy_hdr10(settings: Settings, source: Path, base: Path) -> List[str]:
+    """The source's HDR10 static metadata - mastering display and MaxCLL / MaxFALL, as its first decoded frame
+    carries them - onto the denoised base's video track -> what was set. The base is built from raw frames and has
+    none, and the engine's encode takes them from its input: ffmpeg hands a Matroska track's metadata to libsvtav1,
+    which writes it as metadata OBUs, as it does from the source's own SEI on the plain path. Without this a grain_auto
+    output carried HDR10 metadata in its container only (finish_metadata writes that from the plan), none in its AV1
+    stream, where players and TVs that read the bitstream look for it."""
+    from app.analyzer import _mastering_display, _max_cll
+    from app.transcoder import _first_frame, _md_fmt, _parse_master_display
+
+    if not settings.transcode.hdr.preserve:
+        return []
+    frame = _first_frame(settings, source) or {}
+    md = _mastering_display(frame)
+    fields = _parse_master_display(md) if md else None
+    sets = [f"{k}={_md_fmt(v)}" for k, v in (fields or {}).items()]
+    cll = _max_cll(frame)
+    if cll:
+        try:
+            max_cll, max_fall = (float(v) for v in str(cll).split(","))
+            sets += [f"max-content-light={int(max_cll)}", f"max-frame-light={int(max_fall)}"]
+        except ValueError:
+            logger.warning("grain_auto: could not parse the source's MaxCLL {!r}", cll)
+    if sets:
+        _run([settings.tool_path("mkvpropedit"), "-q", str(base), "--edit", "track:v1",
+              *[a for s in sets for a in ("--set", s)]], "mkvpropedit HDR10")
+    return sets
+
+
 def _frames(settings: Settings, path: Path) -> int:
     txt = _run([settings.tool_path("ffprobe"), "-v", "error", "-select_streams", "v:0", "-count_packets",
                 "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)], "ffprobe count")
@@ -269,6 +298,7 @@ def prepare(settings: Settings, info: MediaInfo, video: VideoParams, p5: bool, e
         _run([settings.tool_path("mkvmerge"), "-q", "-o", str(base), "--timestamps", f"0:{ts}", str(dn)],
              "mkvmerge timestamps")
         _set_frame_rate(settings, base, _rate(settings, encode_input))
+        hdr = _copy_hdr10(settings, encode_input, base)
     except GrainError as e:
         _unlink(dn, base, ts)
         if cancel_flag is not None and cancel_flag():
@@ -276,8 +306,8 @@ def prepare(settings: Settings, info: MediaInfo, video: VideoParams, p5: bool, e
         logger.warning("grain_auto: denoising failed, encoding {} as it is: {}", info.path.name, e)
         return encode_input, None
     _unlink(dn, ts)
-    logger.info("grain_auto: {} frames denoised with {} in {:.0f} s -> {}", n_dn, r.get("model"),
-                time.monotonic() - t0, base.name)
+    logger.info("grain_auto: {} frames denoised with {} in {:.0f} s -> {}{}", n_dn, r.get("model"),
+                time.monotonic() - t0, base.name, " (HDR10 metadata carried over)" if hdr else "")
     return base, GrainContext(svc, encode_input, dec)
 
 
