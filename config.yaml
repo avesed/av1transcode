@@ -98,7 +98,6 @@ transcode:
     model: v3g                 # v3g = 盲测过的版本；v3s2 = 半宽学生模型，4K 快约 1.6 倍(B580 14 vs 9 fps)，
                                # 去除量上限下暗部细节相同，平坦处多留一点颗粒，未盲测
     timeout_hours: 12          # 单个服务步骤的超时(4K 一小时的降噪在 B580 上约 2-3 小时)
-    strength: 0.7              # 实测颗粒按这个比例写入；test-10 里主人两次选了减弱 30%、两次说差不多
     keep_intermediate: false   # 保留降噪中间文件(B580 AV1 QP 0，4K 每小时约 90GB)
 
   # Netflix-style shot-based encoding engine (select per preset via

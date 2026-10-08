@@ -303,10 +303,16 @@
   <div class="def__body"><p>设置页里叫「自动降噪流程」，只对 optimizer 引擎生效，需要 grain 降噪服务（仓库的 <code>grain/</code> 目录，镜像 av1t-grain，地址在 <code>transcode.grain.url</code>，要和本容器用同样的路径看到片源和工作目录）。和上面的 film_grain 不是一回事：那个是固定强度的颗粒合成，这个先分析、再降噪、最后按实测写回颗粒。打开它的 profile 里 SVT 自带的颗粒合成一律关闭：<code>film_grain</code>、<code>film_grain_denoise</code> 以及 <code>additional_video_params</code> 里的 <code>film-grain</code> / <code>film-grain-denoise</code> / <code>fgs-table</code> 都被忽略，作业日志写明忽略了什么。两套颗粒会叠加，探测会带着 SVT 的颗粒选 CRF，而且已带颗粒参数的码流 grav1synth 不肯再写。</p>
     <p>每个作业编码前先分析片源，结果只有开或关：</p>
     <ul>
-      <li><b>开</b>：噪点等级 ≥ 12（主人的 1-50 标尺），颗粒是高斯型（帧差峰度 ≤ 3）且逐帧新生成（相邻帧颗粒相关 ≤ 0.35）——典型的胶片颗粒。片源先降噪（v3 模型：对齐前后各 3 帧；去除量不超过这部片在各亮度上实测颗粒强度的 1.3 倍，暗部细节和暗色妆容因此保得住），降噪结果由 B580 硬件编成 AV1（QP 0）作中间文件，带回原片的逐帧时间戳；引擎按降噪后的画面选 CRF 编码，音轨、字幕、章节照旧取自原片；编完再按镜头、按亮度测出成片比原片少的颗粒，写进 AV1 的颗粒合成参数（grav1synth，不重编码），实测一次后校正，再按 <code>transcode.grain.strength</code>（默认 0.7，test-10 里主人两次选了减弱 30%、两次说差不多）写入。</li>
+      <li><b>开</b>：噪点等级 ≥ 12（主人的 1-50 标尺），颗粒是高斯型（帧差峰度 ≤ 3）且逐帧新生成（相邻帧颗粒相关 ≤ 0.35）——典型的胶片颗粒。片源先降噪（v3 模型：对齐前后各 3 帧；去除量不超过这部片在各亮度上实测颗粒强度的 1.3 倍，暗部细节和暗色妆容因此保得住），降噪结果由 B580 硬件编成 AV1（QP 0）作中间文件，带回原片的逐帧时间戳；引擎按降噪后的画面选 CRF 编码，音轨、字幕、章节照旧取自原片；编完再按镜头、按亮度测出成片比原片少的颗粒，写进 AV1 的颗粒合成参数（grav1synth，不重编码），实测一次后校正，再按 profile 的 <a href="#p-grain_strength">grain_strength</a>（默认 0.5）写入。</li>
       <li><b>关</b>：干净片源、被编码器冻住的颗粒、刻意做出来的颗粒质感，和不开这个开关一样地编码（SVT 自带的颗粒合成仍关着）。</li>
     </ul>
     <p>盲测 12 部剧（test-03 ~ test-09）走降噪的全部胜出或持平；从没参与调参的 4 部新片源码率比生产版少 33~44%。代价是时间：B580 上 4K 降噪约 9 fps（<code>transcode.grain.model: v3s2</code> 约 14 fps），和编码本身差不多，所以颗粒片源一集的总时间约翻倍；中间文件 4K 每小时约 90GB，放在工作目录，作业结束删除。分析或降噪失败时退回普通编码并在日志里告警；编码完成后的颗粒合成失败则作业失败（只降噪不加回颗粒的成片不该留下）。闪烁只记录，不否决。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-grain_strength">
+  <h3 class="def__name"><code>grain_strength</code></h3>
+  <p class="def__dflt">默认 <code>0.5</code>，范围 0-2</p>
+  <div class="def__body"><p>设置页里叫「颗粒强度」：自动降噪流程把实测的颗粒按这个比例写回。1 = 按实测；0.5 = 振幅一半。只在 <a href="#p-grain_auto">grain_auto</a> 开着时起作用。实测量的是原片减成片，里面除了颗粒还带着编码丢掉的一点细节，在平坦静止的画面上合成出来比原片的颗粒强 10-45%；test-10 里主人两次选了减弱 30%、两次说差不多，第一批生产剧集（A Good Girl's Guide to Murder，4K）0.7 看着仍偏多，所以默认 0.5。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
 </div>
 <div class="def" id="p-luminance_qp_bias">

@@ -44,10 +44,12 @@ class GrainUnreachable(GrainError):
 
 
 class GrainContext(NamedTuple):
-    """What finish() needs from prepare(): the service and the source the grain is measured against."""
+    """What finish() needs from prepare(): the service, the source the grain is measured against, and the share of
+    the measured grain to write back (the profile's grain_strength)."""
     service: "GrainService"
     source: Path
     decision: dict
+    strength: float = 0.5
 
 
 class GrainService:
@@ -340,7 +342,7 @@ def prepare(settings: Settings, info: MediaInfo, video: VideoParams, p5: bool, e
     _unlink(dn, ts)
     logger.info("grain_auto: {} frames denoised with {} in {:.0f} s -> {}{}", n_dn, r.get("model"),
                 time.monotonic() - t0, base.name, " (HDR10 metadata carried over)" if hdr else "")
-    return base, GrainContext(svc, encode_input, dec)
+    return base, GrainContext(svc, encode_input, dec, float(video.grain_strength))
 
 
 def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[int], work_dir: Path,
@@ -370,7 +372,7 @@ def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[
         rate = _rate(settings, output)
         res = ctx.service.run("grain", {"source": str(ctx.source), "video": str(vid), "shots": list(shots),
                                         "fps": rate or "24000/1001", "out": str(out_ivf), "work": str(gwork),
-                                        "strength": settings.transcode.grain.strength},
+                                        "strength": ctx.strength},
                               (lambda p: progress_cb(round(p * 100, 1), None)) if progress_cb else None, cancel_flag)
         if _frames(settings, out_ivf) != n_out:
             raise GrainError("the grain-synthesis stream lost frames")

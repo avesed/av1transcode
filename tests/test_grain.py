@@ -184,6 +184,7 @@ def test_on_gives_the_denoised_video_the_sources_timestamps(settings, service, h
     assert stages == ["grain_analyse", "denoising"]
     assert 50.0 in prog                                      # the service's progress reached the job
     assert [k["kind"] for k in s.calls] == ["analyse", "denoise"]
+    assert ctx.strength == 0.5                               # the profile's grain_strength, kept for finish()
     assert timestamps(out) == pytest.approx(timestamps(holey_source), abs=1.0)
     assert rate(holey_source) == "24/1" and rate(out) == "24/1"   # not mkvmerge's 1000/42 from the timestamps file
     assert tracks(out) == ["video"]                          # audio and the rest still come from the source (info.path)
@@ -219,7 +220,7 @@ def test_finish_puts_the_grain_stream_back_on_the_outputs_timestamps(settings, s
     assert res["flicker"]["auto"]["fine_swing"] == 0.033
     job = s.calls[-1]
     assert job["kind"] == "grain" and job["shots"] == [24, 24] and job["source"] == str(holey_source)
-    assert job["strength"] == 0.7                                # the owner's 30% less grain (test-10)
+    assert job["strength"] == 0.5                                # the profile default: half the measured grain
     assert tracks(av1_output) == ["video", "audio", "subtitles"]
     assert timestamps(av1_output) == pytest.approx(before, abs=1.0)
     assert rate(av1_output) == before_rate == "24/1"
@@ -384,3 +385,20 @@ def test_a_job_given_up_or_cancelled_is_cancelled_in_the_service_too(monkeypatch
     with pytest.raises(grain.GrainError, match="boom"):
         failed.run("grain", {}, poll=0)
     assert ("POST", "/jobs/j1/cancel") not in failed.calls             # it ended there: nothing to cancel
+
+
+def test_the_profiles_grain_strength_reaches_the_grain_step(settings, service, holey_source, av1_output):
+    """grain_strength is per profile (default 0.5: 0.7 still read as too much grain on the first production
+    episodes); prepare() keeps it and finish() sends it with the grain job."""
+    from app.config import VideoParams
+    assert VideoParams().grain_strength == 0.5
+    assert VideoParams.model_validate({"grain_strength": "0.8"}).grain_strength == 0.8      # the page sends numbers;
+    with pytest.raises(Exception):                                                          # out of range is refused
+        VideoParams(grain_strength=3)
+    s = service()
+    _, ctx = grain.prepare(settings, _info(holey_source), _video().model_copy(update={"grain_strength": 0.8}), False,
+                           holey_source, settings.dirs.work, [])
+    assert ctx.strength == 0.8
+    grain.finish(settings, ctx._replace(service=grain.GrainService(s.url, 60)), av1_output, [24, 24],
+                 settings.dirs.work)
+    assert s.calls[-1]["kind"] == "grain" and s.calls[-1]["strength"] == 0.8

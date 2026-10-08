@@ -105,6 +105,13 @@ class VideoParams(BaseModel):
     # (test-03 .. test-09): the grain path won or tied every one, at 33-44% less
     # bitrate on new sources.
     grain_auto: bool = False
+    # How much of the measured grain grain_auto writes back: the corrected table's scaling times this, which is the
+    # grain's amplitude (AV1 adds scaling(y) * grain >> scaling_shift); 1 = as measured. On flat static picture the
+    # synthesis measured 10-45% above the source's own grain, the target (source minus encode) carrying some of the
+    # encode's lost detail with it. test-10 (2026-10-07): the owner picked 30% less twice and called the other two
+    # the same; on the first production episodes (A Good Girl's Guide to Murder, 4K) 0.7 still read as too much
+    # grain to them, so 0.5.
+    grain_strength: float = Field(0.5, ge=0, le=2)
     passes: int = 1
     keyint: int = 240
     # extra split in seconds: av1an will subdivide long scenes to keep chunks
@@ -824,13 +831,6 @@ class GrainAuto(BaseModel):
     # How long one service step may run before the job fails, in hours (the
     # denoise of a 4K hour on the B580 takes about 2-3 h with v3g).
     timeout_hours: float = 12.0
-    # The measured grain is written at this share of its amplitude. test-10
-    # (2026-10-07, four of the hardest grain shots): the owner picked 30% less
-    # grain on two and called the other two the same, never the full amount;
-    # the measurement agrees - on flat static picture the synthesis came out
-    # 10-45% stronger than the source's own grain, the target (source minus
-    # encode) carrying some of the encode's lost detail with the grain.
-    strength: float = Field(0.7, gt=0, le=2)
     # Keep the denoised intermediate (B580 AV1 at QP 0, ~90GB per 4K hour)
     # after the job, for inspection.
     keep_intermediate: bool = False
