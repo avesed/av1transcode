@@ -176,7 +176,9 @@ function buildForms() {
   // min_scene_len and probing_rate exist in both tables, and a second
   // id="f-vmaf_threads" would steal the docs page's deep link.
   for (const f of PRESET_FIELDS) {
-    $("presetGrid").appendChild(renderField(f, { ctl: "pe", id: "pf-", attr: "data-pkey", foot: false }));
+    const div = renderField(f, { ctl: "pe", id: "pf-", attr: "data-pkey", foot: false });
+    if (f.hidden) div.hidden = true;                 // set by another control (grain_auto, by 降噪方式)
+    $("presetGrid").appendChild(div);
   }
   for (const s of document.querySelectorAll("main > .sheet:not(#sec-opt)")) {
     s.insertAdjacentHTML("beforeend", '<p class="toindex"><a href="#rail">↑ 回索引</a></p>');
@@ -567,8 +569,9 @@ function presetSummary(p) {
 // Layer 2 of a card: every field the editor writes, read-only, as the
 // key=value it would be typed as in the queue page's custom parameters.
 function presetAll(p) {
-  return h`<details class="disclose"><summary>全部 ${PRESET_FIELDS.length} 项</summary><dl class="kv">${
-    PRESET_FIELDS.map(f => {
+  const real = PRESET_FIELDS.filter(f => !f.virtual);
+  return h`<details class="disclose"><summary>全部 ${real.length} 项</summary><dl class="kv">${
+    real.map(f => {
       const v = p[f.key];
       const val = v === "" || v == null
         ? h`<span class="mono">${f.key}=</span><span class="pcard__empty">空</span>`
@@ -636,6 +639,17 @@ function copyName(from) {
   return n;
 }
 
+// 降噪方式 -> what it stands for: grain_auto on for the denoise flow, and only
+// the chosen method's fields shown. Switching to SVT with its strength at 0
+// (which is SVT's grain off) starts it at 8, the help's grainy-film value.
+const denoiseOf = p => (p && p.grain_auto ? "cnn" : (p && p.film_grain > 0 ? "svt" : "off"));
+function syncDenoise(byUser) {
+  const mode = pctl("denoise").value;
+  for (const f of PRESET_FIELDS) if (f.only) $(`pf-${f.key}`).hidden = f.only !== mode;
+  pctl("grain_auto").value = String(mode === "cnn");
+  if (byUser && mode === "svt" && !(parseInt(pctl("film_grain").value, 10) > 0)) pctl("film_grain").value = "8";
+}
+
 // A new preset starts from the field defaults, or from `from`'s values when it
 // is a copy. The old editor started from whatever the previous edit had left
 // in the form, because "keep the html default" only ever held on the very
@@ -648,6 +662,8 @@ function openEditor(name, from) {
     const v = p ? p[f.key] : (f.dflt !== undefined ? f.dflt : (f.type === "bool" ? false : ""));
     writePreset(f, pctl(f.key), v);
   }
+  pctl("denoise").value = denoiseOf(p);
+  syncDenoise(false);
   $("editorTitle").textContent = name ? `编辑预设 ${name}` : (from ? `复制预设 ${from}` : "新建预设");
   formState("editingHint", name ? "保存会覆盖这个预设。" : (from ? `参数取自 ${from}，改好名字再保存；${from} 本身不变。` : ""));
   editorBaseline = snapshotEditor();
@@ -685,12 +701,17 @@ function presetDecimal(f, el) {
 function collectPreset() {
   const out = {};
   for (const f of PRESET_FIELDS) {
+    if (f.virtual) continue;
     const el = pctl(f.key);
     if (f.type === "bool") out[f.key] = el.value === "true";
     else if (PRESET_INT.has(f.key)) out[f.key] = presetNumber(f, el);
     else if (f.type === "number") out[f.key] = presetDecimal(f, el);
     else out[f.key] = String(el.value).trim();
   }
+  // one denoise method per preset: the one not chosen is cleared
+  const mode = pctl("denoise").value;
+  out.grain_auto = mode === "cnn";
+  if (mode !== "svt") { out.film_grain = 0; out.film_grain_denoise = false; }
   return out;
 }
 
@@ -966,6 +987,7 @@ function wire() {
       } catch (err) { formState("editingHint", `保存失败：${err.message}`, "err"); }
     });
   });
+  $("pe-denoise").addEventListener("change", () => syncDenoise(true));
   $("presetClose").addEventListener("click", closeEditor);
   $("presetCancel").addEventListener("click", closeEditor);
   // Esc and the backdrop would otherwise close straight past the unsaved

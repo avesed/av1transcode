@@ -762,7 +762,8 @@ ${ce ? h`<p class="row__err">${ce}</p>` : ""}
 
   // ------------------------------------------------------------ submit sheet
 
-  const PRESET_KEYS = typeof PRESET_FIELDS !== "undefined" ? PRESET_FIELDS : [];
+  // 降噪方式 (virtual) is the editor's own control: no override key behind it
+  const PRESET_KEYS = typeof PRESET_FIELDS !== "undefined" ? PRESET_FIELDS.filter((f) => !f.virtual) : [];
 
   // decisions.py drops any override key VideoParams does not have, without a
   // word: `preest=3` submitted fine and encoded at the preset's value. This
