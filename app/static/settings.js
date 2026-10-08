@@ -557,7 +557,7 @@ function presetSummary(p) {
   if (p.engine === "optimizer") out.push(`engine=optimizer · metric=${p.target_metric}${p.target_quality ? ` · target=${p.target_quality}` : ""}`);
   else if (p.target_quality) out.push(`target_quality=${p.target_quality}`);
   if (p.film_grain) out.push(`film_grain=${p.film_grain}${p.film_grain_denoise ? "+denoise" : ""}`);
-  if (p.grain_auto) out.push("自动颗粒");
+  if (p.grain_auto) out.push("自动降噪");
   if (p.luminance_qp_bias) out.push(`luminance_qp_bias=${p.luminance_qp_bias}`);
   if (p.vmaf_threads) out.push(`vmaf_threads=${p.vmaf_threads}`);
   if (p.additional_video_params) out.push(p.additional_video_params);
@@ -591,6 +591,7 @@ function renderPresets() {
   ${presetAll(p)}
   <div class="btnrow">
     <button type="button" class="btn btn--sm" data-edit="${name}">编辑</button>
+    <button type="button" class="btn btn--sm" data-copy="${name}">复制</button>
     <button type="button" class="btn btn--sm btn--danger" data-del="${name}">删除</button>
   </div>
 </article>`;
@@ -627,22 +628,31 @@ function editorChanges() {
 }
 const editorDirty = () => editorChanges() > 0;
 
-// A new preset starts from the field defaults. The old editor started from
-// whatever the previous edit had left in the form, because "keep the html
-// default" only ever held on the very first open.
-function openEditor(name) {
-  const p = name ? presets[name] : null;
-  $("pe-name").value = name || "";
+// "copy" plus a number while that is taken: ASCII, since a preset name also
+// goes on the command line (process -p NAME).
+function copyName(from) {
+  let n = `${from}-copy`;
+  for (let i = 2; presets[n]; i++) n = `${from}-copy${i}`;
+  return n;
+}
+
+// A new preset starts from the field defaults, or from `from`'s values when it
+// is a copy. The old editor started from whatever the previous edit had left
+// in the form, because "keep the html default" only ever held on the very
+// first open.
+function openEditor(name, from) {
+  const p = name ? presets[name] : (from ? presets[from] : null);
+  $("pe-name").value = name || (from ? copyName(from) : "");
   $("pe-name").disabled = !!name;
   for (const f of PRESET_FIELDS) {
     const v = p ? p[f.key] : (f.dflt !== undefined ? f.dflt : (f.type === "bool" ? false : ""));
     writePreset(f, pctl(f.key), v);
   }
-  $("editorTitle").textContent = name ? `编辑预设 ${name}` : "新建预设";
-  formState("editingHint", name ? "保存会覆盖这个预设。" : "");
+  $("editorTitle").textContent = name ? `编辑预设 ${name}` : (from ? `复制预设 ${from}` : "新建预设");
+  formState("editingHint", name ? "保存会覆盖这个预设。" : (from ? `参数取自 ${from}，改好名字再保存；${from} 本身不变。` : ""));
   editorBaseline = snapshotEditor();
   openDlg("presetDlg");
-  if (!name) $("pe-name").focus();
+  if (!name) { $("pe-name").focus(); if (from) $("pe-name").select(); }
 }
 
 async function closeEditor() {
@@ -765,6 +775,8 @@ function wire() {
     if (e.target.closest("[data-new-preset]")) { openEditor(""); return; }
     const edit = e.target.closest("button[data-edit]");
     if (edit) { openEditor(edit.dataset.edit); return; }
+    const copy = e.target.closest("button[data-copy]");
+    if (copy) { openEditor("", copy.dataset.copy); return; }
     const del = e.target.closest("button[data-del]");
     if (del) deletePreset(del.dataset.del);
   });
