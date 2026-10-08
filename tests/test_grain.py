@@ -207,9 +207,22 @@ def av1_output(tmp_path, holey_source):
         "-fps_mode", "passthrough", v)
     srt = tmp_path / "s.srt"
     srt.write_text("1\n00:00:00,500 --> 00:00:01,000\nhello\n")
+    vt = tmp_path / "vtags.xml"                       # what the engine's mux puts on its video track
+    vt.write_text("<Tags><Tag><Targets/><Simple><Name>ENCODER</Name><String>SVT-AV1 v4.2.0</String></Simple>"
+                  "<Simple><Name>ENCODER_SETTINGS</Name><String>preset=4 / crf=24-31</String></Simple></Tag></Tags>")
     out = tmp_path / "out.av1.mkv"
-    run("mkvmerge", "-q", "-o", out, v, "-D", holey_source, "--language", "0:eng", srt)
+    run("mkvmerge", "-q", "-o", out, "--tags", f"0:{vt}", v, "-D", holey_source, "--language", "0:eng", srt)
     return out
+
+
+def video_tags(path: Path) -> dict:
+    import xml.etree.ElementTree as ET
+    uid = next(str(t["properties"]["uid"]) for t in json.loads(subprocess.run(
+        ["mkvmerge", "-J", str(path)], capture_output=True, text=True).stdout)["tracks"] if t["type"] == "video")
+    x = Path(tempfile.mkdtemp()) / "tags.xml"
+    run("mkvextract", path, "tags", x)
+    return {s.findtext("Name"): s.findtext("String") for tag in ET.parse(x).getroot().findall("Tag")
+            if uid in [u.text for u in tag.iter("TrackUID")] for s in tag.findall("Simple")}
 
 
 def test_finish_puts_the_grain_stream_back_on_the_outputs_timestamps(settings, service, holey_source, av1_output):
@@ -224,6 +237,9 @@ def test_finish_puts_the_grain_stream_back_on_the_outputs_timestamps(settings, s
     assert tracks(av1_output) == ["video", "audio", "subtitles"]
     assert timestamps(av1_output) == pytest.approx(before, abs=1.0)
     assert rate(av1_output) == before_rate == "24/1"
+    vt = video_tags(av1_output)                      # the new video track keeps the engine's tags, statistics renewed
+    assert vt["ENCODER"] == "SVT-AV1 v4.2.0" and vt["ENCODER_SETTINGS"] == "preset=4 / crf=24-31"
+    assert vt.get("NUMBER_OF_FRAMES") == "48"
     assert list(settings.dirs.work.iterdir()) == []
 
 

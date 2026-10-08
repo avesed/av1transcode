@@ -360,6 +360,7 @@ def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[
     vid = work_dir / f"{output.stem}.grain_v_{ns}.ivf"
     out_ivf = work_dir / f"{output.stem}.grain_g_{ns}.ivf"
     ts = work_dir / f"{output.stem}.grain_ots_{ns}.txt"
+    vtags = work_dir / f"{output.stem}.grain_vtags_{ns}.xml"
     gwork = work_dir / f"grain_work_{ns}"
     tmp = output.with_name(output.stem + f".grain_{ns}.mkv")
     try:
@@ -380,14 +381,17 @@ def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[
         # the output's own timestamps second, then the video put back in front; finish_metadata sets the video
         # track's flags, language, colour and HDR afterwards as for any output
         oid = _video_track_id(settings, output)
-        _run([settings.tool_path("mkvmerge"), "-q", "-o", str(tmp), "-D", str(output), "--timestamps", f"0:{ts}",
+        # the engine's ENCODER / ENCODER_SETTINGS go with the new video track (mkvmerge adds the statistics)
+        tags = _video_tags_file(settings, output, oid, vtags)
+        _run([settings.tool_path("mkvmerge"), "-q", "-o", str(tmp), "-D", str(output),
+              *(["--tags", f"0:{tags}"] if tags else []), "--timestamps", f"0:{ts}",
               str(out_ivf), "--track-order", f"1:0,{_track_order_rest(settings, output, oid)}"], "mkvmerge grain mux")
         _set_frame_rate(settings, tmp, rate)
         if _frames(settings, tmp) != n_out:
             raise GrainError("the grain mux lost frames")
         tmp.replace(output)
     finally:
-        _unlink(vid, out_ivf, ts, gwork, tmp)
+        _unlink(vid, out_ivf, ts, vtags, gwork, tmp)
     t = (res.get("target") or {}).get("y")
     logger.info("grain_auto: film grain synthesis written into {} (luma target per brightness bin {})", output.name, t)
     fl = res.get("flicker") or {}
@@ -403,6 +407,42 @@ def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[
             f"shot {r['shot']} {r['fine_ratio']:.2f}x ({r['source'].get('fine_swing')} -> "
             f"{r['auto'].get('fine_swing')})" for r in hard[:3]))
     return res
+
+
+# the statistics tags mkvmerge writes for every track it muxes (v82): regenerated for the new video track
+_STATISTICS_TAGS = {"BPS", "DURATION", "NUMBER_OF_FRAMES", "NUMBER_OF_BYTES", "_STATISTICS_WRITING_APP",
+                    "_STATISTICS_WRITING_DATE_UTC", "_STATISTICS_TAGS"}
+
+
+def _video_tags_file(settings: Settings, output: Path, video_id: int, dest: Path) -> Optional[Path]:
+    """The output's video track tags other than mkvmerge's statistics (the engine's ENCODER / ENCODER_SETTINGS) as a
+    tags file for mkvmerge --tags, or None. Replacing the video track drops its tags with it, and mkvpropedit cannot
+    put them back afterwards without wiping the statistics (its --tags replaces a track's tags whole)."""
+    import xml.etree.ElementTree as ET
+
+    j = json.loads(_run([settings.tool_path("mkvmerge"), "-J", str(output)], "mkvmerge -J"))
+    uid = next((str(t["properties"].get("uid")) for t in j.get("tracks", []) if int(t["id"]) == video_id), None)
+    raw = dest.with_suffix(".all.xml")
+    try:
+        subprocess.run([settings.tool_path("mkvextract"), str(output), "tags", str(raw)], capture_output=True,
+                       timeout=600)
+        if not uid or not raw.exists() or raw.stat().st_size == 0:
+            return None
+        keep = [simple for tag in ET.parse(raw).getroot().findall("Tag")
+                if uid in [u.text for u in tag.iter("TrackUID")]
+                for simple in tag.findall("Simple") if simple.findtext("Name") not in _STATISTICS_TAGS]
+    except (ET.ParseError, OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        _unlink(raw)
+    if not keep:
+        return None
+    root = ET.Element("Tags")
+    tag = ET.SubElement(root, "Tag")
+    ET.SubElement(tag, "Targets")
+    tag.extend(keep)
+    ET.ElementTree(root).write(dest, encoding="utf-8", xml_declaration=True)
+    return dest
 
 
 def _track_order_rest(settings: Settings, output: Path, video_id: int) -> str:
