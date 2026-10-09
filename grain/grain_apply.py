@@ -31,6 +31,7 @@ STEP = int(os.environ.get("GRAIN_STEP", "3"))
 FLICKER_SHOTS = int(os.environ.get("GRAIN_FLICKER_SHOTS", "10"))
 FLICKER_MIN_FRAMES = 24                       # a swing needs a run of frames; a 1 s shot is the shortest worth it
 FLICKER_BINS = (48, 64, 80, 96, 128, 160)     # the 8-bit brightness bins inside the flicker mask's 200-800 (10-bit)
+FLICKER_PACE = 12                             # see bins(): the flicker source's read lets every 12th frame through too
 # the largest believable luma grain (std, 10-bit) a bin's median over shots may ask for: grainauto's sources measured
 # 3.6-10.4, Breaking Bad's 4K 23.4. A broken source read (VA-API nv12 surfaces downloaded as p010) measured 95-847,
 # the brightness itself: the source and the encode were not compared frame for frame, and the table built on it was
@@ -279,7 +280,13 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
     else:
         gb = prefetch(reader_raw(path_a, w, h, False, False, keep(STEP)))  # path_a, its grain exported, not applied
     fl = Flicker() if fl_ranges else None
-    gs = prefetch(reader_raw(flicker_src, w, h, True, HWDEC, keep(0, fl_ranges))) if fl is not None else None
+    # the flicker source also lets every FLICKER_PACE-th frame through, and the loop pulls it along frame by frame: ffmpeg
+    # held back the last few frames of a selected run until its next selected frame (or the end of the file), and a
+    # source read nobody pulls between flicker shots stops decoding once its queue is full - on S01E02 of Good Girls the
+    # loop sat waiting while the source decoded tens of thousands of frames, 16 of the applied pass's 33 minutes
+    gs = zip(kept(total, FLICKER_PACE, fl_ranges),
+             prefetch(reader_raw(flicker_src, w, h, True, HWDEC, keep(FLICKER_PACE, fl_ranges)))) if fl is not None else None
+    gs_at = next(gs, None) if gs is not None else None
     si, fi, t0, done = 0, 0, time.time(), 0
     with torch.no_grad():
         for f in kept(total, STEP, fl_ranges):
@@ -287,9 +294,10 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
             if a is None:
                 break
             a = planes(a, w, h)
+            while gs_at is not None and gs_at[0] < f:
+                gs_at = next(gs, None)
             if f in fl_frames:
-                s_ = next(gs, None)
-                s_ = planes(s_, w, h) if s_ is not None else None
+                s_ = planes(gs_at[1], w, h) if gs_at is not None and gs_at[0] == f else None
                 while fi < len(fl_ranges) and f >= fl_ranges[fi][1]:
                     fi += 1
                 if s_ is not None:
