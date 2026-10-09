@@ -13,9 +13,9 @@ The steps grainauto's blind tests ran (grainauto.grain(), ga_bins.py, ga_table.p
               flat static picture, source vs the first table's result, measured in step 4's decode pass on the
               FLICKER_SHOTS hardest shots only - most flat picture times grain to synthesise, from step 1 - and
               reported per shot. Every frame of every shot cost the whole step 46 of its 75 min on a 1080p episode.
-Bins are measured on the GPU (ga_bins.py's numpy cost about 0.3 s per 4K frame); the source is decoded on VA-API when
-RENDER_NODE is set (sequential reads only: no seek, so none of the hwaccel seek traps). Every frame is decoded, but
-only the frames a step needs (every STEP-th, and the flicker shots' every frame) leave ffmpeg, through select.
+Bins are measured on the GPU (ga_bins.py's numpy cost about 0.3 s per 4K frame); every stream is decoded on the CPU,
+each in a thread of its own (prefetch). Every frame is decoded, but only the frames a step needs (every STEP-th, and
+the flicker shots' every frame) leave ffmpeg, through select.
   6. strength  the corrected table's scaling times STRENGTH (the owner's 30% less, test-10)
   python3 grain_apply.py SRC VIDEO.ivf SHOTS.json FPS OUT.ivf WORKDIR [CHROMA [STRENGTH]]
 SHOTS.json = {"shots": [{"frames": n}, ...]} in timeline order. Prints JSON {"target": ..., "applied": ...} summaries.
@@ -76,10 +76,17 @@ def kept(total, step, ranges=()):
     return sorted(f)
 
 
-def reader(path, w, h, grain=True, hw=False, select=None):
-    """raw 10-bit frames in decode order = display order (-fps_mode passthrough), as (Y, U, V) float tensors on dev.
-    grain=False exports the film grain parameters instead of applying them; hw decodes on VA-API (4:2:0 8/10-bit;
-    anything else decodes in software). select: a keep() expression; only those frames are read out, in order."""
+def planes(t, w, h):
+    """a reader_raw frame -> (Y, U, V) float tensors on dev."""
+    a = t.to(dev).float()
+    return a[:w * h].view(h, w), a[w * h:w * h * 5 // 4].view(h // 2, w // 2), a[w * h * 5 // 4:].view(h // 2, w // 2)
+
+
+def reader_raw(path, w, h, grain=True, hw=False, select=None):
+    """raw 10-bit frames in decode order = display order (-fps_mode passthrough), as int16 CPU tensors (one per frame,
+    Y U V planar; planes() puts them on dev). grain=False exports the film grain parameters instead of applying them;
+    hw decodes on VA-API (4:2:0 8/10-bit; anything else decodes in software). select: a keep() expression; only those
+    frames are read out, in order."""
     fs = w * h * 3 // 2
     pre = ([] if grain else ["-export_side_data", "film_grain"])
     node = os.environ.get("RENDER_NODE")
@@ -96,11 +103,64 @@ def reader(path, w, h, grain=True, hw=False, select=None):
             b = p.stdout.read(fs * 2)
             if len(b) < fs * 2:
                 break
-            a = torch.from_numpy(np.frombuffer(b, np.int16)).to(dev).float()
-            yield a[:w * h].view(h, w), a[w * h:w * h * 5 // 4].view(h // 2, w // 2), a[w * h * 5 // 4:].view(h // 2, w // 2)
+            yield torch.from_numpy(np.frombuffer(b, np.int16))
     finally:
         p.kill()
         p.wait()
+
+
+# GRAIN_HWDEC=1 decodes on VA-API instead. Off: on the 7.0.0-34 kernel a 4K HEVC decode on the B580 beside the
+# bins' compute delivered wrong pictures - half of one frame, then the rest of its GOP through the references (frames
+# 1302-1347 of the Breaking Bad clip, luma off by 20-117 codes on average, target 4.3 -> 67) - with nothing in the
+# kernel log, and only while the compute ran. Exact alone, and exact under synthetic loads; read in turn it got away
+# with it. GRAIN_PREFETCH: frames each stream decodes ahead in a thread of its own (0 = read in turn, as before).
+HWDEC = os.environ.get("GRAIN_HWDEC", "0") == "1"
+PREFETCH = int(os.environ.get("GRAIN_PREFETCH", "4"))
+
+
+def prefetch(gen, n=None):
+    """gen's items made by a thread of its own, up to n ahead. A 4K episode's grain step read two or three 25 MB frame
+    streams in turn on one Python thread - pipe read, int16 to float, copy to the GPU, then the bins - and that thread
+    sat at 100% of a core with the decoders waiting on it. Each stream's pipe reads now overlap the others' and the
+    bins. CPU work only (reader_raw): planes() puts each frame on the GPU from the consuming thread."""
+    import queue
+    import threading
+    n = PREFETCH if n is None else n
+    if n <= 0:
+        yield from gen
+        return
+    q, end, err, stop = queue.Queue(maxsize=n), object(), [], threading.Event()
+
+    def put(item):
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def work():
+        try:
+            for item in gen:
+                if not put(item):
+                    break
+        except BaseException as e:                       # noqa: BLE001 - raised again on the consumer's side
+            err.append(e)
+        finally:
+            gen.close()                                  # the reader's finally kills its ffmpeg
+            put(end)
+    threading.Thread(target=work, daemon=True).start()
+    try:
+        while True:
+            item = q.get()
+            if item is end:
+                if err:
+                    raise err[0]
+                return
+            yield item
+    finally:
+        stop.set()
 
 
 KF = {}
@@ -190,8 +250,9 @@ def hardest(tgt, k=FLICKER_SHOTS):
 
 def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker_shots=None):
     """ga_bins.py on the GPU, on every STEP-th frame. mode target: A = source, B = the encode; applied: A = with
-    grain, B = without. In applied mode with flicker_src, every frame of the flicker_shots ({shot: score}) also feeds a
-    Flicker of A against that source -> (bins, flicker result)."""
+    grain, B = without it (path_b, the encode it was written into; else A with its grain exported). In applied mode
+    with flicker_src, every frame of the flicker_shots ({shot: score}) also feeds a Flicker of A against that source
+    -> (bins, flicker result). hw_a: A may decode on VA-API (only with GRAIN_HWDEC=1)."""
     w, h = size(path_a)
     bounds, o = [], 0
     for s in shots:
@@ -202,18 +263,25 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
     acc = torch.zeros(len(bounds), nb, 5, dtype=torch.float64, device=dev)    # y, ny, cb, cr, nc
     fl_ranges = [bounds[i] for i in sorted(flicker_shots or {})] if flicker_src else []
     fl_frames = set(kept(total, 0, fl_ranges))
-    ga = reader(path_a, w, h, True, hw_a, keep(STEP, fl_ranges))
-    gb = reader(path_b, w, h, True, False, keep(STEP)) if mode == "target" else reader(path_a, w, h, False, False, keep(STEP))
+    ga = prefetch(reader_raw(path_a, w, h, True, HWDEC and hw_a, keep(STEP, fl_ranges)))
+    if mode == "target" or path_b:
+        # target: the encode, which has no grain yet; applied: the encode the grain was written into (path_b), the
+        # very pictures path_a decodes to with its grain left out
+        gb = prefetch(reader_raw(path_b, w, h, True, False, keep(STEP)))
+    else:
+        gb = prefetch(reader_raw(path_a, w, h, False, False, keep(STEP)))  # path_a, its grain exported, not applied
     fl = Flicker() if fl_ranges else None
-    gs = reader(flicker_src, w, h, True, True, keep(0, fl_ranges)) if fl is not None else None
+    gs = prefetch(reader_raw(flicker_src, w, h, True, HWDEC, keep(0, fl_ranges))) if fl is not None else None
     si, fi, t0, done = 0, 0, time.time(), 0
     with torch.no_grad():
         for f in kept(total, STEP, fl_ranges):
             a = next(ga, None)
             if a is None:
                 break
+            a = planes(a, w, h)
             if f in fl_frames:
                 s_ = next(gs, None)
+                s_ = planes(s_, w, h) if s_ is not None else None
                 while fi < len(fl_ranges) and f >= fl_ranges[fi][1]:
                     fi += 1
                 if s_ is not None:
@@ -223,6 +291,7 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
             b = next(gb, None)
             if b is None:
                 break
+            b = planes(b, w, h)
             while si < len(bounds) and f >= bounds[si][1]:
                 si += 1
             if si >= len(bounds):
@@ -290,6 +359,14 @@ def apply(tbl, src_ivf, out_ivf):
     p = subprocess.run([GRAV1SYNTH, "apply", "-y", "--replace", "-g", tbl, "-o", out_ivf, src_ivf], capture_output=True,
                        text=True)
     if p.returncode or not os.path.exists(out_ivf):
+        dbg = os.environ.get("GRAIN_DEBUG_DIR")
+        if dbg:                                   # what failed, kept for reproducing it (the job's work dir is removed)
+            import shutil
+            os.makedirs(dbg, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy(tbl, f"{dbg}/{stamp}.tbl")
+            shutil.copy(src_ivf, f"{dbg}/{stamp}.ivf")
+            open(f"{dbg}/{stamp}.log", "w").write((p.stderr or "") + (p.stdout or ""))
         raise RuntimeError(f"grav1synth apply failed: {(p.stderr or p.stdout)[-800:]}")
 
 
@@ -326,7 +403,7 @@ def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0, strength=1.0):
     apply(tbl, video, tmp)
     hard = hardest(tgt)
     log(f"applied: measuring the first table; flicker on the {len(hard)} hardest shots {sorted(hard)}")
-    app, flick = bins("applied", shots, tmp, flicker_src=src, flicker_shots=hard)
+    app, flick = bins("applied", shots, tmp, video, flicker_src=src, flicker_shots=hard)
     aj = f"{work}/applied0.json"
     json.dump(app, open(aj, "w"))
     os.remove(tmp)
