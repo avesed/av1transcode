@@ -280,12 +280,14 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
     else:
         gb = prefetch(reader_raw(path_a, w, h, False, False, keep(STEP)))  # path_a, its grain exported, not applied
     fl = Flicker() if fl_ranges else None
-    # the flicker source also lets every FLICKER_PACE-th frame through, and the loop pulls it along frame by frame: ffmpeg
-    # held back the last few frames of a selected run until its next selected frame (or the end of the file), and a
-    # source read nobody pulls between flicker shots stops decoding once its queue is full - on S01E02 of Good Girls the
-    # loop sat waiting while the source decoded tens of thousands of frames, 16 of the applied pass's 33 minutes
-    gs = zip(kept(total, FLICKER_PACE, fl_ranges),
-             prefetch(reader_raw(flicker_src, w, h, True, HWDEC, keep(FLICKER_PACE, fl_ranges)))) if fl is not None else None
+    # the flicker source also lets every FLICKER_PACE-th frame through, and the loop pulls it along frame by frame:
+    # ffmpeg held back the last few frames of a selected run until its next selected frame (or the end of the file),
+    # and a source read nobody pulls between flicker shots stops decoding once its queue is full - on S01E02 of Good
+    # Girls the loop sat waiting while the source decoded tens of thousands of frames, 16 of the applied pass's 33 min
+    gs = None
+    if fl is not None:
+        gs = zip(kept(total, FLICKER_PACE, fl_ranges),
+                 prefetch(reader_raw(flicker_src, w, h, True, HWDEC, keep(FLICKER_PACE, fl_ranges))))
     gs_at = next(gs, None) if gs is not None else None
     si, fi, t0, done = 0, 0, time.time(), 0
     with torch.no_grad():
@@ -377,25 +379,41 @@ DEBUG_DIR = os.environ.get("GRAIN_DEBUG_DIR", "/cache/grain-debug" if os.path.is
 
 
 def apply(tbl, src_ivf, out_ivf):
+    """the table into src_ivf's frame headers -> out_ivf. grav1synth writes Matroska and ffmpeg makes the ivf of it:
+    grav1synth's own ivf muxer (its FFmpeg 5.1) runs every packet through av1_metadata, and that rewrite retries an
+    OBU too big for its 1 MiB write buffer on reference state the first attempt already advanced (restored since
+    FFmpeg 6.0). S01E03 of Good Girls failed on packet 33022, its first inter frame over 1 MiB: "ref_order_hint[i]
+    does not match inferred value: 0, but should be 32". Matroska takes the packets as they are; this ffmpeg's ivf
+    muxer rewrites them with the fixed code."""
+    mkv = os.path.splitext(out_ivf)[0] + ".grav1synth.mkv"
     # --replace: without it grav1synth skips a stream that already has grain headers, exit 0 and no output
-    p = subprocess.run([GRAV1SYNTH, "apply", "-y", "--replace", "-g", tbl, "-o", out_ivf, src_ivf], capture_output=True,
+    p = subprocess.run([GRAV1SYNTH, "apply", "-y", "--replace", "-g", tbl, "-o", mkv, src_ivf], capture_output=True,
                        text=True)
-    if p.returncode or not os.path.exists(out_ivf):
-        out = (p.stderr or "") + (p.stdout or "")
-        kept = ""
-        if DEBUG_DIR:
-            import shutil
-            shutil.rmtree(DEBUG_DIR, ignore_errors=True)
-            os.makedirs(DEBUG_DIR, exist_ok=True)
-            shutil.copy(tbl, f"{DEBUG_DIR}/grain.tbl")
-            shutil.copy(src_ivf, f"{DEBUG_DIR}/input.ivf")         # a 4K hour is 3-5 GB; only the latest is kept
-            open(f"{DEBUG_DIR}/grav1synth.log", "w").write(f"rc {p.returncode}\n{out}")
-            kept = f" (kept in {DEBUG_DIR})"
-        # on one line, the first lines that name the problem: the service shows a job's last log lines, 300
-        # characters each, and the last ones were the bitstream filter's summary of it
-        first = [l.strip() for l in out.splitlines() if re.search(r"error|invalid|range|match|fail", l, re.I)][:3]
-        why = " | ".join(first) or out.strip()[-200:].replace("\n", " | ")
-        raise RuntimeError(f"grav1synth apply failed{kept}: {why}")
+    out = (p.stderr or "") + (p.stdout or "")
+    ok = p.returncode == 0 and os.path.exists(mkv)
+    if ok:
+        q = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", mkv,
+                            "-map", "0:v:0", "-c", "copy", out_ivf], capture_output=True, text=True)
+        out += q.stderr or ""
+        ok = q.returncode == 0 and os.path.exists(out_ivf)
+    if os.path.exists(mkv):
+        os.remove(mkv)
+    if ok:
+        return
+    kept = ""
+    if DEBUG_DIR:
+        import shutil
+        shutil.rmtree(DEBUG_DIR, ignore_errors=True)
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        shutil.copy(tbl, f"{DEBUG_DIR}/grain.tbl")
+        shutil.copy(src_ivf, f"{DEBUG_DIR}/input.ivf")         # a 4K hour is 3-5 GB; only the latest is kept
+        open(f"{DEBUG_DIR}/grav1synth.log", "w").write(f"rc {p.returncode}\n{out}")
+        kept = f" (kept in {DEBUG_DIR})"
+    # on one line, the first lines that name the problem: the service shows a job's last log lines, 300
+    # characters each, and the last ones were the bitstream filter's summary of it
+    first = [l.strip() for l in out.splitlines() if re.search(r"error|invalid|range|match|fail", l, re.I)][:3]
+    why = " | ".join(first) or out.strip()[-200:].replace("\n", " | ")
+    raise RuntimeError(f"grav1synth apply failed{kept}: {why}")
 
 
 def scaled(tbl_in, tbl_out, k):
