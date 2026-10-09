@@ -20,7 +20,7 @@ the flicker shots' every frame) leave ffmpeg, through select.
   python3 grain_apply.py SRC VIDEO.ivf SHOTS.json FPS OUT.ivf WORKDIR [CHROMA [STRENGTH]]
 SHOTS.json = {"shots": [{"frames": n}, ...]} in timeline order. Prints JSON {"target": ..., "applied": ...} summaries.
 """
-import json, os, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -362,20 +362,32 @@ def table(shots_json, fps, target_json, out_tbl, chroma, corr=None):
     return p.stdout
 
 
+# where a failed apply leaves its table, input and full log (the job's work dir is removed with the job): the
+# service's /cache volume, the latest failure only. S01E03 of A Good Girl's Guide failed in here on 2026-10-08 with
+# "[av1_metadata] Failed to write unit 1 (type 6)" and nothing else kept to reproduce it with.
+DEBUG_DIR = os.environ.get("GRAIN_DEBUG_DIR", "/cache/grain-debug" if os.path.isdir("/cache") else "")
+
+
 def apply(tbl, src_ivf, out_ivf):
     # --replace: without it grav1synth skips a stream that already has grain headers, exit 0 and no output
     p = subprocess.run([GRAV1SYNTH, "apply", "-y", "--replace", "-g", tbl, "-o", out_ivf, src_ivf], capture_output=True,
                        text=True)
     if p.returncode or not os.path.exists(out_ivf):
-        dbg = os.environ.get("GRAIN_DEBUG_DIR")
-        if dbg:                                   # what failed, kept for reproducing it (the job's work dir is removed)
+        out = (p.stderr or "") + (p.stdout or "")
+        kept = ""
+        if DEBUG_DIR:
             import shutil
-            os.makedirs(dbg, exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            shutil.copy(tbl, f"{dbg}/{stamp}.tbl")
-            shutil.copy(src_ivf, f"{dbg}/{stamp}.ivf")
-            open(f"{dbg}/{stamp}.log", "w").write((p.stderr or "") + (p.stdout or ""))
-        raise RuntimeError(f"grav1synth apply failed: {(p.stderr or p.stdout)[-800:]}")
+            shutil.rmtree(DEBUG_DIR, ignore_errors=True)
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            shutil.copy(tbl, f"{DEBUG_DIR}/grain.tbl")
+            shutil.copy(src_ivf, f"{DEBUG_DIR}/input.ivf")         # a 4K hour is 3-5 GB; only the latest is kept
+            open(f"{DEBUG_DIR}/grav1synth.log", "w").write(f"rc {p.returncode}\n{out}")
+            kept = f" (kept in {DEBUG_DIR})"
+        # on one line, the first lines that name the problem: the service shows a job's last log lines, 300
+        # characters each, and the last ones were the bitstream filter's summary of it
+        first = [l.strip() for l in out.splitlines() if re.search(r"error|invalid|range|match|fail", l, re.I)][:3]
+        why = " | ".join(first) or out.strip()[-200:].replace("\n", " | ")
+        raise RuntimeError(f"grav1synth apply failed{kept}: {why}")
 
 
 def scaled(tbl_in, tbl_out, k):
