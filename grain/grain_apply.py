@@ -57,9 +57,15 @@ def size(path):
 HW_DOWNLOAD = {"yuv420p": "nv12", "yuvj420p": "nv12", "nv12": "nv12", "yuv420p10le": "p010le", "p010le": "p010le"}
 
 
-def pix_fmt(path):
-    return subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt",
+def probe(path, key):
+    return subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", f"stream={key}",
                            "-of", "csv=p=0", path], capture_output=True, text=True).stdout.strip().split(",")[0]
+
+
+# dav1d on the engine's single-tile 4K encodes is bound by how many frames it has in flight, not by cores: two reads
+# together take as long as one. 32 frames instead of its own 8: 38.5 -> 28.3 s for the applied pass's two reads of
+# the 1458-frame Breaking Bad clip, 2.5 -> 4.5 GB per decoder (64: 24 s and 7.3 GB, 128: 24 s and 12.7 GB).
+DAV1D_FRAMES = int(os.environ.get("GRAIN_DAV1D_FRAMES", "32"))
 
 
 def keep(step, ranges=()):
@@ -90,7 +96,9 @@ def reader_raw(path, w, h, grain=True, hw=False, select=None):
     fs = w * h * 3 // 2
     pre = ([] if grain else ["-export_side_data", "film_grain"])
     node = os.environ.get("RENDER_NODE")
-    surf = HW_DOWNLOAD.get(pix_fmt(path)) if hw and node else None
+    surf = HW_DOWNLOAD.get(probe(path, "pix_fmt")) if hw and node else None
+    if not surf and DAV1D_FRAMES and probe(path, "codec_name") == "av1":
+        pre += ["-threads", str(len(os.sched_getaffinity(0))), "-max_frame_delay", str(DAV1D_FRAMES)]
     chain = [f"select='{select}'"] if select else []      # before hwdownload: a dropped frame never crosses PCIe
     if surf:
         pre += ["-hwaccel", "vaapi", "-hwaccel_device", node, "-hwaccel_output_format", "vaapi"]
