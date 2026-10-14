@@ -136,13 +136,26 @@ def tick(label, t_prev):
 rq = queue.Queue(maxsize=6)
 
 
+# Frames go up from pinned buffers, asynchronously: a copy from pageable memory made the host wait until the device
+# had finished everything queued before it, once a frame, so the device then sat idle while the host queued the next
+# frame's work. The reader thread fills a buffer only after the device's copy out of it has landed (its event).
+IN_RING = [torch.empty(fs, dtype=torch.int16, pin_memory=True) for _ in range(12)]   # > rq's 6 + frames in flight
+IN_EV = [None] * len(IN_RING)
+
+
 def reader():
+    i = 0
     while True:
         b = dec.stdout.read(fs * 2)
         if len(b) < fs * 2:
             rq.put(None)
             return
-        rq.put(np.frombuffer(b, np.int16))           # 10-bit codes fit in int16; converted on the device
+        k = i % len(IN_RING)
+        i += 1
+        if IN_EV[k] is not None:
+            IN_EV[k].synchronize()
+        IN_RING[k].numpy()[:] = np.frombuffer(b, np.int16)   # 10-bit codes fit in int16; converted on the device
+        rq.put(k)
 
 
 threading.Thread(target=reader, daemon=True).start()
@@ -181,10 +194,14 @@ def emit(a, y, u, v):
 
 
 def read():
-    arr = rq.get()
-    if arr is None:
+    k = rq.get()
+    if k is None:
         return None
-    a = torch.from_numpy(arr).to(dev).float()
+    a = IN_RING[k].to(dev, non_blocking=True)
+    ev = torch.Event(device=dev)
+    ev.record()
+    IN_EV[k] = ev
+    a = a.float()
     y, u, v = a[:w * h].view(h, w), a[w * h:w * h * 5 // 4].view(h // 2, w // 2), a[w * h * 5 // 4:].view(h // 2, w // 2)
     if ph or pw:
         y = F.pad(y[None, None], (0, pw, 0, ph), mode="replicate")[0, 0]

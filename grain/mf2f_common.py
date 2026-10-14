@@ -65,11 +65,24 @@ def noise_map(yc, curve, K):
     return (K * s / 876.0)[None, None]
 
 
+_CURVES = {}
+
+
+def _curve_tensors(curve, device):
+    """CENT and curve on the device, made once: a torch.tensor(list, device=...) per call is a blocking host copy,
+    and in dn_v3's frame loop (grain_std via limit_low, every frame) two of them a frame held the host until the
+    device had finished everything queued before them."""
+    key = (tuple(curve), str(device))
+    if key not in _CURVES:
+        _CURVES[key] = (torch.tensor(CENT, device=device, dtype=torch.float32),
+                        torch.tensor(curve, device=device, dtype=torch.float32))
+    return _CURVES[key]
+
+
 def grain_std(yc, curve):
     """yc (H, W) luma in codes -> (H, W) the file's fresh grain std (codes) at each pixel's brightness."""
     lum = blur(yc, 2.0) / 4
-    xs = torch.tensor(CENT, device=yc.device, dtype=torch.float32)
-    ys = torch.tensor(curve, device=yc.device, dtype=torch.float32)
+    xs, ys = _curve_tensors(curve, yc.device)
     lc = lum.clamp(xs[0], xs[-1]).contiguous()
     i = torch.searchsorted(xs, lc).clamp(1, len(CENT) - 1)
     return ys[i - 1] + (ys[i] - ys[i - 1]) * ((lc - xs[i - 1]) / (xs[i] - xs[i - 1]))
