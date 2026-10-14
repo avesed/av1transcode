@@ -105,6 +105,12 @@ class VideoParams(BaseModel):
     # (test-03 .. test-09): the grain path won or tied every one, at 33-44% less
     # bitrate on new sources.
     grain_auto: bool = False
+    # grain_auto without its on/off decision: the source is denoised whatever the analysis calls it (clean, frozen or
+    # texture-like grain); the denoiser still sets how much it takes off from the source's own measured grain (its
+    # removal is capped at 1.3x the fresh grain it measures per brightness). The owner, 2026-10-14: the same release's
+    # episodes came out on and off (A Good Girl's Guide S2, kurtosis 2.5-3.8 around the 3.0 threshold) and looked the
+    # same either way, so the call is theirs per preset.
+    grain_force: bool = False
     # How much of the measured grain grain_auto writes back: the corrected table's scaling times this, which is the
     # grain's amplitude (AV1 adds scaling(y) * grain >> scaling_shift); 1 = as measured. On flat static picture the
     # synthesis measured 10-45% above the source's own grain, the target (source minus encode) carrying some of the

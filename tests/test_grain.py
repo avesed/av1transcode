@@ -146,9 +146,9 @@ def _info(src):
     return MediaInfo(path=src)
 
 
-def _video(engine="optimizer"):
+def _video(engine="optimizer", force=False):
     from app.config import VideoParams
-    return VideoParams(engine=engine, grain_auto=True)
+    return VideoParams(engine=engine, grain_auto=True, grain_force=force)
 
 
 def test_off_encodes_the_input_as_it_is(settings, service, holey_source):
@@ -157,6 +157,15 @@ def test_off_encodes_the_input_as_it_is(settings, service, holey_source):
     out, ctx = grain.prepare(settings, _info(holey_source), _video(), False, holey_source, settings.dirs.work, tmp)
     assert out == holey_source and ctx is None
     assert list(settings.dirs.work.iterdir()) == []
+
+
+def test_forced_denoises_what_the_analysis_calls_off(settings, service, holey_source):
+    s = service(on=False)
+    tmp = []
+    out, ctx = grain.prepare(settings, _info(holey_source), _video(force=True), False, holey_source,
+                             settings.dirs.work, tmp)
+    assert ctx is not None and out != holey_source and out.exists()
+    assert [k["kind"] for k in s.calls] == ["analyse", "denoise"]
 
 
 def test_an_unreachable_service_degrades_to_the_plain_encode(settings, holey_source):

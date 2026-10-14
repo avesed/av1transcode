@@ -309,9 +309,11 @@ def prepare(settings: Settings, info: MediaInfo, video: VideoParams, p5: bool, e
         logger.warning("grain_auto: analysis failed, encoding {} as it is: {}", info.path.name, e)
         return encode_input, None
     f = dec.get("features") or {}
+    forced = not dec.get("on") and video.grain_force
     logger.info("grain_auto: {} -> {} ({}); level {}, kurtosis {}, frozen {}", info.path.name,
-                "on" if dec.get("on") else "off", dec.get("why"), dec.get("level"), f.get("kurtosis"), f.get("fresh_corr"))
-    if not dec.get("on"):
+                "on" if dec.get("on") else ("on, forced by the preset" if forced else "off"), dec.get("why"),
+                dec.get("level"), f.get("kurtosis"), f.get("fresh_corr"))
+    if not dec.get("on") and not forced:
         return encode_input, None
 
     stage("denoising")

@@ -309,6 +309,13 @@
     <p>盲测 12 部剧（test-03 ~ test-09）走降噪的全部胜出或持平；从没参与调参的 4 部新片源码率比生产版少 33~44%。代价是时间：B580 上 4K 降噪约 9 fps（<code>transcode.grain.model: v3s2</code> 约 14 fps），和编码本身差不多，所以颗粒片源一集的总时间约翻倍；中间文件 4K 每小时约 90GB，放在工作目录，作业结束删除。分析或降噪失败时退回普通编码并在日志里告警；编码完成后的颗粒合成失败则作业失败（只降噪不加回颗粒的成片不该留下）。闪烁只记录，不否决。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
 </div>
+<div class="def" id="p-grain_force">
+  <h3 class="def__name"><code>grain_force</code></h3>
+  <p class="def__dflt">默认 <code>false</code></p>
+  <div class="def__body"><p>设置页的「降噪方式」选「自动降噪流程」后出现，叫「跳过开关判定」。开着时，上面 <a href="#p-grain_auto">grain_auto</a> 的开/关判断不再起作用：干净片源、峰度或冻结度超过门槛的颗粒，也一律降噪。分析照样跑：日志仍记下等级、峰度和冻结度，判断写成「on, forced by the preset」。去除多少仍由降噪器自己定：去除量不超过这部片在各亮度上实测颗粒强度的 1.3 倍。只在 grain_auto 开着时起作用，降噪方式换成别的时保存会把它清掉。</p>
+    <p>为什么要有它：同一发布组、同一季的各集，判断会来回跳。A Good Girl's Guide to Murder S2 的帧差峰度在 2.5-3.8，正好绕着门槛 3.0，5 集里 1 集判开、4 集判关；主人对比开和关的两集，看不出区别，开的那集体积只有一半。流媒体编码会把颗粒变尖、变得前后帧相似，峰度和冻结度因此偏高，这并不代表降噪会伤到画面。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-presets">去设置页 ›</a></p></div>
+</div>
 <div class="def" id="p-grain_strength">
   <h3 class="def__name"><code>grain_strength</code></h3>
   <p class="def__dflt">默认 <code>0.5</code>，范围 0-2</p>

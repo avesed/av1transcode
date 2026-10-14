@@ -154,6 +154,7 @@ const PRESET_FIELDS = [
     summary: "展开：两种方式的区别与盲测结果",
     note: "自动降噪流程：optimizer 引擎，需要 grain 降噪服务。先由降噪服务分析片源：噪点等级够高、颗粒是高斯型且逐帧新生成的胶片颗粒才开；干净片源、被编码器冻住或刻意做出来的颗粒质感一律不降噪，和降噪方式选「关」一样编码。开了之后：降噪（对齐前后各 3 帧的 v3 模型，去除量不超过这部片自己的颗粒强度），按降噪后的画面选 CRF，编码完再按镜头和亮度测出成片比原片少的颗粒，写进 AV1 的颗粒合成参数（不重新编码）。盲测 12 部剧（test-03 ~ test-09）全部胜出或持平，新片源码率比生产版少 33~44%。B580 上 4K 降噪约 9 fps，所以颗粒片源一集的总时间约翻倍。SVT 自带：编码器自己的胶片颗粒合成，固定强度，不先降噪，CRF 照原片选。两种方式只能选一种；选自动降噪流程时，额外参数里的 film-grain / film-grain-denoise / fgs-table 也会被忽略，作业日志写明忽略了什么。" }),
   F("grain_auto", "自动降噪流程", "由降噪方式决定。", { type: "bool", hidden: true }),
+  F("grain_force", "跳过开关判定", "开 = 选了自动降噪流程就一定降噪，分析只用来定去除量；关 = 先由分析判断这集要不要降噪（干净、冻住或像刻意纹理的颗粒不降）。", { type: "bool", only: "cnn" }),
   F("grain_strength", "颗粒强度", "实测颗粒写回的比例：1 = 按实测，0.5 = 一半（默认）。", { step: 0.05, min: 0, max: 2, dflt: 0.5, only: "cnn" }),
   F("film_grain", "SVT 颗粒强度", "1-50，颗粒电影 8-10。", { min: 0, max: 50, dflt: 0, only: "svt" }),
   F("film_grain_denoise", "SVT 编码前去噪", "SVT 合成颗粒前先对源去噪。", { type: "bool", only: "svt" }),
@@ -176,9 +177,9 @@ const PRESET_FIELDS = [
   F("additional_video_params", "SVT-AV1 额外参数", "", { type: "text", placeholder: "--sharpness 1 --enable-qm 1", wide: true }),
 ];
 
-// Which preset keys go to the server as integers. film_grain_denoise and
-// grain_auto are the booleans; everything else is sent as the trimmed string
-// it was typed as.
+// Which preset keys go to the server as integers. film_grain_denoise, grain_auto
+// and grain_force are the booleans; everything else is sent as the trimmed
+// string it was typed as.
 const PRESET_INT = new Set(["crf", "preset", "film_grain", "luminance_qp_bias", "passes", "keyint", "extra_split_sec", "min_scene_len", "tune", "probes", "probing_rate", "vmaf_threads"]);
 
 // The settings page's sections in page order: the desktop rail and the phone
