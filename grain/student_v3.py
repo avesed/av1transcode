@@ -36,6 +36,7 @@ class StudentV3(nn.Module):
         super().__init__()
         c0, c1, c2 = c
         self.nf, self.kp, self.ctau = nf, kp, ctau
+        self.cin_pad = 0                                 # see pad_input()
         cin = 6 * nf + (nf - 1)
         self.inc = nn.Sequential(cbr(cin, c0 * 2), cbr(c0 * 2, c0), cbr(c0, c0))
         self.down1 = nn.Sequential(cbr(c0, c1, 2), cbr(c1, c1), cbr(c1, c1))
@@ -59,15 +60,42 @@ class StudentV3(nn.Module):
     def forward(self, frames, conf):
         """frames (B, nf, 6, h, w) packed, aligned, centre at nf // 2, values in [0, 1]; conf (B, nf - 1, h, w) in
         [0, 1]. h, w multiples of 4. -> (B, 6, h, w)."""
+        return self.post(frames, conf, self.trunk(self.pre(frames, conf)))
+
+    # forward() in three parts, so the U-Net alone can be quantized (dn_v3 INT8_TRUNK) while the input normalisation
+    # and the output arithmetic stay in floating point
+
+    def pre(self, frames, conf):
         s = SCALE.to(frames)
-        ctr = frames[:, self.nf // 2]
         x = torch.cat([((frames - 0.5) * s[:, None]).flatten(1, 2), conf * 2 - 1], 1)
+        return F.pad(x, (0, 0, 0, 0, 0, self.cin_pad - x.shape[1])) if self.cin_pad else x
+
+    def pad_input(self, cin=64):
+        """the first conv widened to cin input channels with zero weights, the input zero-padded to match in pre():
+        the same sums, but the B580 runs a 48-channel input conv at a third of the others' rate (fp16 tile 12.2 ->
+        11.8 ms, bit-identical)."""
+        old = self.inc[0][0]
+        new = nn.Conv2d(cin, old.out_channels, old.kernel_size, old.stride, old.padding).to(old.weight.device,
+                                                                                           old.weight.dtype)
+        with torch.no_grad():
+            new.weight.zero_()
+            new.weight[:, :old.in_channels] = old.weight
+            new.bias.copy_(old.bias)
+        self.inc[0][0] = new
+        self.cin_pad = cin
+        return self
+
+    def trunk(self, x):
         x0 = self.inc(x)
         x1 = self.down1(x0)
         x2 = self.down2(x1)
         x1 = self.dec1(self.up2(x2) + x1)
         x0 = self.up1(x1) + x0
-        r = self.out(x0)
+        return self.out(x0)
+
+    def post(self, frames, conf, r):
+        s = SCALE.to(frames)
+        ctr = frames[:, self.nf // 2]
         if not self.kp:
             return ctr - r / s
         c = self.nf // 2

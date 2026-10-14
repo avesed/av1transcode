@@ -46,6 +46,19 @@ net = load_v3(ck).to(dev)
 sp = load_spynet(dev)
 LIMFN = limit_removal
 FAST = ASM is assemble_fast
+# FAST_FP16=1: Inductor's freezing (weights compiled in as constants: no per-call fp32 -> fp16 weight casts, oneDNN's
+# own kernel choice) and the first conv's input padded from 48 to 64 channels (pad_input: zero weights, bit-identical).
+# B580, 572 x 992 tile: 15.2 -> 11.8 ms; the output within 0.16 codes (mean 0.006) of the unfrozen compile.
+# INT8_TRUNK=<.pt2>: the trunk in int8 (int8_net.py, quantize_int8.py), 7.1 ms a tile, within mean 0.57 / max 15
+# codes of the fp16 network. Both set freezing for the whole process.
+NET8 = None
+if os.environ.get("INT8_TRUNK"):
+    from int8_net import load_int8_net
+    NET8 = load_int8_net(os.environ["INT8_TRUNK"], net.eval())
+elif os.environ.get("FAST_FP16") == "1":
+    import torch._inductor.config as icfg
+    icfg.freezing = True
+    net = net.pad_input(64)
 if os.environ.get("COMPILE") == "1":                  # Inductor / Triton: B580 4K network 88 -> 57 ms (v3g), 44 -> 26 (student);
     net = torch.compile(net, dynamic=False, mode=os.environ.get("COMPILE_MODE") or None)   # assemble / limiter: no gain
 if os.environ.get("COMPILE_SP") == "1":               # SpyNet (its first frames compile: measure on long clips)
@@ -214,21 +227,28 @@ fr, fwd, bwd = {}, {}, {}
 n_in, n_out, eof, t0 = 0, 0, False, time.time()
 
 
-def run(frames, conf):
-    """network in fp16, whole frame or TILES x TILES tiles with 32 px of overlap (packed resolution)."""
+def net_tile(frames, conf):
+    """the network on one tile: fp16 autocast, or the int8 network (INT8_TRUNK, fp32 in and out, no autocast)."""
+    if NET8 is not None:
+        return NET8(frames.float(), conf.float())
     with torch.autocast(dev.type, dtype=torch.float16):
-        if TILES == 1:
-            return net(frames, conf).float()
-        Hp, Wp = frames.shape[-2:]
-        th, tw = -(-Hp // TILES // 4) * 4, -(-Wp // TILES // 4) * 4
-        o = torch.empty(frames.shape[0], 6, Hp, Wp, device=dev)
-        for y0 in range(0, Hp, th):
-            for x0 in range(0, Wp, tw):
-                a0, b0 = max(0, y0 - 32), max(0, x0 - 32)
-                a1, b1 = min(Hp, y0 + th + 32), min(Wp, x0 + tw + 32)
-                t = net(frames[..., a0:a1, b0:b1], conf[..., a0:a1, b0:b1]).float()
-                o[..., y0:y0 + th, x0:x0 + tw] = t[..., y0 - a0:y0 - a0 + th, x0 - b0:x0 - b0 + tw]
-        return o
+        return net(frames, conf).float()
+
+
+def run(frames, conf):
+    """network, whole frame or TILES x TILES tiles with 32 px of overlap (packed resolution)."""
+    if TILES == 1:
+        return net_tile(frames, conf)
+    Hp, Wp = frames.shape[-2:]
+    th, tw = -(-Hp // TILES // 4) * 4, -(-Wp // TILES // 4) * 4
+    o = torch.empty(frames.shape[0], 6, Hp, Wp, device=dev)
+    for y0 in range(0, Hp, th):
+        for x0 in range(0, Wp, tw):
+            a0, b0 = max(0, y0 - 32), max(0, x0 - 32)
+            a1, b1 = min(Hp, y0 + th + 32), min(Wp, x0 + tw + 32)
+            t = net_tile(frames[..., a0:a1, b0:b1], conf[..., a0:a1, b0:b1])
+            o[..., y0:y0 + th, x0:x0 + tw] = t[..., y0 - a0:y0 - a0 + th, x0 - b0:x0 - b0 + tw]
+    return o
 
 
 FS = [1]
