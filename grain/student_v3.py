@@ -37,6 +37,9 @@ class StudentV3(nn.Module):
         c0, c1, c2 = c
         self.nf, self.kp, self.ctau = nf, kp, ctau
         self.cin_pad = 0                                 # see pad_input()
+        # SCALE as a buffer, on the network's device: the module-level CPU tensor made the compiled network copy it
+        # from pageable host memory on every call, a copy an XPU graph cannot record either (same output)
+        self.register_buffer("scale", SCALE.clone(), persistent=False)
         cin = 6 * nf + (nf - 1)
         self.inc = nn.Sequential(cbr(cin, c0 * 2), cbr(c0 * 2, c0), cbr(c0, c0))
         self.down1 = nn.Sequential(cbr(c0, c1, 2), cbr(c1, c1), cbr(c1, c1))
@@ -66,7 +69,7 @@ class StudentV3(nn.Module):
     # and the output arithmetic stay in floating point
 
     def pre(self, frames, conf):
-        s = SCALE.to(frames)
+        s = self.scale.to(frames)
         x = torch.cat([((frames - 0.5) * s[:, None]).flatten(1, 2), conf * 2 - 1], 1)
         return F.pad(x, (0, 0, 0, 0, 0, self.cin_pad - x.shape[1])) if self.cin_pad else x
 
@@ -94,7 +97,7 @@ class StudentV3(nn.Module):
         return self.out(x0)
 
     def post(self, frames, conf, r):
-        s = SCALE.to(frames)
+        s = self.scale.to(frames)
         ctr = frames[:, self.nf // 2]
         if not self.kp:
             return ctr - r / s

@@ -28,10 +28,11 @@ DQ = torch.ops.quantized_decomposed.dequantize_per_tensor.default
 QCONV = (torch.ops.onednn.qconv_pointwise.default, torch.ops.onednn.qconv_pointwise.tensor)
 
 
-def rewire_skips(g):
+def rewire_skips(g, expect=2):
     """add(pixel_shuffle(up), relu) reads the skip's dequantized uint8 copy instead of the fp32 ReLU output: the
     producing convs then requantize in-kernel (no fp32 write, no separate quantize pass) and the fused
-    pixel-shuffle + add + quantize reads 1 byte an element. -0.9 ms a tile, +0.013 codes mean."""
+    pixel-shuffle + add + quantize reads 1 byte an element. -0.9 ms a tile, +0.013 codes mean. expect: the trunk has
+    two such adds, the mixed network's int8 middle one."""
     n_done = 0
     for n in g.graph.nodes:
         if n.target is torch.ops.aten.add.Tensor:
@@ -40,7 +41,7 @@ def rewire_skips(g):
             dq = next(u for u in qn.users if u.target is DQ)
             n.args = (n.args[0], dq)
             n_done += 1
-    assert n_done == 2, f"expected the trunk's two skip adds, found {n_done}"
+    assert n_done == expect, f"expected {expect} skip adds, found {n_done}"
     g.graph.lint()
     g.recompile()
     return g
@@ -123,3 +124,48 @@ def load_int8_net(path, net, pad_in=64):
     if pad_in:
         trunk = pad_first_conv(trunk, pad_in)
     return torch.compile(Int8Net(net, trunk, cin_pad=pad_in), dynamic=False)
+
+
+class Middle(nn.Module):
+    """the trunk between the input convs (inc) and the output convs (out): what the mixed network runs in int8
+    (quantize_int8.py mid exports it; its input x0 is inc's ReLU output, its output up1's before the skip add)."""
+    def __init__(self, n):
+        super().__init__()
+        self.down1, self.down2, self.up2, self.dec1, self.up1 = n.down1, n.down2, n.up2, n.dec1, n.up1   # only these in the .pt2
+
+    def forward(self, x0):
+        x1 = self.down1(x0)
+        x2 = self.down2(x1)
+        x1 = self.dec1(self.up2(x2) + x1)
+        return self.up1(x1)
+
+
+class MixedNet(nn.Module):
+    """inc and out in fp16 (autocast, the first conv padded to 64 input channels), the middle in int8, one graph. The
+    int8 part stays outside autocast: autocast around the qconvs gave the bf16-bias garbage (Bf16Out)."""
+    def __init__(self, net, mid):
+        super().__init__()
+        self.net, self.mid = net, mid
+
+    def forward(self, frames, conf):
+        n = self.net
+        with torch.autocast(frames.device.type, dtype=torch.float16):
+            x0 = n.inc(n.pre(frames, conf))
+        m = self.mid(x0.float())
+        with torch.autocast(frames.device.type, dtype=torch.float16):
+            return n.post(frames, conf, n.out(m + x0)).float()
+
+
+def load_mixed_net(path, net):
+    """-> the compiled mixed-precision network, (frames, conf) fp32 -> (B, 6, H, W) fp32, from quantize_int8.py's
+    middle .pt2. All of int8's loss sat in the three input and three output convs (per-layer sensitivity on the v3
+    validation windows, 2026-10-15): with those in fp16 it scores as the fp16 network (synthetic grain 49.25 dB,
+    grain-free 60.58; all-int8 48.85 / 58.51), mean 0.05 codes from it; B580 4K tile 8.9 ms (all-int8 6.9, FAST_FP16
+    11.1). net: the loaded StudentV3, not pad_input()ed."""
+    assert not getattr(net, "cin_pad", 0), "load_mixed_net pads the input conv itself"
+    icfg.freezing = True
+    icfg.post_grad_custom_pre_pass = Bf16Out()
+    mid = copy.deepcopy(torch.export.load(path).module())
+    mid.recompile()
+    mid = rewire_skips(mid, expect=1)
+    return torch.compile(MixedNet(net.pad_input(64), mid), dynamic=False)

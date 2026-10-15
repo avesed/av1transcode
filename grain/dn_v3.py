@@ -50,9 +50,14 @@ FAST = ASM is assemble_fast
 # own kernel choice) and the first conv's input padded from 48 to 64 channels (pad_input: zero weights, bit-identical).
 # B580, 572 x 992 tile: 15.2 -> 11.8 ms; the output within 0.16 codes (mean 0.006) of the unfrozen compile.
 # INT8_TRUNK=<.pt2>: the trunk in int8 (int8_net.py, quantize_int8.py), 7.1 ms a tile, within mean 0.57 / max 15
-# codes of the fp16 network. Both set freezing for the whole process.
+# codes of the fp16 network. INT8_MID=<.pt2> (quantize_int8.py ... mid): the mixed network, the three input and three
+# output convs in fp16 and the 11 between in int8 (int8_net.load_mixed_net): all of int8's loss sat in those six, and
+# it scores as the fp16 network on the v3 validation windows; 8.9 ms a tile. All of them set freezing process-wide.
 NET8 = None
-if os.environ.get("INT8_TRUNK"):
+if os.environ.get("INT8_MID"):
+    from int8_net import load_mixed_net
+    NET8 = load_mixed_net(os.environ["INT8_MID"], net.eval())
+elif os.environ.get("INT8_TRUNK"):
     from int8_net import load_int8_net
     NET8 = load_int8_net(os.environ["INT8_TRUNK"], net.eval())
 elif os.environ.get("FAST_FP16") == "1":
@@ -173,6 +178,8 @@ def reader():
 
 threading.Thread(target=reader, daemon=True).start()
 wq = {a: queue.Queue(maxsize=6) for a in keys}
+# seconds: the main thread blocked on rq (empty) / wq (full); the writer(s) waiting for the device's copy / in the pipe
+WAIT = {"decoder": 0.0, "encoder": 0.0, "w_device": 0.0, "w_pipe": 0.0}
 
 
 def writer(a):
@@ -181,8 +188,12 @@ def writer(a):
         if item is None:
             return
         buf, ev = item
+        t_ = time.perf_counter()
         ev.synchronize()                                 # the asynchronous device -> pinned host copy has landed
+        t1 = time.perf_counter()
         encs[a].stdin.write(memoryview(buf.numpy()).cast("B"))   # no 12 MB copy holding the GIL
+        WAIT["w_device"] += t1 - t_
+        WAIT["w_pipe"] += time.perf_counter() - t1
 
 
 wthreads = [threading.Thread(target=writer, args=(a,), daemon=True) for a in keys]
@@ -203,11 +214,15 @@ def emit(a, y, u, v):
     buf.copy_(planes.round().clamp(0, 1023).to(torch.int16), non_blocking=True)
     ev = torch.Event(device=dev)
     ev.record()
+    t_ = time.perf_counter()
     wq[a].put((buf, ev))
+    WAIT["encoder"] += time.perf_counter() - t_
 
 
 def read():
+    t_ = time.perf_counter()
     k = rq.get()
+    WAIT["decoder"] += time.perf_counter() - t_
     if k is None:
         return None
     a = IN_RING[k].to(dev, non_blocking=True)
@@ -228,7 +243,8 @@ n_in, n_out, eof, t0 = 0, 0, False, time.time()
 
 
 def net_tile(frames, conf):
-    """the network on one tile: fp16 autocast, or the int8 network (INT8_TRUNK, fp32 in and out, no autocast)."""
+    """the network on one tile: fp16 autocast, or the int8 / mixed network (INT8_TRUNK / INT8_MID, fp32 in and out,
+    no autocast around it)."""
     if NET8 is not None:
         return NET8(frames.float(), conf.float())
     with torch.autocast(dev.type, dtype=torch.float16):
@@ -362,6 +378,8 @@ for a, e in encs.items():
     e.stdin.close()
     e.wait()
     os.replace(f"{OUT}/{name(a)}.part.{ext}", f"{OUT}/{name(a)}.{ext}")
-print(f"{os.path.basename(SRC)}: done, {n_in} frames, alphas {ALPHAS}, {n_in / (time.time() - t0):.1f} fps", flush=True)
+print(f"{os.path.basename(SRC)}: done, {n_in} frames, alphas {ALPHAS}, {n_in / (time.time() - t0):.1f} fps; waited on the "
+      f"decoder {WAIT['decoder']:.1f} s, on the encoder {WAIT['encoder']:.1f} s (the writer: on the device "
+      f"{WAIT['w_device']:.1f} s, in the pipe {WAIT['w_pipe']:.1f} s)", flush=True)
 if PROF:
     print("per frame: " + "  ".join(f"{k} {v / max(n_in, 1) * 1000:.1f} ms" for k, v in TM.items() if k != "-"), flush=True)

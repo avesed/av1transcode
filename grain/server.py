@@ -15,6 +15,9 @@ API (JSON):
 One job runs at a time (one GPU); each runs its work in a subprocess, which a cancel terminates. Paths must lie under
 GRAIN_ROOTS (default /media) and are the caller's own: this container mounts the same volumes under the same names.
   python3 server.py   (grain service image; GRAIN_PORT 8790, GRAIN_WEIGHTS /weights, RENDER_NODE /dev/dri/renderD128)
+GRAIN_FAST (default 1): a model with a mixed-precision middle in the weights (MIXED) denoises with it and with flows
+480 px wide - B580 4K 11.0 -> 17.2 fps; the network scores as the fp16 one on the validation windows, and the owner saw
+no difference in the blind test-12 (2026-10-15). 0: the fp16 network and flows 960 wide, as before.
 """
 import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +27,8 @@ PORT = int(os.environ.get("GRAIN_PORT", "8790"))
 WEIGHTS = os.environ.get("GRAIN_WEIGHTS", "/weights")
 ROOTS = [os.path.realpath(r) for r in os.environ.get("GRAIN_ROOTS", "/media").split(":") if r]
 MODELS = {"v3g": "v3g.pt", "v3s2": "v3s2.pt"}         # v3g: the blind-tested one (test-08/09); v3s2: half width, ~1.6x faster
+MIXED = {"v3g": "v3g_mid_u8.pt2"}                     # int8 middles (quantize_int8.py ... mid) for dn_v3 INT8_MID
+FAST = os.environ.get("GRAIN_FAST", "1") != "0"
 DEFAULT_MODEL = os.environ.get("GRAIN_MODEL", "v3g")
 DEV = os.environ.get("DEV", "xpu")
 JOBS = {}
@@ -97,6 +102,12 @@ def do_analyse(job):
         return json.load(open(tf.name))
 
 
+def fast_net(model):
+    """-> the model's mixed-precision middle (.pt2 path) when GRAIN_FAST is on and the weights have one, else None"""
+    p = f"{WEIGHTS}/{MIXED[model]}" if FAST and model in MIXED else None
+    return p if p and os.path.exists(p) else None
+
+
 def do_denoise(job):
     src = allowed(job.params["source"], True)
     out = allowed(job.params["out"])
@@ -105,7 +116,9 @@ def do_denoise(job):
         raise ValueError(f"model {model}: not one of {list(MODELS)}")
     total, width = probe_frames(src)
     tmp = tempfile.mkdtemp(prefix=".grain_dn_", dir=os.path.dirname(out))
-    env = py_env(COMPILE="1", COMPILE_SP="1", FUSED="1", FLOWMW="960", FASTASM="1", TILES="2" if width > 1920 else "1",
+    mixed = fast_net(model)
+    env = py_env(COMPILE="1", COMPILE_SP="1", FUSED="1", FLOWMW="480" if mixed else "960", FASTASM="1",
+                 TILES="2" if width > 1920 else "1", **({"INT8_MID": mixed} if mixed else {}),
                  LIMIT="1.3", LIMWIN="25", LOSSLESS="av1hw", PROGRESS_EVERY="50",
                  SPYNET=f"{WEIGHTS}/spynet.pt", RENDER_NODE=os.environ.get("RENDER_NODE", "/dev/dri/renderD128"))
 
@@ -179,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             busy = next((j.id for j in JOBS.values() if j.state == "running"), None)
             return self._send(200, {"ok": True, "device": DEV, "busy": busy, "models": list(MODELS),
-                                    "default_model": DEFAULT_MODEL})
+                                    "default_model": DEFAULT_MODEL, "fast": [m for m in MODELS if fast_net(m)]})
         m = re.fullmatch(r"/jobs/([0-9a-f]+)", self.path)
         if m and m.group(1) in JOBS:
             return self._send(200, JOBS[m.group(1)].view())

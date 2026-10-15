@@ -3,7 +3,7 @@
   packed, conf = assemble_fused(Y, U, V, lowflows, f, tau=6.0)
 
 Y (1, 7, H, W), U / V (1, 7, H/2, W/2) float32 codes on xpu, H and W multiples of 8; lowflows: 6 tensors
-(1, 2, H/f, W/f) float32 in low-res pixels for the neighbours [0, 1, 2, 4, 5, 6] (None = zero flow); f in 1, 2, 4.
+(1, 2, H/f, W/f) float32 in low-res pixels for the neighbours [0, 1, 2, 4, 5, 6] (None = zero flow); f in 1, 2, 4, 8.
 Equals, within fp32 rounding, assemble_fast(Y, U, V, [F.interpolate(lf, (H, W), "bilinear", align_corners=False) * f ...], tau):
 packed (1, 7, 6, H/2, W/2) in [0, 1] and conf (1, 6, H/2, W/2).
 
@@ -294,7 +294,7 @@ def assemble_fused(Y, U, V, lowflows, f, tau=6.0, BH=8, BW=32, num_warps=4, reci
     """See the module docstring. Returns (packed (1, 7, 6, H/2, W/2), conf (1, 6, H/2, W/2))."""
     B, nf, H, W = Y.shape
     assert B == 1 and nf % 2 == 1 and len(lowflows) == nf - 1, (Y.shape, len(lowflows))
-    assert H % 8 == 0 and W % 8 == 0 and f in (1, 2, 4), (H, W, f)
+    assert H % 8 == 0 and W % 8 == 0 and f in (1, 2, 4, 8), (H, W, f)
     assert Y.is_contiguous() and U.is_contiguous() and V.is_contiguous() and Y.dtype == torch.float32
     Hh, Wh = H // 2, W // 2
     hl, wl = H // f, W // f
