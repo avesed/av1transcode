@@ -274,7 +274,7 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
     # ---------- GPU ----------
     _GPU_KEYS = ("vmaf_sycl_device", "vmaf_sycl_min_width", "scenedetect_hwaccel",
                  "reference_hwaccel", "vmaf_zero_copy", "vmaf_sycl_workers",
-                 "gpu_vram_budget_mb")
+                 "gpu_vram_budget_mb", "gpu_watch", "gpu_watch_kernel_log", "gpu_watch_test_s")
 
     def _gpu_settings() -> dict:
         o = settings.transcode.optimizer
@@ -285,6 +285,9 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
                 "vmaf_zero_copy": o.vmaf_zero_copy,
                 "vmaf_sycl_workers": o.vmaf_sycl_workers,
                 "gpu_vram_budget_mb": o.gpu_vram_budget_mb,
+                "gpu_watch": o.gpu_watch,
+                "gpu_watch_kernel_log": o.gpu_watch_kernel_log,
+                "gpu_watch_test_s": o.gpu_watch_test_s,
                 "vulkan_device": settings.transcode.dovi.vulkan_device}
 
     @router.get("/gpu")
@@ -293,6 +296,8 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         from app import gpu
 
         status = gpu.probe(settings, force=refresh)
+        from app import gpuwatch
+        status["watch"] = gpuwatch._WATCH.status() if gpuwatch.active() else {"state": "off"}
         return {"status": status, "settings": _gpu_settings()}
 
     @router.post("/gpu/selfcheck")

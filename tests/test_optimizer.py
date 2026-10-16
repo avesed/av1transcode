@@ -8002,3 +8002,36 @@ def test_scdet_hardware_pass_with_a_rebuilt_graph_falls_back_to_software(setting
     enc.total_frames = 6
     enc._detect_shots_scdet()
     assert [Path(t).name for t in tried] == ["hw_rebuilt", "sw"]
+
+
+# ---- the GPU watcher's verdict (app/gpuwatch.py) ----
+class _Watch:
+    def __init__(self, ok):
+        self.ok = ok
+
+    def usable(self):
+        return (self.ok, "" if self.ok else "kernel: reset started")
+
+    def vram_mb(self):
+        return 77.0
+
+
+def test_an_unusable_gpu_sends_every_entry_point_to_the_cpu(settings, info, plan, tmp_path, monkeypatch):
+    from app import gpuwatch
+    from app.transcoder import TranscodeError
+    enc = make_encoder(settings, info, plan, tmp_path)
+    monkeypatch.setattr(opt, "_render_nodes", lambda: ["/dev/dri/renderD129"])
+    enc.opt.probe_encoder = "qsv+svt"
+    enc.opt.vmaf_sycl_device = 0
+    w = _Watch(True)
+    monkeypatch.setattr(gpuwatch, "_WATCH", w)
+    assert enc._hwdec_args()[:2] == ["-hwaccel", "vaapi"]
+    assert enc._probe_mode() == "qsv+svt"
+    assert enc._gpu_vram.measured_mb(force=True) == 77.0     # the watcher's reading, not an fdinfo read here
+    w.ok = False
+    assert enc._hwdec_args() == []
+    assert enc._probe_mode() == "svt"
+    assert enc._sycl_device() == -1
+    with pytest.raises(TranscodeError, match="GPU not usable"):
+        with enc._gpu_slot("probe encode q=30", 100.0):
+            pass

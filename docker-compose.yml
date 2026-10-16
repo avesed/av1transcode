@@ -16,6 +16,9 @@ services:
       - ./media/work:/media/work
       - ./sample:/media/sample
       - av1data:/data
+      # the host's logs, read-only: the GPU watcher follows kern.log for the card's driver errors (app/gpuwatch.py);
+      # the directory and not the file, so that the weekly rotation is followed
+      - /var/log:/host/log:ro
     environment:
       # Everything below can also be set in config.yaml
       - AV1TC_WORKERS_CONCURRENCY=1

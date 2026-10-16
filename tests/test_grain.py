@@ -427,3 +427,28 @@ def test_the_profiles_grain_strength_reaches_the_grain_step(settings, service, h
     grain.finish(settings, ctx._replace(service=grain.GrainService(s.url, 60)), av1_output, [24, 24],
                  settings.dirs.work)
     assert s.calls[-1]["kind"] == "grain" and s.calls[-1]["strength"] == 0.8
+
+
+class _Watch:
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def usable(self):
+        ok = self.answers.pop(0) if self.answers else True
+        return (ok, "" if ok else "kernel: reset started")
+
+
+def test_a_step_waits_for_the_gpu_and_runs_again_when_it_goes_down(settings, service, holey_source, monkeypatch,
+                                                                     tmp_path):
+    from app import gpuwatch
+    svc = service(on=True)
+    sleeps = []
+    monkeypatch.setattr(gpuwatch.time, "sleep", lambda s: sleeps.append(s))
+    # before the step: down, down, up; then down while it runs; then up for good
+    monkeypatch.setattr(gpuwatch, "_WATCH", _Watch([False, False, True, False]))
+    monkeypatch.setattr(grain.GrainService, "GPU_DOWN_S", -1.0)
+    out = tmp_path / "dn.mkv"
+    r = grain.GrainService(svc.url, 60).run("denoise", {"source": str(holey_source), "out": str(out)}, poll=0.01)
+    assert r["out"] == str(out)
+    assert [c["kind"] for c in svc.calls] == ["denoise", "denoise"]   # the first cancelled when the GPU went down
+    assert len(sleeps) == 2                                          # the two waits before it started

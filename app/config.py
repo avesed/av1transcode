@@ -511,6 +511,15 @@ class OptimizerSettings(BaseModel):
     # default leaves half the 12GB card unbooked rather than trying to
     # measure the other tenant. Raise it only on a card nothing else uses.
     gpu_vram_budget_mb: int = 0
+    # A separate process watches the GPU (app/gpuwatch.py): its VRAM reading, the host's kernel log for this card's
+    # errors, a small real test every gpu_watch_test_s. When it reports trouble - or stops reporting, stuck in the
+    # driver - every GPU entry point takes its CPU path and grain_auto waits for the GPU. 2026-10-16: a VRAM reading
+    # done in-process hung inside the xe driver after a GT reset and the job stood still for ten hours.
+    # gpu_watch_kernel_log: the host's kern.log as mounted into the container (its directory, read-only, so that
+    # rotation is followed); empty or missing leaves the kernel out of it.
+    gpu_watch: bool = True
+    gpu_watch_kernel_log: str = "/host/log/kern.log"
+    gpu_watch_test_s: int = 600
     # Append one JSON line per probed shot to <logs>/probe_dataset.jsonl:
     # the shot's geometry, the probed (crf, score) points, the (q, score)
     # points when the card probed it too, both crossings, and the CRF the

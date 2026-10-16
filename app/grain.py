@@ -31,6 +31,7 @@ from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 from loguru import logger
 
+from app import gpuwatch
 from app.analyzer import MediaInfo
 from app.config import Settings, VideoParams
 
@@ -52,12 +53,20 @@ class GrainContext(NamedTuple):
     strength: float = 0.5
 
 
+class _GpuWentDown(Exception):
+    """The GPU watcher has called the GPU unusable for GPU_DOWN_S while a step ran on it."""
+
+
 class GrainService:
     # How long a running job's service may go without answering before the job is given up. 2026-10-08, A Good
     # Girl's Guide to Murder S01E03: a neighbour's build saturated the box's CPU and memory, the service (cpu
     # weight 21) answered no poll for over 30 s, and the job failed four hours in - its retry starting from zero
     # while the service kept running the grain step nobody would collect.
     UNREACHABLE_S = 900.0
+    # Every step runs on the GPU (analysis, the denoiser, the grain measurement). One the watcher (app/gpuwatch.py)
+    # has called unusable this long is cancelled and run again once the GPU is back; before each step the job waits
+    # for a usable GPU (owner 2026-10-16: grain_auto jobs wait, they do not go on without the denoiser).
+    GPU_DOWN_S = 300.0
 
     def __init__(self, url: str, timeout_s: float, unreachable_s: Optional[float] = None):
         self.url, self.timeout_s = url.rstrip("/"), timeout_s
@@ -83,12 +92,28 @@ class GrainService:
 
     def run(self, kind: str, params: dict, progress_cb: Optional[Callable[[float], None]] = None,
             cancel_flag: Optional[Callable[[], bool]] = None, poll: float = 2.0) -> dict:
+        """Submit a job and wait for it, once the GPU is usable; a step whose GPU goes down under it is run again
+        when it is back (see GPU_DOWN_S)."""
+        while True:
+            try:
+                gpuwatch.wait_usable(cancel_flag, f"the {kind} step")
+            except InterruptedError as e:
+                raise GrainError(f"{kind}: cancelled") from e
+            try:
+                return self._run_once(kind, params, progress_cb, cancel_flag, poll)
+            except _GpuWentDown as e:
+                logger.warning("grain_auto: the GPU is not usable ({}); the {} step is cancelled and runs again "
+                               "once it is", e, kind)
+
+    def _run_once(self, kind: str, params: dict, progress_cb: Optional[Callable[[float], None]],
+                  cancel_flag: Optional[Callable[[], bool]], poll: float) -> dict:
         """Submit a job and wait for it. progress_cb gets 0..1. A service that stops answering is waited for up to
         unreachable_s (polls back off to 30 s); however the wait ends early - cancelled, failed, timed out, given
-        up - the service job is cancelled too, so no step keeps running that nobody will collect."""
+        up, the GPU gone - the service job is cancelled too, so no step keeps running that nobody will collect."""
         jid = self._call("POST", "/jobs", {"kind": kind, **params})["id"]
         deadline = time.monotonic() + self.timeout_s
         silent_since, wait = None, poll
+        gpu_down_since: Optional[float] = None
         try:
             while True:
                 if cancel_flag is not None and cancel_flag():
@@ -117,6 +142,13 @@ class GrainService:
                     raise GrainError(f"{kind} {v['state']}: {v.get('error')}" + (f" ({tail})" if tail else ""))
                 if time.monotonic() > deadline:
                     raise GrainError(f"{kind}: no result after {self.timeout_s / 3600:g} h")
+                ok, why = gpuwatch.gpu_usable()
+                if ok:
+                    gpu_down_since = None
+                else:
+                    gpu_down_since = gpu_down_since or time.monotonic()
+                    if time.monotonic() - gpu_down_since > self.GPU_DOWN_S:
+                        raise _GpuWentDown(why)
                 time.sleep(poll)
         finally:
             if jid is not None:

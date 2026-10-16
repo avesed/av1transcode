@@ -38,6 +38,7 @@ from typing import (Callable, Dict, Iterator, List, NamedTuple, Optional, Set,
 from loguru import logger
 
 from app import sysres
+from app import gpuwatch
 from app.analyzer import MediaInfo
 from app.config import Settings, VideoParams
 from app.decisions import TranscodePlan
@@ -535,89 +536,9 @@ def _render_nodes() -> List[str]:
     return sorted(glob.glob("/dev/dri/renderD*"))
 
 
-def _render_pdev(node: str) -> Optional[str]:
-    """The PCI address behind a render node, e.g. "0000:c6:00.0".
-
-    fdinfo tags every DRM client with the device it belongs to, and this box
-    has four render nodes (two 3090s, the B580, and the iGPU); without the
-    address a memory reading would sum clients of cards this job never
-    touches.
-    """
-    name = os.path.basename(node)
-    try:
-        return os.path.basename(
-            os.path.realpath(f"/sys/class/drm/{name}/device"))
-    except OSError:
-        return None
-
-
-def drm_vram_used_mb(pdev: Optional[str],
-                     root: str = "/proc") -> Optional[float]:
-    """VRAM this process tree holds on `pdev`, in MB, or None if unreadable.
-
-    The interface nvtop reads: every open DRM file exposes drm-total-vram0 in
-    /proc/<pid>/fdinfo/<fd>, and a client that dup()s or forks its fd shows
-    the same allocation under several fds, so the sum has to be deduplicated
-    by drm-client-id or it counts the same bytes many times over.
-
-    It sees only what this PID namespace can see. Inside the container that
-    is our own ffmpegs - Plex's share of the card is invisible here, which is
-    why the budget has to leave room for it rather than measure it.
-    """
-    total, seen = 0.0, set()
-    try:
-        pids = [d for d in os.listdir(root) if d.isdigit()]
-    except OSError:
-        return None
-    found = False
-    for pid in pids:
-        d = f"{root}/{pid}/fdinfo"
-        try:
-            fds = os.listdir(d)
-        except OSError:
-            continue                      # the process exited, or is not ours
-        for fd in fds:
-            try:
-                with open(f"{d}/{fd}") as fh:
-                    text = fh.read(4096)
-            except OSError:
-                continue
-            if "drm-client-id" not in text:
-                continue
-            found = True
-            cid = dev = None
-            vram = 0.0
-            for line in text.splitlines():
-                k, _, v = line.partition(":")
-                v = v.strip()
-                if k == "drm-client-id":
-                    cid = v
-                elif k == "drm-pdev":
-                    dev = v
-                elif k.startswith("drm-total-vram"):
-                    vram += _kib_to_mb(v)
-            if cid is None or cid in seen:
-                continue
-            if pdev and dev and dev != pdev:
-                continue
-            seen.add(cid)
-            total += vram
-    return total if found or total == 0.0 else None
-
-
-def _kib_to_mb(v: str) -> float:
-    """One fdinfo size field ("1234 KiB", "12 MiB", bare bytes) in MB."""
-    parts = v.split()
-    if not parts:
-        return 0.0
-    try:
-        n = float(parts[0])
-    except ValueError:
-        return 0.0
-    unit = (parts[1] if len(parts) > 1 else "KiB").lower()
-    scale = {"b": 1 / 1048576.0, "kib": 1 / 1024.0, "mib": 1.0,
-             "gib": 1024.0}.get(unit, 1 / 1024.0)
-    return n * scale
+# moved to the watcher process's module: reading a DRM fdinfo goes into the driver (see app/gpuwatch.py); the names
+# stay for callers and tests
+from app.gpuwatch import drm_vram_used_mb, kib_to_mb as _kib_to_mb, render_pdev as _render_pdev  # noqa: E402,F401
 
 
 class VramBudget:
@@ -657,7 +578,8 @@ class VramBudget:
         self.budget = max(256.0, float(budget_mb))
         self.max_ops = max(1, int(max_ops))
         self._pdev = pdev
-        self._measure = measure or (lambda: drm_vram_used_mb(self._pdev))
+        # from the GPU watcher's process when it runs: an fdinfo read in this one can hang in the driver (10-16)
+        self._measure = measure or (lambda: gpuwatch.vram_mb() if gpuwatch.active() else drm_vram_used_mb(self._pdev))
         self._cv = threading.Condition()
         self._reserved = 0.0
         self._ops = 0
@@ -2794,6 +2716,8 @@ class ShotEncoder:
         dev = int(self.opt.vmaf_sycl_device)
         if dev < 0 or self.metric != "vmaf":
             return -1
+        if not gpuwatch.gpu_usable()[0]:
+            return -1                                     # the watcher says no: the CPU, until it says yes
         min_w = int(self.opt.vmaf_sycl_min_width or 0)
         if min_w and (self.info.width or 0) < min_w:
             return -1
@@ -3197,7 +3121,7 @@ class ShotEncoder:
         SVT path rather than failing the job.
         """
         mode = (self.opt.probe_encoder or "svt").lower()
-        if mode == "svt":
+        if mode == "svt" or not gpuwatch.gpu_usable()[0]:
             return "svt"
         if not self._hwdec_args():
             logger.warning("optimizer: probe_encoder={} needs a /dev/dri render "
@@ -3223,7 +3147,11 @@ class ShotEncoder:
         """Hold room on the card for one operation. The same budget the scores
         book against: encode engine and compute engine are separate, but they
         share the one pool of memory, and it was exhausting that which cost a
-        reboot."""
+        reboot. The GPU watcher's verdict comes first: a card it calls unusable fails the operation at once, and the
+        caller's card-failed path takes over (an SVT probe for a card probe)."""
+        ok, why = gpuwatch.gpu_usable()
+        if not ok:
+            raise TranscodeError(f"GPU not usable for {what}: {why}")
         with self._gpu_vram.hold(mb if mb is not None else self._est_score_mb(None),
                                  self._GPU_SLOT_WAIT, what):
             yield
@@ -4024,7 +3952,7 @@ class ShotEncoder:
         cases, nine identical scores.
         """
         nodes = _render_nodes()
-        if not nodes:
+        if not nodes or not gpuwatch.gpu_usable()[0]:
             return []
         return ["-hwaccel", "vaapi", "-hwaccel_device", nodes[0],
                 "-hwaccel_output_format", "vaapi"]

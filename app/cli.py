@@ -84,6 +84,8 @@ def run(
         watcher = None
         logger.info("Watcher disabled")
 
+    from app import gpuwatch
+    gpuwatch.start(settings)          # before the first job: every GPU entry point asks it (see app/gpuwatch.py)
     manager.start()
 
     if settings.web.enabled and not no_web:

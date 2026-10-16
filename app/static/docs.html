@@ -722,6 +722,24 @@
   <div class="def__body"><p>本作业的 GPU 操作可以占用多少显存（MB），0 = 自动（6000）。<code>vmaf_sycl_workers</code> 数的是个数，这个数的是字节——显卡耗尽的是后者。占用用 DRM fdinfo 实测，但只看得见本容器里的进程，容器外共用这张卡的程序那份看不到，所以默认给 12GB 的卡留了一半。它是放行门限，不是硬上限：新操作要等估算放得下才开始，估算偏低时整卡照样会超，B580 上日志记过探测阶段峰值 7.1-7.2GB 对 6000MB 的预算。只有这张卡没有别人用时才调高。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_vram_budget_mb">去设置页 ›</a></p></div>
 </div>
+<div class="def" id="p-gpu_watch">
+  <h4 class="def__name"><code>gpu_watch</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 true</p>
+  <div class="def__body"><p>单独一个进程盯着显卡：每秒读一次显存占用（DRM fdinfo）并写心跳，跟着宿主机的内核日志看这张卡的报错（wedged、任务超时、GT 重置、RCU 卡死），每隔 <a href="#p-gpu_watch_test_s"><code>gpu_watch_test_s</code></a> 做一次小测试（3 帧 VA-API 编码 + 一次 SYCL 打分，都有硬超时）。它报错、测试失败，或者心跳超过 15 秒没更新（卡在驱动里），显卡就算不可用：GPU 打分、VA-API 硬解、显卡探测编码全部改走 CPU，<code>grain_auto</code> 的每一步（分析、降噪、颗粒）在开始前等显卡恢复，跑到一半显卡掉了超过 5 分钟就取消那一步、恢复后重跑。恢复要求出错之后开始的测试通过：wedged 之后就是重绑之后。2026-10-16 的起因：GT 重置之后，主进程读 fdinfo 卡死在 xe 驱动里，探测停了十个小时。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_watch">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_watch_kernel_log">
+  <h4 class="def__name"><code>gpu_watch_kernel_log</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 <code>/host/log/kern.log</code></p>
+  <div class="def__body"><p>宿主机内核日志在容器里的路径。compose 把宿主机 <code>/var/log</code> 只读挂到 <code>/host/log</code>：挂目录而不是文件，每周日志轮转后才能跟到新文件。留空或文件不存在 = 不看内核日志，只靠心跳和定期测试，发现问题会慢一些。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_watch_kernel_log">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="p-gpu_watch_test_s">
+  <h4 class="def__name"><code>gpu_watch_test_s</code> <span class="tag adv">进阶</span></h4>
+  <p class="def__dflt">默认 600</p>
+  <div class="def__body"><p>显卡正常时，监测进程多久做一次小测试（秒）。出错之后不按这个间隔：冷却 10 分钟后每分钟测一次，直到通过。测试很小（256×256、几秒），但每次会占一个 SYCL 上下文（约 400MB 显存）几秒钟。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#f-gpu_watch_test_s">去设置页 ›</a></p></div>
+</div>
 <div class="def" id="p-vmaf_sycl_workers">
   <h4 class="def__name"><code>vmaf_sycl_workers</code> <span class="tag adv">进阶</span></h4>
   <p class="def__dflt">默认 0</p>

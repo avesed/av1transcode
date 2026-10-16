@@ -282,6 +282,15 @@ transcode:
                                  # 也在用这张 B580，在容器里根本看不到，所以默认值给 12GB 的
                                  # 卡留了一半，而不是去猜另一个租户用了多少。只有当这张卡没有
                                  # 别人用时才值得调高。
+    gpu_watch: true              # 单独一个 GPU 监测进程(app/gpuwatch.py):显存读数、内核日志、
+                                 # 每隔 gpu_watch_test_s 一次小测试。它报错或心跳停了(卡在驱动
+                                 # 里)，GPU 打分/硬解/显卡探测全部改走 CPU，grain_auto 等显卡
+                                 # 恢复。2026-10-16:主进程读 fdinfo 卡死在 xe 驱动里，探测停了
+                                 # 十个小时 —— 这类读数现在只在监测进程里做。
+    gpu_watch_kernel_log: /host/log/kern.log   # 宿主机 kern.log(compose 把 /var/log 只读挂到
+                                 # /host/log，挂目录才跟得上轮转)。留空 = 不看内核日志。
+    gpu_watch_test_s: 600        # 正常时多久测一次(3 帧 VA-API 编码 + 一次 SYCL 打分)；出错后
+                                 # 冷却 10 分钟，之后每分钟测一次直到通过。
     probe_dataset: true          # 每探测完一个镜头,往 <logs>/probe_dataset.jsonl 追加一行 JSON:
                                  # 镜头的几何信息、探到的 (crf, 分数) 点、显卡也探过时的
                                  # (q, 分数) 点、两个交点,以及这一集最终用什么 CRF 编的。
