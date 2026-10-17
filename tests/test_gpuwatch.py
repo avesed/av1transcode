@@ -139,3 +139,12 @@ def test_waiting_for_the_gpu_ends_when_it_is_back_or_on_a_cancel(watch, monkeypa
     with pytest.raises(InterruptedError):
         gw.wait_usable(lambda: len(calls) >= 5, "the denoise step")
     assert len(calls) == 5
+
+
+def test_the_xe_memory_query_answer_is_read_for_vram_only():
+    import struct
+    region = lambda cls, used: struct.pack("HHIQQQQ6Q", cls, 0, 4096, 12 << 30, used, 0, 0, *([0] * 6))
+    raw = struct.pack("II", 2, 0) + region(0, 5 << 30) + region(1, 124 << 20)      # system memory, then VRAM
+    assert gw.parse_mem_regions(raw) == 124.0
+    assert gw.parse_mem_regions(struct.pack("II", 1, 0) + region(0, 1 << 20)) is None   # no VRAM region
+    assert gw.parse_mem_regions(b"\x01") is None

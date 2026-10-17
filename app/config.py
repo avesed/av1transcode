@@ -505,8 +505,11 @@ class OptimizerSettings(BaseModel):
     # encode beside the scores, or a model that turns out to be wrong, all of
     # which change the bytes per operation without changing their number.
     #
-    # Usage is measured from DRM fdinfo, so it is what the card really holds
-    # rather than what was predicted - but only for THIS pid namespace. Plex
+    # Usage is measured, so it is what the card really holds rather than what
+    # was predicted. With the GPU watcher on an xe card that is the driver's
+    # own device query: the WHOLE card, the grain service included (since
+    # 10-17; the fdinfo read it replaced hung in the driver on 10-16). Without
+    # it, DRM fdinfo - but only for THIS pid namespace. Plex
     # shares the B580 and is invisible from inside the container, so the
     # default leaves half the 12GB card unbooked rather than trying to
     # measure the other tenant. Raise it only on a card nothing else uses.

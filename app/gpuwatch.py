@@ -8,7 +8,11 @@ probe scheduler waited for that shot's result, and the job sat at "probing 99.9%
 running.
 
 So everything that touches the driver's state from this app goes through a child process:
-  - the VRAM reading (fdinfo), once a second;
+  - the VRAM reading, once a second: on xe the driver's own device query (DRM_XE_DEVICE_QUERY_MEM_REGIONS), which
+    reads a counter and touches no buffer object - the 10-16 spin was a buffer object's last reference dropped inside
+    the fdinfo read. It is the whole card's figure (the grain service's container included, which fdinfo from here
+    never saw); measured 10-17: 24 MB idle, 124 MB during the watcher's own test, back within the second. Other
+    drivers keep the fdinfo sum;
   - the kernel log (the host's, mounted read-only), for this card's errors;
   - a small real test every few minutes: a 3-frame av1_vaapi encode and one SYCL score of the preflight pair, each
     with a hard timeout.
@@ -137,6 +141,72 @@ def kib_to_mb(v: str) -> float:
     unit = (parts[1] if len(parts) > 1 else "KiB").lower()
     scale = {"b": 1 / 1048576.0, "kib": 1 / 1024.0, "mib": 1.0, "gib": 1024.0}.get(unit, 1 / 1024.0)
     return n * scale
+
+
+# DRM_IOCTL_XE_DEVICE_QUERY: _IOWR('d', DRM_COMMAND_BASE + 0x00, struct drm_xe_device_query) - 40 bytes:
+# u64 extensions, u32 query, u32 size, u64 data, u64 reserved[2]
+_XE_QUERY = (3 << 30) | (40 << 16) | (ord("d") << 8) | 0x40
+_XE_QUERY_MEM_REGIONS = 1
+_XE_MEM_REGION_SIZE = 88       # struct drm_xe_mem_region: u16 class, u16 instance, u32 min_page, u64 total, used,
+                               # cpu-visible size, cpu-visible used, u64 reserved[6]
+_XE_MEM_VRAM = 1               # DRM_XE_MEM_REGION_CLASS_VRAM
+
+
+def parse_mem_regions(raw: bytes) -> Optional[float]:
+    """struct drm_xe_query_mem_regions (u32 count, u32 pad, regions) -> the VRAM regions' used bytes, in MB."""
+    import struct
+    if len(raw) < 8:
+        return None
+    n = struct.unpack_from("I", raw)[0]
+    used, seen = 0, False
+    for i in range(n):
+        off = 8 + i * _XE_MEM_REGION_SIZE
+        if off + 24 > len(raw):
+            return None
+        cls, _inst, _page, _total, u = struct.unpack_from("HHIQQ", raw, off)
+        if cls == _XE_MEM_VRAM:
+            used, seen = used + u, True
+    return used / 1048576.0 if seen else None
+
+
+class XeVram:
+    """VRAM in use on the whole card, from the xe driver's memory-region query on one render node fd kept open
+    (an open per reading would make and drop a DRM client every second). None when the query fails; the fd is
+    reopened on the next reading."""
+
+    def __init__(self, node: str):
+        self.node, self.fd = node, None
+
+    def read(self) -> Optional[float]:
+        import ctypes
+        import fcntl
+        import struct
+        try:
+            if self.fd is None:
+                self.fd = os.open(self.node, os.O_RDWR | os.O_CLOEXEC)
+            q = bytearray(struct.pack("QIIQQQ", 0, _XE_QUERY_MEM_REGIONS, 0, 0, 0, 0))
+            fcntl.ioctl(self.fd, _XE_QUERY, q, True)                 # size=0: the kernel says how much it needs
+            size = struct.unpack_from("QII", q)[2]
+            buf = ctypes.create_string_buffer(size)
+            q = bytearray(struct.pack("QIIQQQ", 0, _XE_QUERY_MEM_REGIONS, size, ctypes.addressof(buf), 0, 0))
+            fcntl.ioctl(self.fd, _XE_QUERY, q, True)
+            return parse_mem_regions(buf.raw)
+        except OSError:
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+            self.fd = None
+            return None
+
+
+def render_driver(node: str) -> Optional[str]:
+    """The kernel driver behind a render node ("xe", "i915", "nvidia" ...)."""
+    try:
+        return os.path.basename(os.path.realpath(f"/sys/class/drm/{os.path.basename(node)}/device/driver"))
+    except OSError:
+        return None
 
 
 def classify(line: str, pdev: Optional[str]) -> Optional[str]:
@@ -306,6 +376,7 @@ def child_main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--test-every", type=float, default=600.0)
     a = ap.parse_args(argv)
     pdev = render_pdev(a.node)
+    xe = XeVram(a.node) if render_driver(a.node) == "xe" else None
     parent = os.getppid()
     klog = KernelLog(a.kernlog or None)
     h = Health(time.time())
@@ -335,10 +406,12 @@ def child_main(argv: Optional[List[str]] = None) -> None:
             snap = {"last_error_at": h.last_error_at, "last_error": h.last_error, "wedged_at": h.wedged_at,
                     "test_pass_started": h.test_pass_started, "test_fail": h.test_fail,
                     "test_running_since": h.test_running_since}
-        vram = drm_vram_used_mb(pdev)                     # the read that hung on 10-16: here, it stops the heartbeat
+        # xe: the device query (no buffer objects touched); else the fdinfo sum, whose xe read hung on 10-16
+        vram = xe.read() if xe is not None else drm_vram_used_mb(pdev)
         seq += 1
         _write(a.out, {"pid": os.getpid(), "t": time.time(), "seq": seq, "state": state, "why": why,
-                       "vram_mb": vram, "pdev": pdev, "node": a.node, "kernlog": bool(klog.path), **snap})
+                       "vram_mb": vram, "vram_from": "xe query" if xe is not None else "fdinfo", "pdev": pdev,
+                       "node": a.node, "kernlog": bool(klog.path), **snap})
         time.sleep(LOOP_S)
 
 
