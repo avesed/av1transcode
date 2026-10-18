@@ -84,9 +84,26 @@ def kept(total, step, ranges=()):
 
 
 def planes(t, w, h):
-    """a reader_raw frame -> (Y, U, V) float tensors on dev."""
-    a = t.to(dev).float()
+    """a reader_raw frame -> (Y, U, V) int16 tensors on dev, the 10-bit codes. From pinned memory the copy is queued
+    behind the GPU work instead of waiting for it."""
+    a = t.to(dev, non_blocking=t.is_pinned())
     return a[:w * h].view(h, w), a[w * h:w * h * 5 // 4].view(h // 2, w // 2), a[w * h * 5 // 4:].view(h // 2, w // 2)
+
+
+PIN = [dev.type != "cpu"]
+
+
+def frame_buffer(n):
+    """an int16 CPU tensor of n samples for reader_raw to read a frame into: page-locked where it can be, so planes()
+    copies it up without waiting for the GPU, else ordinary memory. The pipe reads straight into it: tensor.pin_memory()
+    on a read frame copied it again on torch's CPU thread pool, whose threads then spun at about 12 cores."""
+    if PIN[0]:
+        try:
+            return torch.empty(n, dtype=torch.int16, pin_memory=True)
+        except (RuntimeError, NotImplementedError) as e:
+            PIN[0] = False
+            log(f"pinned memory unavailable, frames go up pageable: {str(e)[:120]}")
+    return torch.empty(n, dtype=torch.int16)
 
 
 def reader_raw(path, w, h, grain=True, hw=False, select=None):
@@ -109,10 +126,10 @@ def reader_raw(path, w, h, grain=True, hw=False, select=None):
                           "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-"], stdout=subprocess.PIPE)
     try:
         while True:
-            b = p.stdout.read(fs * 2)
-            if len(b) < fs * 2:
+            t = frame_buffer(fs)
+            if p.stdout.readinto(memoryview(t.numpy()).cast("B")) < fs * 2:
                 break
-            yield torch.from_numpy(np.frombuffer(b, np.int16))
+            yield t
     finally:
         p.kill()
         p.wait()
@@ -257,6 +274,26 @@ def hardest(tgt, k=FLICKER_SHOTS):
     return dict(sorted(scores.items(), key=lambda t: -t[1])[:k])
 
 
+LANES = 256
+LANE_OF = {}
+
+
+def binsums(k, nb, *ws):
+    """per bin 0..nb-1 of k (any other value up to nb is in none): the sum of each of ws and the count, exactly
+    (int64), as an [nb, len(ws) + 1] tensor, without waiting for the GPU. Each bin's sums are spread over LANES
+    counters by pixel position and added up after. On the B580, per 4K frame pair (Sandman S01E01, 2026-10-18): the
+    five torch.bincount calls this replaces took 33-39 ms and read the selection's size and the largest bin back to the
+    host each call; index_add_ straight into the 11 bins, 146-179 ms (atomics on a few addresses); spread over 256
+    lanes, 2.9 ms (7.6 ms with the target's flat mask). Integer sums: the same numbers in any order."""
+    k = k.reshape(-1)
+    if k.numel() not in LANE_OF:
+        LANE_OF[k.numel()] = torch.arange(k.numel(), device=k.device) % LANES
+    key = k * LANES + LANE_OF[k.numel()]
+    cols = [torch.zeros((nb + 1) * LANES, dtype=torch.int64, device=k.device).index_add_(0, key, w.reshape(-1).long())
+            for w in (*ws, torch.ones_like(key))]
+    return torch.stack([c.view(nb + 1, LANES).sum(1) for c in cols], 1)[:nb]
+
+
 def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker_shots=None):
     """ga_bins.py on the GPU, on every STEP-th frame. mode target: A = source, B = the encode; applied: A = with
     grain, B = without it (path_b, the encode it was written into; else A with its grain exported). In applied mode
@@ -269,7 +306,7 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
         o += s
     total = o
     nb = len(EDGES) - 1
-    acc = torch.zeros(len(bounds), nb, 5, dtype=torch.float64, device=dev)    # y, ny, cb, cr, nc
+    acc = torch.zeros(len(bounds), nb, 5, dtype=torch.int64, device=dev)      # y, ny, cb, cr, nc
     fl_ranges = [bounds[i] for i in sorted(flicker_shots or {})] if flicker_src else []
     fl_frames = set(kept(total, 0, fl_ranges))
     ga = prefetch(reader_raw(path_a, w, h, True, HWDEC and hw_a, keep(STEP, fl_ranges)))
@@ -303,7 +340,7 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
                 while fi < len(fl_ranges) and f >= fl_ranges[fi][1]:
                     fi += 1
                 if s_ is not None:
-                    fl.add(bounds.index(fl_ranges[fi]), s_[0], a[0])
+                    fl.add(bounds.index(fl_ranges[fi]), s_[0].float(), a[0].float())
             if f % STEP:
                 continue
             b = next(gb, None)
@@ -315,24 +352,19 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
             if si >= len(bounds):
                 break
             (ay, au, av), (by, bu, bv) = a, b
-            ry, ru, rv = ay - by, au - bu, av - bv
+            ry, ru, rv = ay.int() - by.int(), au.int() - bu.int(), av.int() - bv.int()
+            idx = by / 4
+            k = torch.bucketize(idx, EDGES_T, right=True)
+            idx_c = (idx[0::2, 0::2] + idx[1::2, 0::2] + idx[0::2, 1::2] + idx[1::2, 1::2]) / 4
+            kc = torch.bucketize(idx_c, EDGES_T, right=True)
             if mode == "target":
-                p = F.pad(by[None, None], (4, 4, 4, 4), mode="reflect")
+                p = F.pad(by.float()[None, None], (4, 4, 4, 4), mode="reflect")
                 m1 = F.avg_pool2d(p, 9, 1)[0, 0]
                 m2 = F.avg_pool2d(p * p, 9, 1)[0, 0]
                 flat = (m2 - m1 * m1).clamp(min=0).sqrt() < 3.0
-            else:
-                flat = torch.ones_like(by, dtype=torch.bool)
-            idx = by / 4
-            fl_c = flat[0::2, 0::2] & flat[1::2, 0::2] & flat[0::2, 1::2] & flat[1::2, 1::2]
-            idx_c = (idx[0::2, 0::2] + idx[1::2, 0::2] + idx[0::2, 1::2] + idx[1::2, 1::2]) / 4
-            k = torch.bucketize(idx, EDGES_T, right=True)[flat]
-            kc = torch.bucketize(idx_c, EDGES_T, right=True)[fl_c]
-            acc[si, :, 0] += torch.bincount(k, weights=(ry[flat] ** 2).double(), minlength=nb)
-            acc[si, :, 1] += torch.bincount(k, minlength=nb).double()
-            acc[si, :, 2] += torch.bincount(kc, weights=(ru[fl_c] ** 2).double(), minlength=nb)
-            acc[si, :, 3] += torch.bincount(kc, weights=(rv[fl_c] ** 2).double(), minlength=nb)
-            acc[si, :, 4] += torch.bincount(kc, minlength=nb).double()
+                fl_c = flat[0::2, 0::2] & flat[1::2, 0::2] & flat[0::2, 1::2] & flat[1::2, 1::2]
+                k, kc = k.masked_fill(~flat, nb), kc.masked_fill(~fl_c, nb)       # nb: in no bin
+            acc[si] += torch.cat([binsums(k, nb, ry * ry), binsums(kc, nb, ru * ru, rv * rv)], 1)
             done += 1
             if done % 1000 == 0:
                 log(f"{mode}: {f} frames, {f / (time.time() - t0):.1f} fps")
