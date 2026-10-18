@@ -53,6 +53,30 @@ class GrainContext(NamedTuple):
     strength: float = 0.5
 
 
+class JobLog:
+    """The job's own log (job_<id>.log), which the optimizer engine writes too, in append mode: the grain steps' lines
+    go there beside the engine's (owner 2026-10-18: the denoise and grain synthesis logs were missing from it). No
+    path, no file: loguru only."""
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path
+
+    def write(self, lines: Sequence[str]) -> None:
+        if self.path is None or not lines:
+            return
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write("".join(line.rstrip() + "\n" for line in lines))
+        except OSError as e:
+            logger.debug("grain_auto: could not write to {}: {}", self.path, e)
+
+    def say(self, level: str, fmt: str, *args) -> None:
+        """loguru's logger.<level>(fmt, *args), and the same line into the job log"""
+        msg = fmt.format(*args)
+        logger.opt(depth=1).log(level, "{}", msg)
+        self.write([msg])
+
+
 class _GpuWentDown(Exception):
     """The GPU watcher has called the GPU unusable for GPU_DOWN_S while a step ran on it."""
 
@@ -68,9 +92,11 @@ class GrainService:
     # for a usable GPU (owner 2026-10-16: grain_auto jobs wait, they do not go on without the denoiser).
     GPU_DOWN_S = 300.0
 
-    def __init__(self, url: str, timeout_s: float, unreachable_s: Optional[float] = None):
+    def __init__(self, url: str, timeout_s: float, unreachable_s: Optional[float] = None,
+                 log_path: Optional[Path] = None):
         self.url, self.timeout_s = url.rstrip("/"), timeout_s
         self.unreachable_s = self.UNREACHABLE_S if unreachable_s is None else unreachable_s
+        self.log = JobLog(log_path)
 
     def _call(self, method: str, path: str, body: Optional[dict] = None, timeout: float = 30) -> dict:
         data = None if body is None else json.dumps(body).encode()
@@ -95,15 +121,18 @@ class GrainService:
         """Submit a job and wait for it, once the GPU is usable; a step whose GPU goes down under it is run again
         when it is back (see GPU_DOWN_S)."""
         while True:
+            t0 = time.monotonic()
             try:
                 gpuwatch.wait_usable(cancel_flag, f"the {kind} step")
             except InterruptedError as e:
                 raise GrainError(f"{kind}: cancelled") from e
+            if time.monotonic() - t0 > 60:
+                self.log.write([f"[grain {kind}] waited {(time.monotonic() - t0) / 60:.0f} min for a usable GPU"])
             try:
                 return self._run_once(kind, params, progress_cb, cancel_flag, poll)
             except _GpuWentDown as e:
-                logger.warning("grain_auto: the GPU is not usable ({}); the {} step is cancelled and runs again "
-                               "once it is", e, kind)
+                self.log.say("WARNING", "grain_auto: the GPU is not usable ({}); the {} step is cancelled and runs "
+                             "again once it is", e, kind)
 
     def _run_once(self, kind: str, params: dict, progress_cb: Optional[Callable[[float], None]],
                   cancel_flag: Optional[Callable[[], bool]], poll: float) -> dict:
@@ -111,28 +140,34 @@ class GrainService:
         unreachable_s (polls back off to 30 s); however the wait ends early - cancelled, failed, timed out, given
         up, the GPU gone - the service job is cancelled too, so no step keeps running that nobody will collect."""
         jid = self._call("POST", "/jobs", {"kind": kind, **params})["id"]
-        deadline = time.monotonic() + self.timeout_s
+        t0 = time.monotonic()
+        self.log.write([f"[grain {kind}] {time.strftime('%H:%M:%S')} service job {jid}"])
+        deadline = t0 + self.timeout_s
         silent_since, wait = None, poll
         gpu_down_since: Optional[float] = None
+        since = 0                                                  # the service job's log lines copied so far
         try:
             while True:
                 if cancel_flag is not None and cancel_flag():
                     raise GrainError(f"{kind}: cancelled")
                 try:
-                    v = self._call("GET", f"/jobs/{jid}", timeout=60)
+                    v = self._call("GET", f"/jobs/{jid}?since={since}", timeout=60)
                 except GrainUnreachable as e:
                     now = time.monotonic()
                     silent_since = silent_since or now
                     if now - silent_since > self.unreachable_s:
                         raise GrainError(f"{kind}: no answer for {self.unreachable_s / 60:g} min ({e})") from e
-                    logger.warning("grain_auto: {} - the {} step keeps running there, asking again in {:.0f} s",
-                                   e, kind, wait)
+                    self.log.say("WARNING", "grain_auto: {} - the {} step keeps running there, asking again in "
+                                 "{:.0f} s", e, kind, wait)
                     time.sleep(wait)
                     wait = min(wait * 2, 30.0)
                     continue
                 silent_since, wait = None, poll
+                since = self._copy_lines(kind, v, since)
                 if progress_cb is not None:
                     progress_cb(float(v.get("progress") or 0.0))
+                if v["state"] in ("done", "failed", "cancelled"):
+                    self.log.write([f"[grain {kind}] {v['state']} after {time.monotonic() - t0:.0f} s"])
                 if v["state"] == "done":
                     jid = None                                     # nothing left to cancel
                     return v.get("result") or {}
@@ -153,6 +188,15 @@ class GrainService:
         finally:
             if jid is not None:
                 self._cancel(jid)
+
+    def _copy_lines(self, kind: str, v: dict, since: int) -> int:
+        """the service job's new output lines (a server without ?since= sends none) into the job log -> lines so far"""
+        if "nlog" not in v:
+            return since
+        lost = int(v.get("lines_from") or since) - since
+        self.log.write(([f"[grain {kind}] ... {lost} lines not kept by the service"] if lost > 0 else [])
+                       + [f"[grain {kind}] {line}" for line in v.get("lines") or []])
+        return int(v["nlog"])
 
     def _cancel(self, jid: str) -> None:
         try:
@@ -310,17 +354,19 @@ def _unlink(*paths: Path) -> None:
 def prepare(settings: Settings, info: MediaInfo, video: VideoParams, p5: bool, encode_input: Path, work_dir: Path,
             tmp_files: List[Path], stage_cb: Optional[Callable[[str], None]] = None,
             progress_cb: Optional[Callable[[float, Optional[dict]], None]] = None,
-            cancel_flag: Optional[Callable[[], bool]] = None) -> tuple:
-    """-> (the engine's input, GrainContext or None). None means off: encode encode_input as it is."""
+            cancel_flag: Optional[Callable[[], bool]] = None, log_path: Optional[Path] = None) -> tuple:
+    """-> (the engine's input, GrainContext or None). None means off: encode encode_input as it is. log_path: the
+    job's log, which gets the service's output lines and what was decided."""
     cfg = settings.transcode.grain
+    jlog = JobLog(log_path)
     if video.engine != "optimizer":
-        logger.warning("grain_auto needs the optimizer engine; encoding {} without it", info.path.name)
+        jlog.say("WARNING", "grain_auto needs the optimizer engine; encoding {} without it", info.path.name)
         return encode_input, None
     if p5:
-        logger.warning("grain_auto: Dolby Vision profile 5 is converted shot by shot inside the engine and cannot "
-                       "be denoised first; encoding {} without it", info.path.name)
+        jlog.say("WARNING", "grain_auto: Dolby Vision profile 5 is converted shot by shot inside the engine and "
+                 "cannot be denoised first; encoding {} without it", info.path.name)
         return encode_input, None
-    svc = GrainService(cfg.url, cfg.timeout_hours * 3600)
+    svc = GrainService(cfg.url, cfg.timeout_hours * 3600, log_path=log_path)
 
     def stage(name: str) -> None:
         if stage_cb is not None:
@@ -338,11 +384,11 @@ def prepare(settings: Settings, info: MediaInfo, video: VideoParams, p5: bool, e
     except GrainError as e:
         if cancel_flag is not None and cancel_flag():
             raise
-        logger.warning("grain_auto: analysis failed, encoding {} as it is: {}", info.path.name, e)
+        jlog.say("WARNING", "grain_auto: analysis failed, encoding {} as it is: {}", info.path.name, e)
         return encode_input, None
     f = dec.get("features") or {}
     forced = not dec.get("on") and video.grain_force
-    logger.info("grain_auto: {} -> {} ({}); level {}, kurtosis {}, frozen {}", info.path.name,
+    jlog.say("INFO", "grain_auto: {} -> {} ({}); level {}, kurtosis {}, frozen {}", info.path.name,
                 "on" if dec.get("on") else ("on, forced by the preset" if forced else "off"), dec.get("why"),
                 dec.get("level"), f.get("kurtosis"), f.get("fresh_corr"))
     if not dec.get("on") and not forced:
@@ -371,11 +417,11 @@ def prepare(settings: Settings, info: MediaInfo, video: VideoParams, p5: bool, e
         _unlink(dn, base, ts)
         if cancel_flag is not None and cancel_flag():
             raise
-        logger.warning("grain_auto: denoising failed, encoding {} as it is: {}", info.path.name, e)
+        jlog.say("WARNING", "grain_auto: denoising failed, encoding {} as it is: {}", info.path.name, e)
         return encode_input, None
     _unlink(dn, ts)
-    logger.info("grain_auto: {} frames denoised with {} in {:.0f} s -> {}{}", n_dn, r.get("model"),
-                time.monotonic() - t0, base.name, " (HDR10 metadata carried over)" if hdr else "")
+    jlog.say("INFO", "grain_auto: {} frames denoised with {} in {:.0f} s -> {}{}", n_dn, r.get("model"),
+             time.monotonic() - t0, base.name, " (HDR10 metadata carried over)" if hdr else "")
     return base, GrainContext(svc, encode_input, dec, float(video.grain_strength))
 
 
@@ -427,17 +473,19 @@ def finish(settings: Settings, ctx: GrainContext, output: Path, shots: Sequence[
     finally:
         _unlink(vid, out_ivf, ts, vtags, gwork, tmp)
     t = (res.get("target") or {}).get("y")
-    logger.info("grain_auto: film grain synthesis written into {} (luma target per brightness bin {})", output.name, t)
+    jlog = ctx.service.log
+    jlog.say("INFO", "grain_auto: film grain synthesis written into {} (luma target per brightness bin {})",
+             output.name, t)
     fl = res.get("flicker") or {}
     src_sw, auto_sw = (fl.get("source") or {}).get("fine_swing"), (fl.get("auto") or {}).get("fine_swing")
     if src_sw and auto_sw:
         # logged, not acted on (the owner picked flicker-vetoed versions twice in blind tests, test-08 / test-09)
-        logger.info("grain_auto: grain flicker (fine-band swing on flat static picture) {:.3f} against the source's "
-                    "{:.3f} ({:.2f}x)", auto_sw, src_sw, auto_sw / src_sw)
+        jlog.say("INFO", "grain_auto: grain flicker (fine-band swing on flat static picture) {:.3f} against the "
+                 "source's {:.3f} ({:.2f}x)", auto_sw, src_sw, auto_sw / src_sw)
     hard = [r for r in fl.get("shots") or [] if r.get("fine_ratio")]
     if hard:
         # measured on the hardest shots only (most flat picture times grain to synthesise), highest ratio first
-        logger.info("grain_auto: flicker on the {} hardest shots, highest first: {}", len(hard), ", ".join(
+        jlog.say("INFO", "grain_auto: flicker on the {} hardest shots, highest first: {}", len(hard), ", ".join(
             f"shot {r['shot']} {r['fine_ratio']:.2f}x ({r['source'].get('fine_swing')} -> "
             f"{r['auto'].get('fine_swing')})" for r in hard[:3]))
     return res

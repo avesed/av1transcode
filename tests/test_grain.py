@@ -70,9 +70,10 @@ def holey_source(tmp_path):
 
 class FakeService:
     """The grain service's HTTP API with scripted results. denoise: CFR re-encode of the source's video
-    (drop_frame=True loses one); grain: the video handed back; fail: kinds that fail."""
-    def __init__(self, on=True, drop_frame=False, fail=()):
-        self.on, self.drop_frame, self.fail, self.calls = on, drop_frame, set(fail), []
+    (drop_frame=True loses one); grain: the video handed back; fail: kinds that fail. Every job has three output
+    lines, "<kind>: line <n>", sent for ?since= (lines=False: a server from before it, which sends none)."""
+    def __init__(self, on=True, drop_frame=False, fail=(), lines=True):
+        self.on, self.drop_frame, self.fail, self.lines, self.calls = on, drop_frame, set(fail), lines, []
         svc = self
 
         class H(BaseHTTPRequestHandler):
@@ -94,8 +95,14 @@ class FakeService:
                 self._send({})
 
             def do_GET(self):
-                job = svc.calls[int(self.path.rsplit("/", 1)[1], 16) - 1]
-                self._send(svc.result(job))
+                path, _, query = self.path.partition("?")
+                job = svc.calls[int(path.rsplit("/", 1)[1], 16) - 1]
+                v = svc.result(job)
+                if svc.lines and query.startswith("since="):
+                    out = [f"{job['kind']}: line {n}" for n in range(3)]
+                    since = int(query[6:])
+                    v.update(lines=out[since:], lines_from=since, nlog=len(out))
+                self._send(v)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -250,6 +257,71 @@ def test_finish_puts_the_grain_stream_back_on_the_outputs_timestamps(settings, s
     assert vt["ENCODER"] == "SVT-AV1 v4.2.0" and vt["ENCODER_SETTINGS"] == "preset=4 / crf=24-31"
     assert vt.get("NUMBER_OF_FRAMES") == "48"
     assert list(settings.dirs.work.iterdir()) == []
+
+
+def test_the_steps_output_goes_into_the_job_log(settings, service, holey_source, av1_output, tmp_path):
+    """owner 2026-10-18: the denoise and grain synthesis logs were missing from the job's log. Each service line once
+    (denoise is polled twice), after what the log already held, with the decisions between them."""
+    s = service()
+    log = tmp_path / "job_x.log"
+    log.write_text("before\n")
+    out, ctx = grain.prepare(settings, _info(holey_source), _video(), False, holey_source, settings.dirs.work, [],
+                             log_path=log)
+    assert ctx is not None and len(s.calls) == 2
+    grain.finish(settings, ctx, av1_output, [24, 24], settings.dirs.work)
+    text = log.read_text().splitlines()
+    assert text[0] == "before"
+    for kind in ("analyse", "denoise", "grain"):
+        assert [t for t in text if t.startswith(f"[grain {kind}] {kind}: line")] == \
+            [f"[grain {kind}] {kind}: line {n}" for n in range(3)]
+        assert sum(t.startswith(f"[grain {kind}] done after ") for t in text) == 1
+    assert any(t.startswith("grain_auto: src.mkv -> on (scripted)") for t in text)
+    assert any(t.startswith("grain_auto: 48 frames denoised with") for t in text)
+    assert any(t.startswith("grain_auto: film grain synthesis written into out.av1.mkv") for t in text)
+    order = [next(i for i, t in enumerate(text) if t.startswith(p)) for p in
+             ("[grain analyse] analyse: line 0", "grain_auto: src.mkv -> on", "[grain denoise] denoise: line 0",
+              "grain_auto: 48 frames denoised", "[grain grain] grain: line 0", "grain_auto: film grain synthesis")]
+    assert order == sorted(order)
+
+
+def test_a_service_without_line_numbers_still_runs(settings, service, holey_source, tmp_path):
+    service(lines=False)
+    log = tmp_path / "job_x.log"
+    out, ctx = grain.prepare(settings, _info(holey_source), _video(), False, holey_source, settings.dirs.work, [],
+                             log_path=log)
+    assert ctx is not None
+    assert not any(": line " in t for t in log.read_text().splitlines())
+
+
+def _server_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("grain_server", Path(__file__).parents[1] / "grain" / "server.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_the_server_numbers_a_jobs_lines(monkeypatch):
+    srv = _server_module()
+    monkeypatch.setattr(srv.Job, "LOG_KEEP", 3)
+    job = srv.Job("grain", {})
+    for n in range(5):
+        job.add_log(f"l{n}")
+    assert "lines" not in job.view()
+    assert job.view()["log"] == ["l2", "l3", "l4"]
+    v = job.view(0)                                  # two went by unread: the caller is told where its lines start
+    assert (v["lines"], v["lines_from"], v["nlog"]) == (["l2", "l3", "l4"], 2, 5)
+    assert job.view(4)["lines"] == ["l4"] and job.view(5)["lines"] == []
+    srv.JOBS[job.id] = job
+    httpd = srv.ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        import urllib.request
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/jobs/{job.id}"
+        assert json.loads(urllib.request.urlopen(base + "?since=3").read())["lines"] == ["l3", "l4"]
+        assert "lines" not in json.loads(urllib.request.urlopen(base).read())
+    finally:
+        httpd.shutdown()
 
 
 def test_finish_refuses_shots_that_do_not_cover_the_output(settings, service, holey_source, av1_output):

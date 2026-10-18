@@ -11,6 +11,9 @@ API (JSON):
   POST /jobs {"kind": ..., ...}      {"id"}
   GET  /jobs/<id>                    {"id", "kind", "state": queued|running|done|failed|cancelled, "progress": 0..1,
                                       "result", "error", "log": last lines}
+  GET  /jobs/<id>?since=N            the same plus "lines": the job's output lines after its first N, "nlog": lines so
+                                      far (the caller's next N) and "lines_from": the first one's number (above N
+                                      when more than LOG_KEEP went by between two calls)
   POST /jobs/<id>/cancel
 One job runs at a time (one GPU); each runs its work in a subprocess, which a cancel terminates. Paths must lie under
 GRAIN_ROOTS (default /media) and are the caller's own: this container mounts the same volumes under the same names.
@@ -19,8 +22,9 @@ GRAIN_FAST (default 1): a model with a mixed-precision middle in the weights (MI
 480 px wide - B580 4K 11.0 -> 17.2 fps; the network scores as the fp16 one on the validation windows, and the owner saw
 no difference in the blind test-12 (2026-10-15). 0: the fp16 network and flows 960 wide, as before.
 """
-import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, uuid
+import collections, itertools, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("GRAIN_PORT", "8790"))
@@ -46,15 +50,34 @@ def allowed(path, must_exist=False):
 
 
 class Job:
+    LOG_KEEP = 5000          # lines kept for ?since= (a 4K episode's denoise writes ~300, its grain step ~200)
+
     def __init__(self, kind, params):
         self.id, self.kind, self.params = uuid.uuid4().hex[:12], kind, params
         self.state, self.progress, self.result, self.error = "queued", 0.0, None, None
-        self.log = collections.deque(maxlen=40)
+        self.log = collections.deque(maxlen=self.LOG_KEEP)
+        self.nlog, self.log_lock = 0, threading.Lock()   # nlog: lines ever logged, the numbering ?since= counts in
         self.proc, self.cancelled, self.t0 = None, False, time.time()
 
-    def view(self):
-        return {"id": self.id, "kind": self.kind, "state": self.state, "progress": round(self.progress, 4),
-                "result": self.result, "error": self.error, "log": list(self.log), "seconds": round(time.time() - self.t0, 1)}
+    def add_log(self, line):
+        with self.log_lock:
+            self.log.append(line[-300:])
+            self.nlog += 1
+
+    def tail(self, n):
+        with self.log_lock:
+            return list(itertools.islice(self.log, max(0, len(self.log) - n), None))
+
+    def view(self, since=None):
+        v = {"id": self.id, "kind": self.kind, "state": self.state, "progress": round(self.progress, 4),
+             "result": self.result, "error": self.error, "log": self.tail(40), "seconds": round(time.time() - self.t0, 1)}
+        if since is not None:
+            # the job's caller (av1transcode) copies these into the job's own log
+            with self.log_lock:
+                first = self.nlog - len(self.log)
+                start = max(since, first)
+                v.update(lines=list(itertools.islice(self.log, start - first, None)), lines_from=start, nlog=self.nlog)
+        return v
 
 
 def run_proc(job, cmd, env=None, on_line=None):
@@ -65,8 +88,8 @@ def run_proc(job, cmd, env=None, on_line=None):
         line = line.rstrip()
         if not line or re.search(r"Warning|warn\(|USDT|non-writable|from_numpy|nbits|stepping|^[EW]\d{4} ", line):
             continue
-        if not line.startswith("PROGRESS "):
-            job.log.append(line[-300:])
+        if not line.startswith(("PROGRESS ", "RESULT ")):    # RESULT: the step's whole result, returned as such
+            job.add_log(line)
         if on_line:
             on_line(line)
     rc = job.proc.wait()
@@ -74,7 +97,7 @@ def run_proc(job, cmd, env=None, on_line=None):
     if job.cancelled:
         raise RuntimeError("cancelled")
     if rc:
-        raise RuntimeError(f"{os.path.basename(cmd[1])} exited {rc}: " + " | ".join(list(job.log)[-4:]))
+        raise RuntimeError(f"{os.path.basename(cmd[1])} exited {rc}: " + " | ".join(job.tail(4)))
 
 
 def py_env(**extra):
@@ -200,9 +223,11 @@ class Handler(BaseHTTPRequestHandler):
             busy = next((j.id for j in JOBS.values() if j.state == "running"), None)
             return self._send(200, {"ok": True, "device": DEV, "busy": busy, "models": list(MODELS),
                                     "default_model": DEFAULT_MODEL, "fast": [m for m in MODELS if fast_net(m)]})
-        m = re.fullmatch(r"/jobs/([0-9a-f]+)", self.path)
+        url = urlsplit(self.path)
+        m = re.fullmatch(r"/jobs/([0-9a-f]+)", url.path)
         if m and m.group(1) in JOBS:
-            return self._send(200, JOBS[m.group(1)].view())
+            since = parse_qs(url.query).get("since", [""])[0]
+            return self._send(200, JOBS[m.group(1)].view(int(since) if since.isdigit() else None))
         self._send(404, {"error": "not found"})
 
     def do_POST(self):

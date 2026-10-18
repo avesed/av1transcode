@@ -489,7 +489,7 @@ def run_full_transcode(
         try:
             encode_input, grain_ctx = grain_auto.prepare(
                 settings, info, video, bool(plan.p5), encode_input, work_dir, tmp_files,
-                stage_cb, progress_cb, cancel_flag)
+                stage_cb, progress_cb, cancel_flag, log_path)
         except grain_auto.GrainError as e:   # only a cancel gets here: prepare() degrades everything else
             raise TranscodeError("Job cancelled by user") from e
 
