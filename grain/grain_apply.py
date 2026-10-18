@@ -13,9 +13,10 @@ The steps grainauto's blind tests ran (grainauto.grain(), ga_bins.py, ga_table.p
               flat static picture, source vs the first table's result, measured in step 4's decode pass on the
               FLICKER_SHOTS hardest shots only - most flat picture times grain to synthesise, from step 1 - and
               reported per shot. Every frame of every shot cost the whole step 46 of its 75 min on a 1080p episode.
-Bins are measured on the GPU (ga_bins.py's numpy cost about 0.3 s per 4K frame); every stream is decoded on the CPU,
-each in a thread of its own (prefetch). Every frame is decoded, but only the frames a step needs (every STEP-th, and
-the flicker shots' every frame) leave ffmpeg, through select.
+Bins are measured on the GPU (ga_bins.py's numpy cost about 0.3 s per 4K frame). Every stream is decoded on the card
+and read there without a copy (zc.py, GRAIN_ZC), or on the CPU where that cannot be, each in a thread of its own
+(prefetch). Every frame is decoded, but only the frames a step needs (every STEP-th, and the flicker shots' every
+frame) are handed on.
   6. strength  the corrected table's scaling times STRENGTH (the owner's 30% less, test-10)
   python3 grain_apply.py SRC VIDEO.ivf SHOTS.json FPS OUT.ivf WORKDIR [CHROMA [STRENGTH]]
 SHOTS.json = {"shots": [{"frames": n}, ...]} in timeline order. Prints JSON {"target": ..., "applied": ...} summaries.
@@ -189,6 +190,80 @@ def prefetch(gen, n=None):
         stop.set()
 
 
+
+# GRAIN_ZC: read on the card itself (zc.py: zcdec decodes on VA-API, its surfaces are imported into torch's own
+# context and de-tiled there; no pixels through system memory, no CPU decode). auto: every read that can, each one
+# first checked against the CPU read on its first ZC_CHECK kept frames; off: every read on the CPU. Measured on
+# Sandman S01E01 (2026-10-18): HEVC 4K at 322 frames/s against 99 for the CPU decode on 24 cores; P010 HEVC, AV1 and
+# AV1 with its film grain applied came out bit-exact with the CPU decode (libavcodec / dav1d). The VA-API decode is
+# only sound beside compute without fp64 atomics: torch.bincount with fp64 weights broke it (bottom tiles of 4K HEVC
+# frames, nothing in the kernel log), and binsums() has none.
+ZC_MODE = os.environ.get("GRAIN_ZC", "auto")
+ZC_CHECK = int(os.environ.get("GRAIN_ZC_CHECK", "6"))
+
+
+def keep_iter(step, ranges=()):
+    """the frame numbers keep(step, ranges) lets through, ascending, without an end."""
+    rs, n = sorted(ranges), 0
+    while True:
+        cand = ([-(-n // step) * step] if step else []) + [max(a, n) for a, b in rs if b > n]
+        if not cand:
+            return
+        n = min(cand)
+        yield n
+        n += 1
+
+
+def cpu_frames(path, w, h, grain=True, hw=False, step=0, ranges=()):
+    """reader_raw's frames (decoded in a thread of their own), uploaded as the consumer takes them."""
+    for t in prefetch(reader_raw(path, w, h, grain, hw, keep(step, ranges))):
+        yield planes(t, w, h)
+
+
+def zc_frames(path, w, h, step=0, ranges=()):
+    import zc
+    want = keep_iter(step, ranges)
+    for n, p in zc.ZcReader(path, w, h, step, ranges, node=os.environ.get("RENDER_NODE")):
+        if n != next(want, None):
+            raise zc.ZcError(f"zcdec gave frame {n} of {os.path.basename(path)} out of keep()'s order")
+        yield p
+
+
+def _then(head, gen):
+    """head's items, then gen's; closing it closes gen (prefetch closes its source when the loop is done with it,
+    and that is what ends zcdec)."""
+    try:
+        yield from head
+        yield from gen
+    finally:
+        gen.close()
+
+
+def frames(path, w, h, grain=True, hw=False, step=0, ranges=()):
+    """the kept frames of path (keep(step, ranges)) as int16 10-bit (Y, U, V) on dev: read on the card when GRAIN_ZC
+    allows and its first ZC_CHECK kept frames equal the CPU read's, else on the CPU. grain=False (the film grain
+    exported, not applied) reads on the CPU."""
+    if ZC_MODE != "off" and dev.type == "xpu" and grain and not hw:
+        gen = None
+        try:
+            import itertools
+            import zc
+            gen = zc_frames(path, w, h, step, ranges)
+            head = list(itertools.islice(gen, ZC_CHECK))
+            ref = cpu_frames(path, w, h, grain, False, step, ranges)
+            for i, (p, q) in enumerate(zip(head, ref)):
+                if not all(torch.equal(x, y) for x, y in zip(p, q)):
+                    raise zc.ZcUnsupported(f"kept frame {i} differs from the CPU read")
+            ref.close()
+            log(f"{os.path.basename(path)}: read on the card (zero-copy)")
+            return prefetch(_then(head, gen))
+        except Exception as e:                           # noqa: BLE001 - any trouble before the first frame: the CPU
+            if gen is not None:
+                gen.close()
+            log(f"{os.path.basename(path)}: read on the CPU ({type(e).__name__}: {str(e)[:160]})")
+    return cpu_frames(path, w, h, grain, hw, step, ranges)
+
+
 KF = {}
 
 
@@ -309,13 +384,13 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
     acc = torch.zeros(len(bounds), nb, 5, dtype=torch.int64, device=dev)      # y, ny, cb, cr, nc
     fl_ranges = [bounds[i] for i in sorted(flicker_shots or {})] if flicker_src else []
     fl_frames = set(kept(total, 0, fl_ranges))
-    ga = prefetch(reader_raw(path_a, w, h, True, HWDEC and hw_a, keep(STEP, fl_ranges)))
+    ga = frames(path_a, w, h, True, HWDEC and hw_a, STEP, fl_ranges)
     if mode == "target" or path_b:
         # target: the encode, which has no grain yet; applied: the encode the grain was written into (path_b), the
         # very pictures path_a decodes to with its grain left out
-        gb = prefetch(reader_raw(path_b, w, h, True, False, keep(STEP)))
+        gb = frames(path_b, w, h, True, False, STEP)
     else:
-        gb = prefetch(reader_raw(path_a, w, h, False, False, keep(STEP)))  # path_a, its grain exported, not applied
+        gb = frames(path_a, w, h, False, False, STEP)          # path_a, its grain exported, not applied
     fl = Flicker() if fl_ranges else None
     # the flicker source also lets every FLICKER_PACE-th frame through, and the loop pulls it along frame by frame:
     # ffmpeg held back the last few frames of a selected run until its next selected frame (or the end of the file),
@@ -324,7 +399,7 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
     gs = None
     if fl is not None:
         gs = zip(kept(total, FLICKER_PACE, fl_ranges),
-                 prefetch(reader_raw(flicker_src, w, h, True, HWDEC, keep(FLICKER_PACE, fl_ranges))))
+                 frames(flicker_src, w, h, True, HWDEC, FLICKER_PACE, fl_ranges))
     gs_at = next(gs, None) if gs is not None else None
     si, fi, t0, done = 0, 0, time.time(), 0
     with torch.no_grad():
@@ -332,11 +407,10 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
             a = next(ga, None)
             if a is None:
                 break
-            a = planes(a, w, h)
             while gs_at is not None and gs_at[0] < f:
                 gs_at = next(gs, None)
             if f in fl_frames:
-                s_ = planes(gs_at[1], w, h) if gs_at is not None and gs_at[0] == f else None
+                s_ = gs_at[1] if gs_at is not None and gs_at[0] == f else None
                 while fi < len(fl_ranges) and f >= fl_ranges[fi][1]:
                     fi += 1
                 if s_ is not None:
@@ -346,7 +420,6 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
             b = next(gb, None)
             if b is None:
                 break
-            b = planes(b, w, h)
             while si < len(bounds) and f >= bounds[si][1]:
                 si += 1
             if si >= len(bounds):
@@ -381,6 +454,20 @@ def bins(mode, shots, path_a, path_b=None, hw_a=False, flicker_src=None, flicker
     if not flicker_src:
         return out
     return out, (fl.result(bounds, flicker_shots) if fl is not None else {"source": {}, "auto": {}, "shots": []})
+
+
+def bins_or_cpu(*a, **k):
+    """bins(), and once more with every read on the CPU when a zero-copy read failed after its first frames (zcdec
+    died, a surface the reader cannot take turned up mid-stream): the pass costs its time twice, the step still ends."""
+    global ZC_MODE
+    try:
+        return bins(*a, **k)
+    except Exception as e:                               # noqa: BLE001 - zc's errors, whatever they are
+        if ZC_MODE == "off" or type(e).__module__ != "zc":
+            raise
+        log(f"{a[0]}: a zero-copy read failed ({type(e).__name__}: {str(e)[:160]}); the pass again on the CPU")
+        ZC_MODE = "off"
+        return bins(*a, **k)
 
 
 def summary(b):
@@ -466,7 +553,7 @@ def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0, strength=1.0):
     os.makedirs(work, exist_ok=True)
     shots = [s["frames"] for s in json.load(open(shots_json))["shots"]]
     log(f"target: {src} against {video}, {len(shots)} shots, {sum(shots)} frames")
-    tgt = bins("target", shots, src, video, hw_a=True)
+    tgt = bins_or_cpu("target", shots, src, video, hw_a=True)
     ty = [v for v in summary(tgt)["y"] if v is not None]
     if not ty:
         raise RuntimeError("no flat picture to measure the grain on in any shot")
@@ -481,7 +568,7 @@ def run(src, video, shots_json, fps, out_ivf, work, chroma=1.0, strength=1.0):
     apply(tbl, video, tmp)
     hard = hardest(tgt)
     log(f"applied: measuring the first table; flicker on the {len(hard)} hardest shots {sorted(hard)}")
-    app, flick = bins("applied", shots, tmp, video, flicker_src=src, flicker_shots=hard)
+    app, flick = bins_or_cpu("applied", shots, tmp, video, flicker_src=src, flicker_shots=hard)
     aj = f"{work}/applied0.json"
     json.dump(app, open(aj, "w"))
     os.remove(tmp)

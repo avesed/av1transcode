@@ -142,12 +142,19 @@ def do_grain(job):
     sj = f"{work}/shots.json"
     json.dump({"shots": [{"frames": n} for n in shots]}, open(sj, "w"))
     marks = {"target:": 0.05, "applied:": 0.55, "done": 1.0}
+    total = max(1, sum(shots))
     result = {}
 
     def on_line(line):
         for k, v in marks.items():
             if k in line:
                 job.progress = max(job.progress, v)
+        # the passes' "target: N frames, F fps" / "applied: N frames, ..." lines move it along within each pass (the
+        # owner took a pass that sat at 55% for 25 minutes for a stuck job, 2026-10-18)
+        m = re.search(r"\b(target|applied): (\d+) frames,", line)
+        if m:
+            lo, span = (0.05, 0.5) if m.group(1) == "target" else (0.55, 0.44)
+            job.progress = max(job.progress, min(lo + span * int(m.group(2)) / total, lo + span))
         if line.startswith("RESULT "):
             result.update(json.loads(line[7:]))
     run_proc(job, [sys.executable, f"{HERE}/grain_apply.py", src, video, sj, p["fps"], out, work, str(p.get("chroma", 1.0)),
