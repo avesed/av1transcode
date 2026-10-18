@@ -1,12 +1,14 @@
 # The grain-auto service (av1transcode profile switch grain_auto): analysis, the v3 denoiser and AV1 grain synthesis on
 # the B580. Built on the box, from images that only exist there:
-#   av1t-cvvdp:gxx4   torch 2.14 + XPU, triton, ffmpeg with VA-API / QSV and the iHD driver (the CVVDP scorer's image)
+#   av1t-cvvdp:<tag>  base.Dockerfile on an engine image: torch 2.14 + XPU, triton, ffmpeg with VA-API / QSV and the
+#                     iHD driver (BASE below)
 #   grav1synth:local  grav1synth 0.2.0, linked against Ubuntu 22.04's ffmpeg 5 libraries, which come along below
 # zcdec (the zero-copy reads' VA-API decoder, zc.py) is built here against a cut-down static ffmpeg of the engine's
 # release, with the engine's hevc patch (zcdec/build.sh; the tarball comes from GitHub, so the build needs network).
 # The weights are not in git: put v3g.pt, v3s2.pt, s32v2.pt, spynet.pt and v3g_mid_u8.pt2 (v3g's int8 middle:
 # quantize_int8.py v3g.pt CAPTURES v3g_mid_u8.pt2 mid) into grain/weights/ first, then
-#   docker build -t av1t-grain:latest grain/
+#   docker build --build-arg BASE=av1t-cvvdp:<tag> -t av1t-grain:<commit> grain/
+ARG BASE=av1t-cvvdp:latest
 FROM grav1synth:local AS g
 RUN mkdir -p /out/lib && cp /usr/local/bin/grav1synth /out/ && \
     ldd /usr/local/bin/grav1synth | awk '/=> \// {print $3}' \
@@ -17,7 +19,7 @@ ARG JOBS=8
 COPY zcdec/ /build/zcdec/
 RUN JOBS=$JOBS sh /build/zcdec/build.sh /build/zcdec
 
-FROM av1t-cvvdp:gxx4
+FROM ${BASE}
 COPY --from=g /out /opt/grav1synth
 COPY --from=zcdec /build/zcdec/zcdec /usr/local/bin/zcdec
 RUN /opt/cvvdp/bin/pip install --no-cache-dir torchao==0.18.0      # the int8 middle (int8_net.py, quantize_int8.py)
