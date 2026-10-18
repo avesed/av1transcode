@@ -632,6 +632,7 @@ GATED = [
     ("put", "/api/settings/workers", {"json": {"concurrency": 1}}),
     ("put", "/api/settings/optimizer", {"json": {}}),
     ("put", "/api/settings/delete_source", {"json": {"enabled": False}}),
+    ("put", "/api/settings/carry_subtitles", {"json": {"enabled": False}}),
     ("get", "/api/browse", {"params": {"path": "/"}}),
 ]
 

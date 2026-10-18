@@ -35,6 +35,8 @@ transcode:
   min_height_to_transcode: 0   # 0 = never re-encode AV1
   keep_temp: false
   delete_source: false         # set true to delete source after success
+  carry_subtitles: true        # copy the source's sidecar subtitles to the output's name
+                               # (moved instead with delete_source); see app/sidecars.py
 
   presets:
     quality:                   # highest fidelity, slowest

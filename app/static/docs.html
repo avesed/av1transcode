@@ -230,6 +230,7 @@
 <ul>
   <li>已是 AV1 的源默认跳过（<code>skip_existing_av1</code>）。</li>
   <li>成功后源文件<b>默认保留</b>在原位置。可选：在<a href="/static/settings.html#sec-safety">设置页</a>开启「转码成功后删除源文件」（需要二次确认，危险操作）。</li>
+  <li>源文件的外挂字幕默认按成品的文件名复制一份到成品旁边（<a href="#sec-subs-sidecar"><code>carry_subtitles</code></a>），开了删除源文件时是移动。</li>
 </ul>
 </section>
 
@@ -811,6 +812,18 @@
   <li>最终封装用 mkvmerge，它不可用或失败时退回 ffmpeg；两条路写出的字幕标记一致，但 ffmpeg 这条路保不住图片附件和附件的 UID。</li>
 </ul>
 
+<h3 id="sec-subs-sidecar">外挂字幕跟着成品改名（<code>carry_subtitles</code>）</h3>
+<p>上面说的都是封装在文件里的字幕；这一节说文件<b>旁边</b>的字幕，两种引擎都做。Plex 和 Jellyfin 按文件名把外挂字幕配给视频：字幕名要以视频文件名开头，<code>X.mkv</code> 配 <code>X.zh.srt</code>、<code>X.en.srt</code>。成品改了名（编码标记换成 AV1）、又写在另一个目录（默认源目录下的 <code>av1/</code>），源的外挂字幕（Bazarr 下的、aisub 翻的）就配不到成品上，源删掉以后它们只剩孤儿。</p>
+<ul>
+  <li><b>带哪些</b>：源文件旁边、以及它旁边的 <code>subs/</code>（<code>Subs</code>、<code>subtitles</code>、<code>sub</code>，不分大小写）里，名字以源文件名加一个点开头的字幕文件（<code>.srt .ass .ssa .vtt .sub .idx .sup .smi</code>，比较不分大小写）。同目录里另一个视频的文件名更长、也以源文件名开头时（<code>X.mkv</code> 和 <code>X.part2.mkv</code>），以 <code>X.part2.</code> 开头的字幕算那个视频的，不带。蓝光原盘（目录、<code>.iso</code>、<code>.mpls</code>）没有按它命名的外挂字幕，不做。</li>
+  <li><b>放到哪</b>：成品旁边的同一位置，源文件名那一段换成成品的文件名：<code>S1/subs/X.HEVC.zh.srt</code> → <code>S1/av1/subs/X.AV1.zh.srt</code>，<code>S1/X.HEVC.en.srt</code> → <code>S1/av1/X.AV1.en.srt</code>。先写成同目录下的点开头临时文件再改名，播放器读不到写了一半的字幕。时间轴不用改：音轨和封装的字幕带着原时间戳复制，新视频按源的起始偏移对齐（见<a href="#sec-subs-always">复用</a>）。</li>
+  <li><b>已经有文件时</b>：目标位置已有同名文件就不动它——内容相同记作“已在”，不同就保留那个文件、记一条告警，源旁边的那份也保留。</li>
+  <li><b>和删除源文件</b>：开着 <code>delete_source</code> 时，源删成功之后，已经在成品旁边的那几份从源旁边删掉，等于移动；删源失败或目标有别的文件时两边都留着。</li>
+  <li><b>手动把成品挪回季目录时</b>：<code>av1/subs/</code> 里的字幕要挪进季目录的 <code>subs/</code>，和成品一样改用新名字，Plex 才配得上；直接 <code>mv av1/* .</code> 时，季目录已有 <code>subs/</code> 的话这一项会报 Directory not empty。</li>
+  <li><b>失败</b>：读不了、写不进的文件记一条告警，作业照样是完成。</li>
+</ul>
+<p>结果记在应用日志里（每份一行 <code>subtitle … -> copied …</code>），也追加在作业日志末尾（<code>[subtitles]</code> 开头的几行）。关掉：设置页「源文件处理」，或 config.yaml 的 <code>transcode.carry_subtitles: false</code>。</p>
+
 <h3 id="sec-subs-log">在哪看结果</h3>
 <p>这几件事记在应用日志里（进程的标准错误输出；<code>logging.file</code> 为 <code>true</code> 时也写进 <code>dirs.logs</code> 下的 <code>av1transcode.log</code>），不在队列页的作业日志里：丢了哪些空轨是一行 <code>optimizer: dropping … empty subtitle stream(s)</code>；每条 OCR 成功的轨一行 <code>optimizer: OCR'd s:…</code>，带条数、用时和门限用到的数字；没做成的是 <code>no text copy of s:…</code> 加原因，没装 tesseract 时是 <code>pgs_ocr_srt is on but tesseract is not installed</code>。成品的结构检查按源的字幕轨数减去丢掉的空轨、加上新增的 srt 来核对字幕数，所以丢轨、加轨都不会让它报错（见<a href="#sec-verify-output">结构检查</a>）。</p>
 </section>
@@ -1052,7 +1065,7 @@
 <div class="def" id="c-dirs-presets_file">
   <h3 class="def__name"><code>presets_file / settings_file</code></h3>
   <p class="def__dflt">配置段 <code>dirs</code> · 默认 <code>data/presets.json</code> / <code>data/settings.json</code>（随附 config.yaml：<code>/data/presets.json</code> / <code>/data/settings.json</code>）</p>
-  <div class="def__body"><p>网页端保存的预设 / 设置的持久化文件。<code>settings_file</code> 里存并行数（<code>concurrency</code>、<code>av1an_workers</code>）、<code>delete_source</code>、与 config.yaml 不同的优化器参数和 <code>vulkan_device</code>；启动时这些值盖在 config.yaml 和环境变量之上。</p></div>
+  <div class="def__body"><p>网页端保存的预设 / 设置的持久化文件。<code>settings_file</code> 里存并行数（<code>concurrency</code>、<code>av1an_workers</code>）、<code>delete_source</code>、<code>carry_subtitles</code>、与 config.yaml 不同的优化器参数和 <code>vulkan_device</code>；启动时这些值盖在 config.yaml 和环境变量之上。</p></div>
 </div>
 <div class="def" id="c-workers-concurrency">
   <h3 class="def__name"><code>concurrency</code></h3>
@@ -1106,6 +1119,12 @@
   <h3 class="def__name"><code>keep_temp / delete_source</code></h3>
   <p class="def__dflt">配置段 <code>transcode</code> · 默认 <code>false</code> / <code>false</code></p>
   <div class="def__body"><p>保留作业临时文件（<a href="#c-dirs-work"><code>dirs.work</code></a> 下，两种引擎都算；开着时启动清理也跳过）/ 成功后删除源文件。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-safety">去设置页 ›</a></p></div>
+</div>
+<div class="def" id="c-transcode-carry_subtitles">
+  <h3 class="def__name"><code>carry_subtitles</code></h3>
+  <p class="def__dflt">配置段 <code>transcode</code> · 默认 <code>true</code></p>
+  <div class="def__body"><p>成功后把源文件的外挂字幕按成品的文件名复制到成品旁边（开着 <code>delete_source</code> 时是移动），见<a href="#sec-subs-sidecar">外挂字幕跟着成品改名</a>。</p>
     <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-safety">去设置页 ›</a></p></div>
 </div>
 <div class="def" id="c-transcode-video">
@@ -1382,7 +1401,13 @@ python3 -m app.cli status / cancel [job_id] / check</pre>
 <div class="def" id="api-safety">
   <h3 class="def__name"><code>/api/settings/safety</code></h3>
   <p class="def__dflt">方法 <code>GET</code></p>
-  <div class="def__body"><p>返回 <code>{"delete_source": true|false}</code>：成功后是否删除源文件。</p></div>
+  <div class="def__body"><p>返回 <code>{"delete_source": true|false, "carry_subtitles": true|false}</code>：成功后是否删除源文件、是否把外挂字幕带到成品旁边。</p></div>
+</div>
+<div class="def" id="api-carry-subtitles">
+  <h3 class="def__name"><code>/api/settings/carry_subtitles</code></h3>
+  <p class="def__dflt">方法 <code>PUT</code> · 需密钥</p>
+  <div class="def__body"><p>「带上外挂字幕」的开关：<code>{"enabled": true}</code>。不删任何东西，所以不用确认。立即生效并写进 <code>dirs.settings_file</code>，返回 <code>{"ok": true, "carry_subtitles": …}</code>。和 <code>delete_source</code> 一样在作业完成的那一刻才读。见<a href="#sec-subs-sidecar">外挂字幕跟着成品改名</a>。</p>
+    <p class="def__foot"><a class="def__link" href="/static/settings.html#sec-safety">去设置页 ›</a></p></div>
 </div>
 <div class="def" id="api-delete-source">
   <h3 class="def__name"><code>/api/settings/delete_source</code></h3>

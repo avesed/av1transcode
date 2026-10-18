@@ -3,12 +3,12 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from loguru import logger
 
 from app import analyzer as analyzer_mod
-from app import db, decisions
+from app import db, decisions, sidecars
 from app.config import Settings
 from app.transcoder import run_full_transcode
 
@@ -324,7 +324,9 @@ class TranscodeManager:
             self._emit(jid, "done")
             logger.info("Job {} done: {}", jid, out)
 
+            carried = self._carry_subtitles(jid, source, out, log_path)
             self._postprocess(jid, source)
+            self._drop_carried(jid, source, carried)
 
         except Exception as e:  # noqa: BLE001
             if jid in self._cancel:
@@ -366,6 +368,39 @@ class TranscodeManager:
                 return
             logger.error("Job {} failed after retries: {}", jid, error)
         self._emit(jid, "failed")
+
+    def _carry_subtitles(self, jid: str, source: Path, out: Path,
+                         log_path: Path) -> List[sidecars.Carried]:
+        """transcode.carry_subtitles: the source's sidecar subtitles, renamed
+        for the output and put beside it (app/sidecars.py). Never fails the
+        job; what happened goes to the app log and the job's log."""
+        if not self.settings.transcode.carry_subtitles or not sidecars.applies_to(source):
+            return []
+        try:
+            carried = sidecars.carry(source, out)
+        except Exception as e:  # noqa: BLE001 - the encode is done; subtitles must not undo it
+            logger.warning("Job {}: could not carry the subtitles of {}: {}", jid, source.name, e)
+            return []
+        for item in carried:
+            log = logger.warning if item.status in (sidecars.KEPT, sidecars.FAILED) else logger.info
+            log("Job {}: subtitle {}", jid, item.line())
+        if carried:
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write("\n[subtitles] carried to the output's name:\n")
+                    fh.writelines(f"[subtitles] {item.line()}\n" for item in carried)
+            except OSError:
+                pass
+        return carried
+
+    def _drop_carried(self, jid: str, source: Path, carried: List[sidecars.Carried]) -> None:
+        """With delete_source the source is gone: its sidecars that now sit
+        beside the output go too, so carrying them was a move. Only once the
+        source really is gone - a failed delete keeps both."""
+        if not carried or not self.settings.transcode.delete_source or source.exists():
+            return
+        for path in sidecars.remove_sources(carried):
+            logger.info("Job {}: removed the source's subtitle {}", jid, path)
 
     def _postprocess(self, jid: str, source: Path) -> None:
         """Optional: delete the source after a successful encode."""

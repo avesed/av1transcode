@@ -201,6 +201,6 @@ const SECTIONS = [
   { id: "sec-gpu", name: "GPU", count: true },
   { id: "sec-opt", name: "优化器引擎", count: true,
     subs: OPT_GROUPS.map(g => ({ id: g.id, name: g.name })) },
-  { id: "sec-safety", name: "危险操作" },
+  { id: "sec-safety", name: "源文件处理" },
   { id: "sec-presets", name: "编码预设" },
 ];

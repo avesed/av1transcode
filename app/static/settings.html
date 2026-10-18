@@ -288,9 +288,17 @@
   </section>
 
   <section class="sheet" id="sec-safety">
-    <h2 class="head head--danger">危险操作</h2>
-    <p class="lede">下面的开关会造成<b>不可逆的数据损失</b>。</p>
+    <h2 class="head head--danger">源文件处理</h2>
+    <p class="lede">转码成功之后怎么处理源文件。删除源文件会造成<b>不可逆的数据损失</b>。</p>
     <form id="safetyForm">
+      <div class="field" id="f-carry_subtitles">
+        <label class="field__label" for="s-carry_subtitles">带上外挂字幕 <code class="field__key">carry_subtitles</code></label>
+        <div class="field__ctl"><select id="s-carry_subtitles">
+          <option value="true">开（按成品的文件名复制一份，推荐）</option>
+          <option value="false">关</option>
+        </select></div>
+        <p class="field__help">Plex 和 Jellyfin 按文件名把外挂字幕配给视频，成品改了名就配不上了。开着时，源文件旁边和它 <code>subs/</code> 里以源文件名开头的字幕（Bazarr 下的、aisub 翻的）按成品的名字放到成品旁边的同样位置；那里已有同名文件就不动。开了删除源文件时是移动，不是复制。</p>
+      </div>
       <div class="field" id="f-delete_source">
         <label class="field__label" for="s-delete_source">转码成功后删除源文件 <code class="field__key">delete_source</code></label>
         <div class="field__ctl"><select id="s-delete_source">

@@ -335,10 +335,23 @@ def create_app(settings: Settings, store: "db.JobStore", manager: "TranscodeMana
         logger.info("Updated GPU settings: {}", _gpu_settings())
         return {"ok": True, "settings": _gpu_settings(), "overrides": over}
 
-    # ---------- safety settings (delete_source) ----------
+    # ---------- what happens to the source (delete_source, carry_subtitles) ----------
     @router.get("/settings/safety")
     def get_safety():
-        return {"delete_source": settings.transcode.delete_source}
+        return {"delete_source": settings.transcode.delete_source,
+                "carry_subtitles": settings.transcode.carry_subtitles}
+
+    @router.put("/settings/carry_subtitles")
+    def put_carry_subtitles(request: Request, body: dict):
+        """Copy (with delete_source: move) the source's sidecar subtitles to
+        the output's name after success. Nothing is lost either way, so no
+        confirm."""
+        _auth(request)
+        enabled = bool(body.get("enabled"))
+        settings.transcode.carry_subtitles = enabled
+        config.save_user_settings(settings, {"carry_subtitles": enabled})
+        logger.info("carry_subtitles {}", "enabled" if enabled else "disabled")
+        return {"ok": True, "carry_subtitles": enabled}
     @router.put("/settings/delete_source")
     def put_delete_source(request: Request, body: dict):
         """Enable/disable source deletion after success.

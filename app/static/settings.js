@@ -33,7 +33,7 @@ const EXTRA_DEFAULTS = { vulkan_device: "" };
 
 let optDefaults = null;      // null until loaded: nothing reads as "changed" before we know
 const saved = {};            // what the server holds now, per key: the unsaved-edit baseline
-let savedWorkers = null, savedSafety = null, activeWorkers = null;
+let savedWorkers = null, savedSafety = null, savedCarry = null, activeWorkers = null;
 let presets = {};
 const loadErrors = new Map();   // where -> message, cleared by that loader's next success
 let booted = false;
@@ -240,7 +240,9 @@ function unsavedWorkers() {
   if (!savedWorkers) return 0;
   return ["concurrency", "av1an_workers"].filter(k => $(`w-${k}`).value !== String(savedWorkers[k])).length;
 }
-const unsavedSafety = () => savedSafety !== null && $("s-delete_source").value !== String(savedSafety) ? 1 : 0;
+const unsavedSafety = () =>
+  (savedSafety !== null && $("s-delete_source").value !== String(savedSafety) ? 1 : 0) +
+  (savedCarry !== null && $("s-carry_subtitles").value !== String(savedCarry) ? 1 : 0);
 const unsavedKey = () => $("apiKeyInput").value.trim() !== apiKey() ? 1 : 0;
 
 function unsavedTotal(except) {
@@ -275,9 +277,11 @@ const RECEIPT = {
     return n ? [pending(n), "warn"] : [optDefaults ? vsConfig(changedIn($("optGroups"))) : ""];
   } },
   safetyForm: { el: "safetyActive", idle() {
-    if (unsavedSafety()) return [pending(1), "warn"];
+    const n = unsavedSafety();
+    if (n) return [pending(n), "warn"];
     if (savedSafety === null) return [""];
-    return savedSafety ? ["已开启：转码成功后源文件会被删除", "warn"] : ["关闭：保留源文件"];
+    const subs = savedCarry ? (savedSafety ? "外挂字幕随之移到成品旁" : "外挂字幕复制一份到成品旁") : "外挂字幕不带";
+    return savedSafety ? [`已开启：转码成功后源文件会被删除；${subs}`, "warn"] : [`保留源文件；${subs}`];
   } },
 };
 
@@ -441,10 +445,12 @@ async function loadSafety() {
     const s = await api("/api/settings/safety");
     savedSafety = !!s.delete_source;
     $("s-delete_source").value = String(savedSafety);
-    readOk("safetyForm", "危险操作");
+    savedCarry = s.carry_subtitles !== false;
+    $("s-carry_subtitles").value = String(savedCarry);
+    readOk("safetyForm", "源文件处理");
     idleReceipt("safetyForm");
   } catch (err) {
-    readFailed("safetyForm", "危险操作", err);
+    readFailed("safetyForm", "源文件处理", err);
   }
 }
 
@@ -936,7 +942,10 @@ function wire() {
     e.preventDefault();
     const btn = e.submitter || $("safetySaveBtn");
     const enabled = $("s-delete_source").value === "true";
-    if (enabled && !await confirmDlg({
+    const carry = $("s-carry_subtitles").value === "true";
+    const carryChanged = savedCarry !== null && carry !== savedCarry;
+    const deleteChanged = savedSafety === null || enabled !== savedSafety;
+    if (enabled && deleteChanged && !await confirmDlg({
       title: "开启删除源文件",
       body: ["开启后，每个转码成功的任务都会删除原始源文件。",
              "这一步不可逆：即使输出有问题，源文件也已经没了。",
@@ -950,11 +959,19 @@ function wire() {
     }
     busy(btn, async () => {
       try {
-        // confirm:true is the server's own guard (api.py put_delete_source):
-        // enabling without it is a 422, so the dialog above is not the only lock.
-        await api("/api/settings/delete_source", { method: "PUT", json: { enabled, confirm: enabled } });
+        const said = [];
+        if (carryChanged) {
+          await api("/api/settings/carry_subtitles", { method: "PUT", json: { enabled: carry } });
+          said.push(carry ? "已开启带上外挂字幕" : "已关闭带上外挂字幕");
+        }
+        if (deleteChanged) {
+          // confirm:true is the server's own guard (api.py put_delete_source):
+          // enabling without it is a 422, so the dialog above is not the only lock.
+          await api("/api/settings/delete_source", { method: "PUT", json: { enabled, confirm: enabled } });
+          said.push(enabled ? "已开启删除源文件" : "已关闭删除源文件");
+        }
         await loadSafety();
-        stick("safetyForm", enabled ? "已开启删除源文件" : "已关闭删除源文件", enabled ? "warn" : "ok");
+        stick("safetyForm", said.join("，") || "没有改动", enabled && deleteChanged ? "warn" : "ok");
       } catch (err) { stick("safetyForm", `保存失败：${err.message}`, "err"); }
       refreshMarks();
     });

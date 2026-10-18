@@ -897,6 +897,11 @@ class Transcode(BaseModel):
     keep_temp: bool = False
     # Delete source file after successful transcode (false by default)
     delete_source: bool = False
+    # Copy the source's sidecar subtitles (beside it and in its subs/ folder)
+    # to the output's name beside the output, so Plex/Jellyfin still pair
+    # them with the renamed AV1 file; with delete_source they are moved
+    # (app/sidecars.py).
+    carry_subtitles: bool = True
 
 
 class Web(BaseModel):
@@ -1089,6 +1094,8 @@ def load_settings(config_path: Optional[Path] = None) -> Settings:
             pass
     if "delete_source" in usettings and isinstance(usettings["delete_source"], bool):
         settings.transcode.delete_source = usettings["delete_source"]
+    if "carry_subtitles" in usettings and isinstance(usettings["carry_subtitles"], bool):
+        settings.transcode.carry_subtitles = usettings["carry_subtitles"]
     settings.transcode.optimizer_defaults = settings.transcode.optimizer.model_copy(deep=True)
     user_opt = usettings.get("optimizer") or {}
     if user_opt:
@@ -1145,7 +1152,7 @@ def delete_user_setting(settings: Settings, key: str) -> bool:
 
 
 def load_user_settings(settings: Settings) -> Dict[str, Any]:
-    """Read user-persisted settings (workers, delete_source) from the settings file."""
+    """Read user-persisted settings (workers, delete_source, carry_subtitles) from the settings file."""
     p = settings.dirs.settings_file
     try:
         if not p.exists():
@@ -1156,6 +1163,8 @@ def load_user_settings(settings: Settings) -> Dict[str, Any]:
             out["workers"] = data["workers"]
         if "delete_source" in data:
             out["delete_source"] = data["delete_source"]
+        if "carry_subtitles" in data:
+            out["carry_subtitles"] = data["carry_subtitles"]
         if data.get("optimizer"):
             out["optimizer"] = data["optimizer"]
         if isinstance(data.get("dovi"), dict):
