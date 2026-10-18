@@ -90,6 +90,9 @@ FROM ubuntu:24.04 AS vmaf-builder
 ARG VMAFX_REF=0b58cb597680ef634c8cb15ef42c887e3465cfd0
 ARG JOBS=8
 WORKDIR /build
+# oneAPI pinned to 2026.1 (2026.1.1 in production): the unversioned package moved to 2026.2 and a rebuild then
+# shipped a libsycl / UR loader whose LIBUR_LOADER symbols torch 2.14's 2026.1 runtime (the grain image, which
+# sits on this one with /usr/local/lib first on LD_LIBRARY_PATH) cannot load against.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gpg gpg-agent software-properties-common \
         build-essential ninja-build nasm xxd pkg-config git python3 python3-pip \
@@ -99,7 +102,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/oneAPI.list \
     && add-apt-repository -y ppa:kobuk-team/intel-graphics \
     && apt-get update && apt-get install -y --no-install-recommends \
-        intel-oneapi-compiler-dpcpp-cpp libze1 libze-dev \
+        intel-oneapi-compiler-dpcpp-cpp-2026.1 libze1 libze-dev \
     && rm -rf /var/lib/apt/lists/* \
     # noble ships meson 1.3.2; VMAFx's meson.build requires >= 1.4
     && pip3 install --break-system-packages --no-cache-dir 'meson>=1.4'
