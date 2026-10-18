@@ -17,6 +17,10 @@ from app.analyzer import MediaInfo
 from app import optimizer as opt
 from app import pgsocr
 
+# the real shutil.which, kept at import: the settings fixture swaps it for a stub that answers /usr/bin/fake-<name>,
+# and the code resolves every tool through it, so a test that runs real binaries has to put it back
+_REAL_WHICH = shutil.which
+
 
 def _write_out(args, data):
     """What a faked ffmpeg/encoder call leaves behind: its output file, the
@@ -377,7 +381,9 @@ def test_pix_fmt_normalises_8bit(settings, info, plan, tmp_path):
 
 
 def test_vmaf_threads_auto_sized_to_probe_pool(settings, info, plan, tmp_path, monkeypatch):
-    monkeypatch.setattr(opt.os, "cpu_count", lambda: 32)
+    # the cores are the cgroup's (_cores -> sysres.cpu_budget), not os.cpu_count(): patching the latter left the
+    # test reading whatever quota it ran under (2 == 8 in a --cpus 8 container)
+    monkeypatch.setattr(opt.sysres, "cpu_budget", lambda: 32.0)
     enc = make_encoder(settings, info, plan, tmp_path)
     # ffmpeg's libvmaf default (0) is single-threaded, so never leave it unset
     enc._probe_worker_count = 4
@@ -3295,8 +3301,8 @@ def test_mkvmerge_mux_without_an_audio_file(settings, info, plan, tmp_path,
                            *_video_in(enc, video_only, tags=False)]
 
 
-@pytest.mark.skipif(shutil.which("ffprobe") is None, reason="needs a real ffprobe")
-def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path):
+@pytest.mark.skipif(_REAL_WHICH("ffprobe") is None, reason="needs a real ffprobe")
+def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path, monkeypatch):
     """Run the probe command for real, not against a stubbed _run.
 
     The first version of this used "-select_streams a,s", which ffprobe rejects
@@ -3305,6 +3311,7 @@ def test_has_audio_or_subs_against_a_real_ffprobe(settings, info, plan, tmp_path
     fell back to "assume there is audio" on every single source. Only a real
     ffprobe catches that class of mistake.
     """
+    monkeypatch.setattr(shutil, "which", _REAL_WHICH)     # the settings fixture's stub would name fake-ffprobe
     settings.tools.ffprobe = shutil.which("ffprobe")
     enc = make_encoder(settings, info, plan, tmp_path)
     silent = tmp_path / "silent.mkv"
