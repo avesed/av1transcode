@@ -132,7 +132,11 @@ class ZcReader:
         if ino not in self.imports:
             s = _Shim.get()
             ptr = ctypes.c_void_p()
-            r = s.lib.zc_import(s.ctx, s.dev, fd, size, ctypes.byref(ptr))
+            # Level Zero closes the fd it imports, so it gets a dup of its own: the received fd stays ours to close
+            # exactly once. Closing it after the import instead (EBADF ignored) closed whatever another reader's
+            # thread had received under the reused number in the meantime - the applied pass's third reader died on
+            # it, Sandman S01E01, 2026-10-18. A failed import may or may not have closed the dup: left alone.
+            r = s.lib.zc_import(s.ctx, s.dev, os.dup(fd), size, ctypes.byref(ptr))
             if r or not ptr.value:
                 raise ZcUnsupported(f"Level Zero DMA-BUF import failed ({r:#x})")
             self.imports[ino] = (ptr, _tensor(ptr, size))
@@ -161,6 +165,12 @@ class ZcReader:
         return y.contiguous(), uv[:, 0::2].contiguous(), uv[:, 1::2].contiguous()
 
     def __iter__(self):
+        try:
+            yield from self._frames()
+        except OSError as e:
+            raise ZcError(f"{type(e).__name__}: {e}") from e
+
+    def _frames(self):
         pending = collections.deque()
         try:
             while True:
@@ -177,10 +187,7 @@ class ZcReader:
                     bufs = [self._import(fd, sz) for fd, sz in zip(fds, m["size"])]
                 finally:
                     for fd in fds:
-                        try:
-                            os.close(fd)
-                        except OSError:             # the Level Zero import may already have taken (closed) it
-                            pass
+                        os.close(fd)
                 planes = self._planes(m, bufs)
                 ev = torch.xpu.Event()
                 ev.record()
