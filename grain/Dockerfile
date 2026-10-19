@@ -26,6 +26,11 @@ RUN /opt/cvvdp/bin/pip install --no-cache-dir torchao==0.18.0      # the int8 mi
 RUN printf '#!/bin/sh\nLD_LIBRARY_PATH=/opt/grav1synth/lib exec /opt/grav1synth/grav1synth "$@"\n' > /usr/local/bin/grav1synth \
     && chmod +x /usr/local/bin/grav1synth
 COPY . /grain
+# the weights are not in git (see the top): an image without them builds fine and then fails every analysis, which
+# grain_auto degrades to a plain encode without grain (the first build of av1t-grain:8e517ef, 2026-10-19)
+RUN for f in v3g.pt v3s2.pt s32v2.pt spynet.pt v3g_mid_u8.pt2; do \
+      test -s /grain/weights/$f || { echo "grain/weights/$f is missing: put the weights in first (top of this file)"; exit 1; }; \
+    done
 # zcshim: host code against the SYCL headers of torch's own runtime, so its Level Zero context is torch's
 RUN cd /grain/zcdec && g++ -O2 -shared -fPIC -std=c++17 -DSYCL_DISABLE_FSYCL_SYCLHPP_WARNING -I/opt/cvvdp/include \
       zcshim.cpp -o libzcshim.so -L/opt/cvvdp/lib -lsycl -lze_loader && rm -f zcdec
